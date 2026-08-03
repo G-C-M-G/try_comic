@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.try-comic.invalid/schema/ocr-v4.json",
+  "title": "try_comic headless manga OCR result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "backend",
+    "source",
+    "capture",
+    "columns",
+    "reading_order",
+    "translation_units",
+    "ignored_regions",
+    "fusion_summary"
+  ],
+  "properties": {
+    "schema_version": { "const": 4 },
+    "backend": { "type": "string" },
+    "source": {
+      "type": "object",
+      "required": ["path", "width", "height"],
+      "properties": {
+        "path": { "type": "string" },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": true
+    },
+    "capture": { "type": "object" },
+    "columns": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/column" }
+    },
+    "reading_order": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "translation_units": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/translationUnit" }
+    },
+    "ignored_regions": { "type": "array" },
+    "fusion_summary": { "type": "object" },
+    "benchmark": { "type": "object" }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "point": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "number" },
+        { "type": "number" }
+      ],
+      "items": false
+    },
+    "polygon": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/point" },
+      "minItems": 4
+    },
+    "bbox": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" },
+        { "type": "number" }
+      ],
+      "items": false
+    },
+    "column": {
+      "type": "object",
+      "required": [
+        "id",
+        "text",
+        "polygon",
+        "image_bbox",
+        "layout_bbox_10pct",
+        "selection_order",
+        "panel_index",
+        "text_source",
+        "detection_sources"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "text": { "type": "string", "minLength": 1 },
+        "polygon": { "$ref": "#/$defs/polygon" },
+        "image_bbox": { "$ref": "#/$defs/bbox" },
+        "layout_bbox_10pct": { "$ref": "#/$defs/bbox" },
+        "selection_order": { "type": "integer", "minimum": 0 },
+        "panel_index": { "type": "integer", "minimum": 0 },
+        "text_source": { "type": "string", "minLength": 1 },
+        "detection_sources": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "readings": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "layoutRegion": {
+      "type": "object",
+      "required": ["column_id", "source_text", "polygon", "image_bbox", "layout_bbox_10pct"],
+      "properties": {
+        "column_id": { "type": "string", "minLength": 1 },
+        "source_text": { "type": "string", "minLength": 1 },
+        "polygon": { "$ref": "#/$defs/polygon" },
+        "image_bbox": { "$ref": "#/$defs/bbox" },
+        "layout_bbox_10pct": { "$ref": "#/$defs/bbox" }
+      },
+      "additionalProperties": true
+    },
+    "translationUnit": {
+      "type": "object",
+      "required": ["id", "column_ids", "source_text", "translation_query", "panel_index", "layout_regions"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "column_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "source_text": { "type": "string", "minLength": 1 },
+        "translation_query": { "type": "string", "minLength": 1 },
+        "panel_index": { "type": "integer", "minimum": 0 },
+        "layout_regions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/layoutRegion" },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

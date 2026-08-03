@@ -32,6 +32,34 @@ git restore -- path\to\file
 
 不要用 `git reset --hard` 代替检查差异。根仓库不追踪嵌套引擎目录；修改引擎代码后，需要在 `manga-image-translator` 仓库单独提交。
 
+## OCR 里程碑备份
+
+2026-08-04 的交接备份位于 `backups\2026-08-04_ocr-handoff\`。该目录由 `.gitignore`
+排除，避免把 bundle、样本图片和压缩包再次写进仓库历史。
+
+验证 bundle：
+
+```powershell
+git bundle verify backups\2026-08-04_ocr-handoff\try-comic-final.bundle
+git -C manga-image-translator bundle verify ..\backups\2026-08-04_ocr-handoff\manga-image-translator.bundle
+```
+
+恢复根仓库到新目录：
+
+```powershell
+git clone backups\2026-08-04_ocr-handoff\try-comic-final.bundle try_comic_restored
+```
+
+恢复 MITS 到新目录：
+
+```powershell
+git clone backups\2026-08-04_ocr-handoff\manga-image-translator.bundle manga-image-translator-restored
+git -C manga-image-translator-restored switch local/try-comic
+```
+
+`ocr-handoff-final.zip` 是下游项目的最小输入包，不用于还原完整运行环境；Python 虚拟环境、
+模型和 Sakura 大模型仍保留在当前工作目录，需要时按 `架构说明.md` 的环境章节重建。
+
 若以后重新克隆了上游引擎，可从上游基线恢复本项目补丁：
 
 ```powershell

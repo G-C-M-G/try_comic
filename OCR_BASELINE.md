@@ -1,6 +1,6 @@
 # OCR 基准与改造路线
 
-更新日期：2026-08-03
+更新日期：2026-08-04
 
 ## 1. 首个真实样本
 
@@ -150,3 +150,10 @@ Paddle 独有高置信多字符框会进入 MangaOCR 三次复核后补入。Pad
 四页批量共 70 个有效列都获得 PP-OCRv6 框交叉确认。当前四页没有出现需要补入的
 Paddle-only 正文框；补漏分支通过自动测试覆盖。1.jpg 中 MangaOCR 对 `ダメだ…` 的三次读数
 互相冲突，PaddleOCR 高置信结果与“照片”一致，仲裁后把本页字符错误率由 8.22% 降到 5.48%。
+
+## 7. 交接冻结
+
+本基准对应 schema 4 OCR 里程碑。最终样本、JSON、照片基准和核对图已经标准化到
+`outputs\paddle_batch_input`、`outputs\hybrid_batch`、`outputs\ocr_baselines` 和
+`outputs\ocr_review`。后续擦字/翻译/嵌字作为独立项目消费这些数据，具体契约见
+`OCR_交接文档.md`，新项目启动提示词见 `NEXT_PROJECT_PROMPT.md`。
