@@ -2,6 +2,9 @@
 __pycache__/
 *.py[cod]
 /venv/
+/paddle_venv/
+/models/paddle/
+/.cache/
 
 # Nested engine repository (versioned independently)
 /manga-image-translator/

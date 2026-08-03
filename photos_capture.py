@@ -12,6 +12,7 @@ from collections import Counter
 import json
 import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +89,19 @@ def _wait_for_window(title: str, timeout: float):
     raise RuntimeError(f"Photos window {title!r} did not become available")
 
 
+def _launch_photos(path: str) -> None:
+    absolute_path = os.path.abspath(path)
+    try:
+        os.startfile(absolute_path)
+        return
+    except OSError as error:
+        # WinError 1155 means the image extension has no default application.
+        if getattr(error, "winerror", None) != 1155:
+            raise
+
+    subprocess.Popen(["explorer.exe", absolute_path], close_fds=True)
+
+
 def _open_photos(path: str, timeout: float):
     title = os.path.basename(path)
     existing = None
@@ -96,7 +110,7 @@ def _open_photos(path: str, timeout: float):
     except RuntimeError:
         pass
     if existing is None:
-        os.startfile(os.path.abspath(path))
+        _launch_photos(path)
     window = _wait_for_window(title, timeout)
     window.set_focus()
     time.sleep(0.5)
@@ -215,6 +229,30 @@ def _projection_clicks(active: np.ndarray, block: OverlayBlock) -> list[tuple[in
     return clicks
 
 
+def _glyph_clicks(base: np.ndarray) -> list[tuple[int, int]]:
+    """Find likely character centres for OCR islands merged into white artwork."""
+    gray = cv2.cvtColor(base, cv2.COLOR_RGB2GRAY)
+    ink = (gray < 100).astype(np.uint8) * 255
+    ink = cv2.morphologyEx(
+        ink, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    )
+    _, _, stats, _ = cv2.connectedComponentsWithStats(ink)
+    clicks = []
+    for x, y, width, height, area in stats[1:]:
+        if not (5 <= width <= 35 and 7 <= height <= 38 and 18 <= area <= 800):
+            continue
+        if area / (width * height) < 0.16:
+            continue
+        padding = 7
+        neighborhood = gray[
+            max(0, y - padding):min(gray.shape[0], y + height + padding),
+            max(0, x - padding):min(gray.shape[1], x + width + padding),
+        ]
+        if neighborhood.size and float(np.mean(neighborhood > 210)) >= 0.52:
+            clicks.append((int(x + width // 2), int(y + height // 2)))
+    return clicks
+
+
 def _selection_bbox(active: np.ndarray, selected: np.ndarray, click: tuple[int, int]) -> list[int]:
     """Extract Photos' blue selected-range geometry around the clicked column."""
     delta = np.max(np.abs(selected.astype(np.int16) - active.astype(np.int16)), axis=2)
@@ -296,8 +334,16 @@ def capture_photos_columns(path: str, timeout: float = 20, debug_dir: str | None
     rect = active_control.rectangle()
     seen: list[dict] = []
     click_index = 0
-    for block_index, block in enumerate(blocks):
-        for click in _projection_clicks(active, block):
+    click_groups = [
+        (block_index, _projection_clicks(active, block))
+        for block_index, block in enumerate(blocks)
+    ]
+    # Photos sometimes preserves most of a white manga page as one OCR island.
+    # Probe likely glyph centres so separate columns within that island remain
+    # selectable; copied text and geometry de-duplication discard repeated hits.
+    click_groups.append((-1, _glyph_clicks(base)))
+    for block_index, clicks in click_groups:
+        for click in clicks:
             click_index += 1
             marker = f"__PHOTOS_OCR_{click_index}_{time.time_ns()}__"
             _set_clipboard_marker(marker)
@@ -309,6 +355,16 @@ def capture_photos_columns(path: str, timeout: float = 20, debug_dir: str | None
             if not copied or copied == marker or not _JAPANESE_RE.search(copied):
                 continue
             text = _normalize_text(copied)
+            # Character-centre probing intentionally hits each vertical column
+            # several times. Avoid another screenshot when the click still lies
+            # inside a geometry already captured for the same copied text.
+            if any(
+                prior["text"] == text
+                and prior["display_bbox"][0] - 6 <= click[0] <= prior["display_bbox"][2] + 6
+                and prior["display_bbox"][1] - 6 <= click[1] <= prior["display_bbox"][3] + 6
+                for prior in seen
+            ):
+                continue
             mouse.move(coords=(rect.right + 18, rect.bottom + 18))
             time.sleep(0.05)
             selected = _capture(active_control)
@@ -355,6 +411,20 @@ def capture_photos_columns(path: str, timeout: float = 20, debug_dir: str | None
     inventory_counts = Counter(inventory)
     missing_counts = inventory_counts - captured_counts
     extra_counts = captured_counts - inventory_counts
+    ignored_inventory_noise = list(missing_counts.elements())
+    # On sparse punctuation Photos occasionally emits one unstable kanji/kana
+    # (the same 19.jpg run alternated between 仄 and し). Do not treat a lone,
+    # unlocatable OCR hallucination as manga dialogue; all multi-character
+    # columns remain strict and captured extras are never accepted.
+    if (
+        sum(missing_counts.values()) == 1
+        and not extra_counts
+        and len(next(iter(missing_counts))) == 1
+    ):
+        inventory_counts -= missing_counts
+        missing_counts.clear()
+    else:
+        ignored_inventory_noise = []
     if missing_counts or extra_counts:
         missing = ", ".join(
             text if count == 1 else f"{text} x{count}"
@@ -378,6 +448,7 @@ def capture_photos_columns(path: str, timeout: float = 20, debug_dir: str | None
             "inventory_count": len(inventory),
             "captured_count": len(columns),
             "complete": True,
+            "ignored_inventory_noise": ignored_inventory_noise,
         },
         "columns": columns,
     }
