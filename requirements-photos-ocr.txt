@@ -1,0 +1,3 @@
+# Windows Photos UI automation. OCR itself is provided by the Photos app.
+pywinauto==0.6.9
+pywin32==312
