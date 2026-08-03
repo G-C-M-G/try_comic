@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tauri UI 样板 · Manga Translator</title>
+<style>
+  /* ============================================================
+     Tauri 桌面应用 UI 样板
+     说明：Tauri 前端 = 标准 Web 技术（HTML/CSS/JS），
+     常搭配 Tailwind / shadcn-ui / Lucide 图标。
+     本样板纯手写 CSS，浏览器双击打开即可预览。
+     Tauri 专属点（真实项目中）：
+       - 无边框窗口: tauri.conf.json 中 decorations:false
+       - 标题栏拖拽: data-tauri-drag-region 属性
+       - 窗口控制: getCurrentWindow().minimize/maximize/close
+     ============================================================ */
+  :root {
+    --bg: #f8fafc;
+    --card: #ffffff;
+    --border: #e2e8f0;
+    --text: #0f172a;
+    --text-2: #64748b;
+    --text-3: #94a3b8;
+    --primary: #4f46e5;        /* Tauri 品牌紫 */
+    --primary-soft: #eef2ff;
+    --radius: 12px;
+    --shadow: 0 1px 3px rgba(15,23,42,.06), 0 8px 24px rgba(15,23,42,.06);
+  }
+  [data-theme="dark"] {
+    --bg: #0b1120;
+    --card: #131c31;
+    --border: #1e293b;
+    --text: #e2e8f0;
+    --text-2: #94a3b8;
+    --text-3: #64748b;
+    --primary: #818cf8;
+    --primary-soft: rgba(79,70,229,.18);
+    --shadow: 0 1px 3px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; flex-direction: column; height: 100vh;
+    overflow: hidden; transition: background .25s, color .25s;
+  }
+
+  /* ---------- 无边框标题栏（Tauri data-tauri-drag-region） ---------- */
+  .titlebar {
+    height: 40px; display: flex; align-items: center; gap: 10px;
+    padding: 0 8px 0 14px; background: var(--card);
+    border-bottom: 1px solid var(--border);
+    user-select: none; flex-shrink: 0;
+  }
+  .titlebar .app-logo {
+    width: 18px; height: 18px; border-radius: 5px;
+    background: linear-gradient(135deg, #8b5cf6, #4f46e5);
+  }
+  .titlebar .app-name { font-size: 12px; color: var(--text-2); font-weight: 600; }
+  .titlebar .drag-region { flex: 1; height: 100%; }  /* data-tauri-drag-region */
+  .tb-btn {
+    width: 42px; height: 28px; border: none; border-radius: 7px;
+    background: transparent; color: var(--text-2); font-size: 12px;
+    cursor: pointer; line-height: 1;
+  }
+  .tb-btn:hover { background: var(--primary-soft); color: var(--text); }
+  .tb-btn.close:hover { background: #ef4444; color: #fff; }
+
+  /* ---------- 布局 ---------- */
+  .shell { display: flex; flex: 1; min-height: 0; }
+
+  /* 侧边栏 */
+  .sidebar {
+    width: 210px; background: var(--card);
+    border-right: 1px solid var(--border);
+    padding: 14px 10px; display: flex; flex-direction: column; gap: 2px;
+  }
+  .nav-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; border-radius: 9px;
+    color: var(--text-2); font-size: 13px; font-weight: 500;
+    cursor: pointer; border: none; background: transparent; text-align: left;
+    transition: background .15s, color .15s;
+  }
+  .nav-item:hover { background: var(--primary-soft); color: var(--text); }
+  .nav-item.active { background: var(--primary-soft); color: var(--primary); font-weight: 600; }
+  .nav-item svg { width: 16px; height: 16px; flex-shrink: 0; }
+  .sidebar .spacer { flex: 1; }
+
+  /* 主内容 */
+  .main { flex: 1; overflow-y: auto; padding: 22px 26px; }
+  .page-title { font-size: 20px; font-weight: 700; }
+  .page-sub { color: var(--text-2); font-size: 13px; margin: 4px 0 18px; }
+
+  /* 卡片 */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px; box-shadow: var(--shadow);
+  }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px; }
+  .stat .label { color: var(--text-2); font-size: 12px; }
+  .stat .value { font-size: 24px; font-weight: 700; margin-top: 6px; }
+  .stat .delta { font-size: 12px; color: #10b981; margin-top: 2px; }
+
+  /* 按钮 */
+  .btn {
+    border: 1px solid var(--border); background: var(--card);
+    color: var(--text); padding: 8px 16px; border-radius: 9px;
+    font-size: 13px; font-weight: 500; cursor: pointer;
+    transition: all .15s;
+  }
+  .btn:hover { border-color: var(--text-3); }
+  .btn.primary {
+    background: var(--primary); color: #fff; border: none;
+    box-shadow: 0 2px 8px rgba(79,70,229,.35);
+  }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn.ghost { background: transparent; border: none; color: var(--text-2); }
+  .btn.ghost:hover { background: var(--primary-soft); color: var(--text); }
+
+  /* 输入 */
+  .input {
+    border: 1px solid var(--border); background: var(--card);
+    color: var(--text); padding: 8px 12px; border-radius: 9px;
+    font-size: 13px; outline: none; width: 100%;
+  }
+  .input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+
+  /* 徽章 */
+  .badge {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-size: 11px; font-weight: 600;
+  }
+  .badge.green { background: rgba(16,185,129,.15); color: #10b981; }
+  .badge.purple { background: var(--primary-soft); color: var(--primary); }
+  .badge.gray { background: var(--border); color: var(--text-2); }
+
+  /* 表格 */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--text-2); font-weight: 500; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  td { padding: 11px 12px; border-bottom: 1px solid var(--border); }
+  tr:hover td { background: var(--primary-soft); }
+
+  .row { display: flex; gap: 10px; align-items: center; }
+  .mt { margin-top: 18px; }
+  .note { color: var(--text-3); font-size: 11px; line-height: 1.7; margin-top: 16px; }
+  code { background: var(--primary-soft); color: var(--primary); padding: 1px 6px; border-radius: 5px; font-size: 11px; }
+</style>
+</head>
+<body>
+
+<!-- ============ 标题栏（Tauri 无边框窗口: decorations:false） ============ -->
+<div class="titlebar">
+  <div class="app-logo"></div>
+  <span class="app-name">漫画翻译助手 · Tauri 样板</span>
+  <div class="drag-region" data-tauri-drag-region></div>
+  <button class="tb-btn" title="最小化" onclick="windowClose(this,'min')">─</button>
+  <button class="tb-btn" title="最大化" onclick="windowClose(this,'max')">□</button>
+  <button class="tb-btn close" title="关闭" onclick="windowClose(this,'close')">✕</button>
+</div>
+
+<div class="shell">
+  <!-- ============ 侧边栏 ============ -->
+  <nav class="sidebar">
+    <button class="nav-item active" id="nav-home" onclick="switchPage('home')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>
+      首页
+    </button>
+    <button class="nav-item" id="nav-translate" onclick="switchPage('translate')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>
+      翻译
+    </button>
+    <button class="nav-item" id="nav-workbench" onclick="switchPage('workbench')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M9 3v18"/><path d="M3 9h18"/></svg>
+      调整工作台
+    </button>
+    <button class="nav-item" id="nav-dict" onclick="switchPage('dict')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+      词典与缓存
+    </button>
+    <div class="spacer"></div>
+    <button class="nav-item" id="nav-settings" onclick="switchPage('settings')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      设置
+    </button>
+    <button class="nav-item" onclick="toggleTheme()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+      <span id="theme-label">暗色模式</span>
+    </button>
+  </nav>
+
+  <!-- ============ 主内容 ============ -->
+  <main class="main" id="page-home">
+    <div class="page-title">欢迎回来 👋</div>
+    <div class="page-sub">Tauri 风格的桌面应用界面 · 圆角卡片 / 柔和阴影 / 毛玻璃标题栏</div>
+
+    <div class="stats">
+      <div class="card stat"><div class="label">已翻译页数</div><div class="value">1,284</div><div class="delta">▲ 12.4% 本周</div></div>
+      <div class="card stat"><div class="label">译文缓存占用</div><div class="value">486 MB</div><div class="delta">上限 2 GB</div></div>
+      <div class="card stat"><div class="label">翻译记忆</div><div class="value">3,912</div><div class="delta">条记录</div></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between; margin-bottom:14px">
+        <b>最近任务</b>
+        <div class="row">
+          <button class="btn ghost">导出</button>
+          <button class="btn primary">新建任务</button>
+        </div>
+      </div>
+      <table>
+        <tr><th>任务</th><th>状态</th><th>页数</th><th>进度</th></tr>
+        <tr><td>第 20 卷 · 第 1 章</td><td><span class="badge green">完成</span></td><td>32</td><td>100%</td></tr>
+        <tr><td>第 21 卷 · 第 2 章</td><td><span class="badge purple">翻译中</span></td><td>28</td><td>64%</td></tr>
+        <tr><td>短篇集 · 夏季篇</td><td><span class="badge gray">待调整</span></td><td>18</td><td>—</td></tr>
+      </table>
+    </div>
+
+    <div class="card mt">
+      <div class="row" style="justify-content:space-between; margin-bottom:14px">
+        <b>快速翻译</b>
+        <span class="badge purple">Sakura 服务运行中</span>
+      </div>
+      <div class="row">
+        <input class="input" placeholder="选择 图片 / 文件夹 / zip / cbz…" style="flex:1">
+        <button class="btn">浏览…</button>
+        <button class="btn primary">开始翻译</button>
+      </div>
+    </div>
+
+    <p class="note">
+      <b>Tauri 样板说明</b>：① 标题栏为无边框窗口自绘（<code>decorations:false</code> + <code>data-tauri-drag-region</code>）；
+      ② 窗口按钮调用 <code>getCurrentWindow()</code> 的 API；③ 前端框架可选 Vue/React/Svelte，
+      样式常配 Tailwind CSS + shadcn/ui + Lucide 图标；④ 体积小（~5MB）、内存占用低，但 Rust 后端
+      与你的 Python/MITS 管线集成成本高——本样板仅作视觉参考。
+    </p>
+  </main>
+
+  <main class="main" id="page-translate" style="display:none">
+    <div class="page-title">翻译</div>
+    <div class="page-sub">页面切换演示（其余页面略）</div>
+    <div class="card">
+      <div class="row"><input class="input" placeholder="占位输入框" style="flex:1"><button class="btn primary">确定</button></div>
+    </div>
+  </main>
+  <main class="main" id="page-workbench" style="display:none">
+    <div class="page-title">调整工作台</div>
+    <div class="page-sub">页面切换演示（其余页面略）</div>
+  </main>
+  <main class="main" id="page-dict" style="display:none">
+    <div class="page-title">词典与缓存</div>
+    <div class="page-sub">页面切换演示（其余页面略）</div>
+  </main>
+  <main class="main" id="page-settings" style="display:none">
+    <div class="page-title">设置</div>
+    <div class="page-sub">页面切换演示（其余页面略）</div>
+  </main>
+</div>
+
+<script>
+  const pages = ['home','translate','workbench','dict','settings'];
+  function switchPage(name) {
+    pages.forEach(p => {
+      document.getElementById('page-' + p).style.display = p === name ? '' : 'none';
+      document.getElementById('nav-' + p).classList.toggle('active', p === name);
+    });
+  }
+  function toggleTheme() {
+    const dark = document.documentElement.getAttribute('data-theme') === 'dark';
+    document.documentElement.setAttribute('data-theme', dark ? '' : 'dark');
+    document.getElementById('theme-label').textContent = dark ? '暗色模式' : '亮色模式';
+  }
+  // 真实 Tauri 中:
+  // const { getCurrentWindow } = window.__TAURI__.window;
+  // function windowClose(btn, act){ getCurrentWindow()[act === 'min' ? 'minimize' : act === 'max' ? 'toggleMaximize' : 'close'](); }
+  function windowClose(btn, act) { /* 浏览器预览占位 */ }
+</script>
+</body>
+</html>

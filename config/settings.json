@@ -1,0 +1,8 @@
+{
+ "enable_glossary": true,
+ "enable_memory": true,
+ "enable_cache": true,
+ "cache_limit_mb": 2048,
+ "direction": "auto",
+ "hf_offline": true
+}

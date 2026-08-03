@@ -1,0 +1,33 @@
+# Python/runtime
+__pycache__/
+*.py[cod]
+/venv/
+
+# Nested engine repository (versioned independently)
+/manga-image-translator/
+
+# Models, local services, and generated logs
+/sakura/llama/
+/sakura/models/
+/sakura/*.log
+/manga_translator.log
+
+# Generated output and large local backups
+/打包输出/
+/译文缓存/
+/依赖备份/
+/依赖备份.zip
+/backup_*.zip
+/漫画翻译助手.exe
+
+# User/runtime state
+/config/cache_index.json
+/config/glossary.json
+/config/translation_memory.json
+/config/ui.json
+/sfx_report.txt
+
+# Tooling
+.pytest_cache/
+.coverage
+*.tmp

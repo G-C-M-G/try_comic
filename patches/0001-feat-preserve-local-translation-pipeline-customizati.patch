@@ -1,0 +1,678 @@
+From d7dbd603dd872e09ec44e8a210f87610629988e7 Mon Sep 17 00:00:00 2001
+From: YLP <ylp@local>
+Date: Mon, 3 Aug 2026 16:35:15 +0800
+Subject: [PATCH] feat: preserve local translation pipeline customizations
+
+---
+ manga_translator/config.py                |   2 +
+ manga_translator/detection/__init__.py    |   6 +-
+ manga_translator/detection/ctd.py         |   2 +-
+ manga_translator/manga_translator.py      | 100 +++++++-
+ manga_translator/mode/local.py            |   2 +-
+ manga_translator/rendering/__init__.py    | 268 ++++++++++------------
+ manga_translator/rendering/text_render.py |  17 +-
+ 7 files changed, 239 insertions(+), 158 deletions(-)
+
+diff --git a/manga_translator/config.py b/manga_translator/config.py
+index 747b3e4..b385d48 100644
+--- a/manga_translator/config.py
++++ b/manga_translator/config.py
+@@ -182,6 +182,8 @@ class RenderConfig(BaseModel):
+     """Use fixed font size for rendering"""
+     rtl: bool = True
+     """Right-to-left reading order for panel and text_region sorting,"""  
++    vertical_rtl: bool = True
++    """竖排多列按右→左排（日漫原文阅读习惯）；False 时左→右"""  
+     _font_color_fg = None
+     _font_color_bg = None
+     @property
+diff --git a/manga_translator/detection/__init__.py b/manga_translator/detection/__init__.py
+index 46058e8..877f27d 100644
+--- a/manga_translator/detection/__init__.py
++++ b/manga_translator/detection/__init__.py
+@@ -4,7 +4,11 @@ from .default import DefaultDetector
+ from .dbnet_convnext import DBConvNextDetector
+ from .ctd import ComicTextDetector
+ from .craft import CRAFTDetector
+-from .paddle_rust import PaddleDetector
++try:
++    from .paddle_rust import PaddleDetector
++except Exception:
++    # Rust 检测器(依赖 rusty_manga_image_translator)不可用时置空，避免 import 警告/崩溃
++    PaddleDetector = None
+ from .none import NoneDetector
+ from .common import CommonDetector, OfflineDetector
+ from ..config import Detector
+diff --git a/manga_translator/detection/ctd.py b/manga_translator/detection/ctd.py
+index 4ebf1fc..2ebe51f 100644
+--- a/manga_translator/detection/ctd.py
++++ b/manga_translator/detection/ctd.py
+@@ -154,7 +154,7 @@ class ComicTextDetector(OfflineDetector):
+ 
+         mask = postprocess_mask(mask)
+         lines, scores = self.seg_rep(None, lines_map, height=im_h, width=im_w)
+-        box_thresh = 0.6
++        box_thresh = 0.6 if box_threshold is None else float(box_threshold)
+         idx = np.where(scores[0] > box_thresh)
+         lines, scores = lines[0][idx], scores[0][idx]
+ 
+diff --git a/manga_translator/manga_translator.py b/manga_translator/manga_translator.py
+index 2688eeb..9916df9 100644
+--- a/manga_translator/manga_translator.py
++++ b/manga_translator/manga_translator.py
+@@ -119,6 +119,21 @@ class MangaTranslator:
+         self._progress_hooks = []
+         self._add_logger_hook()
+ 
++        # Custom hook called after OCR/textline-merge, before translation.
++        # Signature: hook(ctx) -> Optional[List[TextBlock]] (return new text_regions or None to keep)
++        self.pre_translate_hook = None
++        # Custom hook called after translation, before mask refinement.
++        self.post_translate_hook = None
++        # Custom hook called before post-translation filtering: transliterate
++        # untranslatable text (e.g. names). Signature: hook(ctx), modifies in place.
++        self.transliteration_hook = None
++        # Custom hook called after inpainting, before rendering (manual adjust state export).
++        # Signature: hook(ctx, config)
++        self.mid_pipeline_hook = None
++        # Custom hook called at the very start of translate(), before model preload.
++        # Signature: hook(ctx) -> Optional[PIL.Image] (return cached result image to skip pipeline)
++        self.page_skip_hook = None
++
+         params = params or {}
+         
+         self._batch_contexts = []  # 存储批量处理的上下文
+@@ -357,13 +372,14 @@ class MangaTranslator:
+     def using_gpu(self):
+         return self.device.startswith('cuda') or self.device == 'mps' or self.device == 'xpu'
+ 
+-    async def translate(self, image: Image.Image, config: Config, image_name: str = None, skip_context_save: bool = False) -> Context:
++    async def translate(self, image: Image.Image, config: Config, image_name: str = None, skip_context_save: bool = False, input_path: str = None) -> Context:
+         """
+         Translates a single image.
+ 
+         :param image: Input image.
+         :param config: Translation config.
+         :param image_name: Deprecated parameter, kept for compatibility.
++        :param input_path: Source file path of the input image (used by page cache).
+         :return: Translation context.
+         """
+         await self._report_progress('running_pre_translation_hooks')
+@@ -375,6 +391,7 @@ class MangaTranslator:
+ 
+         ctx = Context()
+         ctx.input = image
++        ctx.input_path = input_path
+         ctx.result = None
+         ctx.verbose = self.verbose
+ 
+@@ -399,6 +416,18 @@ class MangaTranslator:
+                 logger.error(f"Error saving input.png debug image: {e}")
+                 logger.debug(f"Exception details: {traceback.format_exc()}")
+ 
++        # 译文缓存命中: 跳过整条管线，直接返回缓存成品图
++        if self.page_skip_hook is not None:
++            try:
++                cached = self.page_skip_hook(ctx)
++                if cached is not None:
++                    ctx.result = cached
++                    logger.info('[cache] 命中，跳过本页 OCR/翻译/擦字')
++                    return ctx
++            except Exception as e:
++                logger.error(f"Error in page_skip_hook: {e}")
++                logger.error(traceback.format_exc())
++
+         # preload and download models (not strictly necessary, remove to lazy load)
+         if ( self.models_ttl == 0 ):
+             logger.info('Loading models')
+@@ -539,6 +568,16 @@ class MangaTranslator:
+         else:
+             logger.info("No pre-translation replacements made.")
+             
++        # -- Custom pre-translate hook (e.g. SFX filtering)
++        if self.pre_translate_hook is not None:
++            try:
++                new_regions = self.pre_translate_hook(ctx)
++                if new_regions is not None:
++                    ctx.text_regions = new_regions
++            except Exception as e:
++                logger.error(f"Error in pre_translate_hook: {e}")
++                logger.error(traceback.format_exc())
++            
+         # -- Translation
+         await self._report_progress('translating')
+         try:
+@@ -549,6 +588,16 @@ class MangaTranslator:
+                 raise 
+             ctx.text_regions = [] # Fallback to empty text_regions if translation fails
+ 
++        # -- Custom post-translate hook (e.g. SFX dictionary fixup)
++        if self.post_translate_hook is not None:
++            try:
++                new_regions = self.post_translate_hook(ctx)
++                if new_regions is not None:
++                    ctx.text_regions = new_regions
++            except Exception as e:
++                logger.error(f"Error in post_translate_hook: {e}")
++                logger.error(traceback.format_exc())
++
+         await self._report_progress('after-translating')
+ 
+         if not ctx.text_regions:
+@@ -590,6 +639,11 @@ class MangaTranslator:
+                 ctx.img_inpainted = ctx.img_rgb
+         ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
+ 
++        # 渲染会原地修改 ctx.img_inpainted（文字直接写入该数组），
++        # 此处先保存干净副本，供 mid_pipeline_hook 导出"纯擦字图"状态
++        if self.mid_pipeline_hook is not None:
++            ctx.img_inpainted_clean = ctx.img_inpainted.copy()
++
+         if self.verbose:
+             try:
+                 inpainted_path = self._result_path('inpainted.png')
+@@ -599,6 +653,7 @@ class MangaTranslator:
+             except Exception as e:
+                 logger.error(f"Error saving inpainted.png debug image: {e}")
+                 logger.debug(f"Exception details: {traceback.format_exc()}")
++
+         # -- Rendering
+         await self._report_progress('rendering')
+ 
+@@ -616,6 +671,16 @@ class MangaTranslator:
+                 raise
+             ctx.img_rendered = ctx.img_inpainted # Fallback to inpainted (or original RGB) image if rendering fails
+ 
++        # -- Custom mid-pipeline hook (after rendering).
++        # Used to export manual-adjustment state (inpainted image + text regions).
++        # 放在渲染后: region.font_size 已是最终实际嵌字字号
++        if self.mid_pipeline_hook is not None:
++            try:
++                self.mid_pipeline_hook(ctx, config)
++            except Exception as e:
++                logger.error(f"Error in mid_pipeline_hook: {e}")
++                logger.error(traceback.format_exc())
++
+         await self._report_progress('finished', True)
+         ctx.result = dump_image(ctx.input, ctx.img_rendered, ctx.img_alpha)
+ 
+@@ -772,11 +837,6 @@ class MangaTranslator:
+     async def _run_textline_merge(self, config: Config, ctx: Context):
+         current_time = time.time()
+         self._model_usage_timestamps[("textline_merge", "textline_merge")] = current_time
+-        text_regions = await dispatch_textline_merge(ctx.textlines, ctx.img_rgb.shape[1], ctx.img_rgb.shape[0],
+-                                                     verbose=self.verbose)
+-        for region in text_regions:
+-            if not hasattr(region, "text_raw"):
+-                region.text_raw = region.text      # <- Save the initial OCR results to expand the render detection box. Also, prevent affecting the forbidden translation function.       
+         # Filter out languages to skip  
+         if config.translator.skip_lang is not None:  
+             skip_langs = [lang.strip().upper() for lang in config.translator.skip_lang.split(',')]  
+@@ -802,6 +862,19 @@ class MangaTranslator:
+     
+         text_regions = await dispatch_textline_merge(ctx.textlines, ctx.img_rgb.shape[1], ctx.img_rgb.shape[0],  
+                                                      verbose=self.verbose)  
++        ocr_backend = getattr(config.ocr.ocr, 'value', str(config.ocr.ocr))
++        for region in text_regions:
++            if not hasattr(region, "text_raw"):
++                # Keep the initial OCR result for render-box expansion and forbidden translation checks.
++                region.text_raw = region.text
++            region.ocr_backend = ocr_backend
++            if ocr_backend == 'mocr':
++                # MangaOCR does not expose confidence. region.prob comes from the auxiliary
++                # 48px model used for color estimation and must not be treated as MangaOCR confidence.
++                region.ocr_confidence = None
++                region.ocr_score_proxy = float(region.prob)
++            else:
++                region.ocr_confidence = float(region.prob)
+ 
+         new_text_regions = []
+         for region in text_regions:
+@@ -1322,6 +1395,14 @@ class MangaTranslator:
+             else:
+                 logger.warning("Some translation regions failed post-translation check.")
+ 
++        # 人名音译钩子: 翻译失败(译文为空/与原文相同)且含片假名的文本按人名音译
++        if self.transliteration_hook is not None:
++            try:
++                self.transliteration_hook(ctx)
++            except Exception as e:
++                logger.error(f"Error in transliteration_hook: {e}")
++                logger.error(traceback.format_exc())
++
+         # 过滤逻辑（简化版本，保留主要过滤条件）
+         new_text_regions = []
+         for region in ctx.text_regions:
+@@ -1377,7 +1458,8 @@ class MangaTranslator:
+         else:
+             output = await dispatch_rendering(ctx.img_inpainted, ctx.text_regions, self.font_path, config.render.font_size,
+                                               config.render.font_size_offset,
+-                                              config.render.font_size_minimum, not config.render.no_hyphenation, ctx.render_mask, config.render.line_spacing)
++                                              config.render.font_size_minimum, not config.render.no_hyphenation, ctx.render_mask, config.render.line_spacing,
++                                              vertical_rtl=config.render.vertical_rtl)
+         return output
+ 
+     def _result_path(self, path: str) -> str:
+@@ -1960,7 +2042,7 @@ class MangaTranslator:
+                     else:
+                         logger.warning("Some translation regions failed post-translation check.")
+                         
+-                # 过滤逻辑（简化版本，保留主要过滤条件）
++        # 过滤逻辑（简化版本，保留主要过滤条件）
+                 for ctx, config in batch:
+                     if ctx.text_regions:
+                         new_text_regions = []
+@@ -2803,4 +2885,4 @@ class MangaTranslator:
+                 logger.warning(f'Post-translation check failed, maximum retry attempts ({max_attempts}) reached, keeping original translation: "{original_translation}"')
+                 region.translation = original_translation
+         
+-        return region.translation
+\ No newline at end of file
++        return region.translation
+diff --git a/manga_translator/mode/local.py b/manga_translator/mode/local.py
+index b6846c9..005ef81 100644
+--- a/manga_translator/mode/local.py
++++ b/manga_translator/mode/local.py
+@@ -264,7 +264,7 @@ class MangaTranslatorLocal(MangaTranslator):
+                 return False
+ 
+             # 直接翻译图片，不再需要传递文件名
+-            ctx = await self.translate(img, config)
++            ctx = await self.translate(img, config, input_path=path)
+             result = ctx.result
+ 
+             # TODO
+diff --git a/manga_translator/rendering/__init__.py b/manga_translator/rendering/__init__.py
+index fa9264a..f8cfc8c 100644
+--- a/manga_translator/rendering/__init__.py
++++ b/manga_translator/rendering/__init__.py
+@@ -1,4 +1,5 @@
+-import os
++import copy
++import os
+ import cv2
+ import numpy as np
+ from typing import List
+@@ -18,7 +19,39 @@ from ..utils import (
+     rotate_polygons,
+ )
+ 
+-logger = get_logger('render')
++logger = get_logger('render')
++
++_GEOMETRY_CACHE_KEYS = (
++    'xyxy', 'xywh', 'center', 'unrotated_polygons', 'unrotated_min_rect',
++    'min_rect', 'polygon_aspect_ratio', 'unrotated_size', 'aspect_ratio',
++    'polygon_object', 'area', 'real_area',
++)
++
++
++def expand_translation_regions(text_regions: List[TextBlock]) -> List[TextBlock]:
++    """Split conservatively aligned translations into their original OCR polygons."""
++    expanded = []
++    for region in text_regions:
++        translations = list(getattr(region, 'translation_segments', None) or [])
++        source_texts = list(getattr(region, 'texts', None) or [])
++        lines = np.asarray(region.lines).reshape(-1, 4, 2)
++        if len(lines) < 2 or len(translations) != len(lines) or len(source_texts) != len(lines):
++            expanded.append(region)
++            continue
++
++        for index, (line, source, translation) in enumerate(zip(lines, source_texts, translations)):
++            segment = copy.copy(region)
++            segment.lines = np.asarray([line], dtype=np.int32)
++            segment.texts = [source]
++            segment.text = source
++            segment.translation = translation
++            segment.translation_segments = None
++            segment.segment_index = index
++            segment._segment_parent = region
++            for key in _GEOMETRY_CACHE_KEYS:
++                segment.__dict__.pop(key, None)
++            expanded.append(segment)
++    return expanded
+ 
+ def parse_font_paths(path: str, default: List[str] = None) -> List[str]:
+     if path:
+@@ -72,7 +105,6 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
+         # Store and validate original font size
+         original_region_font_size = region.font_size  
+         if original_region_font_size <= 0:  
+-            # logger.warning(f"Invalid original font size ({original_region_font_size}) for text '{region.translation}'. Using default value {font_size_minimum}.")  
+             original_region_font_size = font_size_minimum
+ 
+         # Determine target font size
+@@ -83,150 +115,89 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
+             target_font_size = current_base_font_size + font_size_offset  
+ 
+         target_font_size = max(target_font_size, font_size_minimum, 1)  
+-        # print("-" * 50)
+-        # logger.debug(f"Calculated target font size: {target_font_size} for text '{region.translation}'")  
+ 
+-        # Single-axis text box expansion
+-        single_axis_expanded = False
+-        dst_points = None
+-        
+-        if region.horizontal: 
+-            used_rows = len(region.texts)
+-            # logger.debug(f"Horizontal text - used rows: {used_rows}")
+-            
++        # 嵌字框固定为原始检测框，不扩展
++        dst_points = region.min_rect
++
++        # 字号/嵌字框控制优先级:
++        #   1) 保证最小字号 (font_size_minimum, 默认12)
++        #   2) 嵌字框不超过原框 110%: 放不下则缩小字号适配(但不低于最小字号)
++        #   3) 仍放不下 → 最多加一列(竖排加列/横排加行), 保持中心
++        max_w = region.unrotated_size[0] * 1.1
++        max_h = region.unrotated_size[1] * 1.1
++
++        def _expand_dst(extent_x: float, extent_y: float):
++            """按(extent_x, extent_y)对称扩展 dst_points"""
++            poly = Polygon(region.unrotated_min_rect[0])
++            minx, miny, maxx, maxy = poly.bounds
++            poly2 = Polygon([(minx - extent_x, miny - extent_y),
++                             (maxx + extent_x, miny - extent_y),
++                             (maxx + extent_x, maxy + extent_y),
++                             (minx - extent_x, maxy + extent_y)])
++            pts = np.array(poly2.exterior.coords[:4])
++            return rotate_polygons(
++                region.center, pts.reshape(1, -1), -region.angle,
++                to_int=False).reshape(-1, 4, 2).astype(np.int64)
++
++        if region.horizontal:
++            used_rows = max(1, len(region.texts))
++            for _ in range(8):
++                line_text_list, _ = text_render.calc_horizontal(
++                    target_font_size,
++                    region.translation,
++                    max_width=int(max_w),
++                    max_height=int(max_h),
++                    language=getattr(region, "target_lang", "en_US")
++                )
++                needed_rows = len(line_text_list)
++                if needed_rows <= used_rows:
++                    break
++                if target_font_size <= font_size_minimum:
++                    break
++                target_font_size = max(font_size_minimum,
++                                       int(target_font_size * used_rows / max(1, needed_rows)))
+             line_text_list, _ = text_render.calc_horizontal(
+-                region.font_size,
++                target_font_size,
+                 region.translation,
+-                max_width=region.unrotated_size[0],
+-                max_height=region.unrotated_size[1],
++                max_width=int(max_w),
++                max_height=int(max_h),
+                 language=getattr(region, "target_lang", "en_US")
+             )
+             needed_rows = len(line_text_list)
+-            # logger.debug(f"Needed rows: {needed_rows}")                
+-
+             if needed_rows > used_rows:
+-                scale_x = ((needed_rows - used_rows) / used_rows) * 1 + 1
+-                try:  
+-                    poly = Polygon(region.unrotated_min_rect[0])
+-                    minx, miny, maxx, maxy = poly.bounds
+-                    poly = affinity.scale(poly, xfact=scale_x, yfact=1.0, origin=(minx, miny))        
+-                
+-                    pts = np.array(poly.exterior.coords[:4])  
+-                    dst_points = rotate_polygons(  
+-                        region.center, pts.reshape(1, -1), -region.angle,  
+-                        to_int=False  
+-                    ).reshape(-1, 4, 2)  
+-                    # 移除边界限制，允许文本超出检测框边界
+-                    # dst_points[..., 0] = dst_points[..., 0].clip(0, img.shape[1] - 1)  
+-                    # dst_points[..., 1] = dst_points[..., 1].clip(0, img.shape[0] - 1)  
+-                    dst_points = dst_points.astype(np.int64)
+-                    single_axis_expanded = True
+-                    # logger.debug(f"Successfully expanded horizontal text width: xfact={scale_x:.2f}")  
+-                except Exception as e:  
+-                    # logger.error(f"Failed to expand horizontal text: {e}")  
+-                    pass
+-                    
+-        if region.vertical:
+-            used_cols = len(region.texts)
+-            # logger.debug(f"Vertical text - used columns: {used_cols}")
+-            
++                if needed_rows <= used_rows + 1:
++                    try:
++                        dst_points = _expand_dst(0.0, target_font_size * 0.5)
++                    except Exception as e:
++                        logger.debug(f"Horizontal row expansion failed: {e}")
++        elif region.vertical:
++            used_cols = max(1, len(region.texts))
++            for _ in range(8):
++                line_text_list, _ = text_render.calc_vertical(
++                    target_font_size,
++                    region.translation,
++                    max_height=int(max_h),
++                )
++                needed_cols = len(line_text_list)
++                if needed_cols <= used_cols:
++                    break
++                if target_font_size <= font_size_minimum:
++                    break
++                target_font_size = max(font_size_minimum,
++                                       int(target_font_size * used_cols / max(1, needed_cols)))
+             line_text_list, _ = text_render.calc_vertical(
+-                region.font_size, 
+-                region.translation, 
+-                max_height=region.unrotated_size[1],
++                target_font_size,
++                region.translation,
++                max_height=int(max_h),
+             )
+             needed_cols = len(line_text_list)
+-            # logger.debug(f"Needed columns: {needed_cols}") 
+             if needed_cols > used_cols:
+-                scale_x = ((needed_cols - used_cols) / used_cols) * 1 + 1
+-                try:  
+-                    poly = Polygon(region.unrotated_min_rect[0])
+-                    minx, miny, maxx, maxy = poly.bounds
+-                    poly = affinity.scale(poly, xfact=1.0, yfact=scale_x, origin=(minx, miny))                    
+-                    
+-                    pts = np.array(poly.exterior.coords[:4])  
+-                    dst_points = rotate_polygons(  
+-                        region.center, pts.reshape(1, -1), -region.angle,  
+-                        to_int=False  
+-                    ).reshape(-1, 4, 2)  
+-                    # 移除边界限制，允许文本超出检测框边界
+-                    # dst_points[..., 0] = dst_points[..., 0].clip(0, img.shape[1] - 1)  
+-                    # dst_points[..., 1] = dst_points[..., 1].clip(0, img.shape[0] - 1)  
+-                    dst_points = dst_points.astype(np.int64)
+-                    single_axis_expanded = True
+-                    # logger.debug(f"Successfully expanded vertical text width: xfact={scale_x:.2f}")  
+-                except Exception as e:  
+-                    # logger.error(f"Failed to expand vertical text: {e}")  
+-                    pass
+-
+-        # If single-axis expansion failed, use general scaling
+-        if not single_axis_expanded:
+-            # Calculate scaling factor based on text length ratio
+-            orig_text = getattr(region, "text_raw", region.text)
+-            char_count_orig = count_text_length(orig_text)
+-            char_count_trans = count_text_length(region.translation.strip())     
+-            length_ratio = 1.0
+-
+-            if char_count_orig > 0 and char_count_trans > char_count_orig:  
+-                increase_percentage = (char_count_trans - char_count_orig) / char_count_orig
+-                font_increase_ratio = 1 + (increase_percentage * 0.3)
+-                font_increase_ratio = min(1.5, max(1.0, font_increase_ratio))
+-                # logger.debug(f"Translation is {increase_percentage:.2%} longer, font increase ratio: {font_increase_ratio:.2f}")
+-                target_font_size = int(target_font_size * font_increase_ratio)
+-                # logger.debug(f"Adjusted target font size: {target_font_size}")
+-                # Need greater bounding box scaling to accommodate larger font size and longer text
+-                target_scale = max(1, min(1 + increase_percentage * 0.3, 2))  # Possibly max(1, min(1 + (font_increase_ratio-1), 2))
+-                # logger.debug(f"Translation is longer than original and font increased, need larger bounding box scaling. Target scale factor: {target_scale:.2f}")
+-            # Short text box expansion is quite aggressive, in many cases short text boxes don't need expansion
+-            # elif char_count_orig > 0 and char_count_trans < char_count_orig:
+-            #     # Translation is shorter, increase font proportionally
+-            #     decrease_percentage = (char_count_orig - char_count_trans) / char_count_orig
+-            #     # Font increase ratio equals text reduction ratio
+-            #     font_increase_ratio = 1 + decrease_percentage
+-            #     # Limit font increase ratio to reasonable range, e.g., between 1.0 and 1.5
+-            #     font_increase_ratio = min(1.5, max(1.0, font_increase_ratio))
+-            #     logger.debug(f"Translation is {decrease_percentage:.2%} shorter than original, font increase ratio: {font_increase_ratio:.2f}")
+-            #     # Update target font size
+-            #     target_font_size = int(target_font_size * font_increase_ratio)
+-            #     logger.debug(f"Adjusted target font size: {target_font_size}")
+-            #     target_scale = 1.0  # No additional bounding box scaling needed
+-            #     logger.debug(f"Translation is shorter than original, no bounding box scaling applied, only font increase. Target scale factor: {target_scale:.2f}")            
+-            else:  
+-                target_scale = 1              
+-                # logger.debug(f"No length ratio scaling applied. Target scale factor: {target_scale:.2f}")   
+-
+-            # Calculate final scaling factor
+-            font_size_scale = (((target_font_size - original_region_font_size) / original_region_font_size) * 0.4 + 1) if original_region_font_size > 0 else 1.0  
+-            # logger.debug(f"Font size ratio: ({target_font_size} / {original_region_font_size})")  
+-            final_scale = max(font_size_scale, target_scale)
+-            final_scale = max(1, min(final_scale, 1.1))  
+-            
+-            # logger.debug(f"Final scaling factor: {final_scale:.2f}")  
+-
+-            # Scale bounding box if needed
+-            if final_scale > 1.001:  
+-                # logger.debug(f"Scaling bounding box: text='{region.translation}', scale={final_scale:.2f}")  
+-                try:  
+-                    poly = Polygon(region.unrotated_min_rect[0])  
+-                     # Scale from the center  
+-                    poly = affinity.scale(poly, xfact=final_scale, yfact=final_scale, origin='center')  
+-                    scaled_unrotated_points = np.array(poly.exterior.coords[:4])  
+-
+-                    dst_points = rotate_polygons(region.center, scaled_unrotated_points.reshape(1, -1), -region.angle, to_int=False).reshape(-1, 4, 2)  
+-                    # 移除边界限制，允许文本超出检测框边界
+-                    # dst_points[..., 0] = dst_points[..., 0].clip(0, img.shape[1] - 1)  
+-                    # dst_points[..., 1] = dst_points[..., 1].clip(0, img.shape[0] - 1)  
+-                    dst_points = dst_points.astype(np.int64)  
+-                    dst_points = dst_points.reshape((-1, 4, 2))  
+-                    # logger.debug(f"Finished calculating scaled dst_points.")  
+-
+-                except Exception as e:  
+-                    # logger.error(f"Error during scaling for text '{region.translation}': {e}. Using original min_rect.")  
+-                    dst_points = region.min_rect
+-            else:
+-                dst_points = region.min_rect
+-
+-        # Store results and update font size
++                if needed_cols <= used_cols + 1:
++                    try:
++                        dst_points = _expand_dst(target_font_size * 0.6, 0.0)
++                    except Exception as e:
++                        logger.debug(f"Vertical column expansion failed: {e}")
++
+         dst_points_list.append(dst_points)  
+         region.font_size = int(target_font_size)
+ 
+@@ -242,14 +213,24 @@ async def dispatch(
+     hyphenate: bool = True,
+     render_mask: np.ndarray = None,
+     line_spacing: int = None,
+-    disable_font_border: bool = False
++    disable_font_border: bool = False,
++    vertical_rtl: bool = True
+     ) -> np.ndarray:
+ 
+     text_render.set_font(font_path)
+-    text_regions = list(filter(lambda region: region.translation, text_regions))
++    text_regions = expand_translation_regions(
++        list(filter(lambda region: region.translation, text_regions))
++    )
+ 
+     # Resize regions that are too small
+-    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum)
++    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum)
++
++    # State export happens after rendering; retain the smallest segment font on the parent block.
++    for region in text_regions:
++        parent = getattr(region, '_segment_parent', None)
++        if parent is not None:
++            current = int(getattr(parent, 'font_size', 0) or 0)
++            parent.font_size = min(current, region.font_size) if current > 0 else region.font_size
+ 
+     # TODO: Maybe remove intersections
+ 
+@@ -258,7 +239,7 @@ async def dispatch(
+         if render_mask is not None:
+             # set render_mask to 1 for the region that is inside dst_points
+             cv2.fillConvexPoly(render_mask, dst_points.astype(np.int32), 1)
+-        img = render(img, region, dst_points, hyphenate, line_spacing, disable_font_border)
++        img = render(img, region, dst_points, hyphenate, line_spacing, disable_font_border, vertical_rtl)
+     return img
+ 
+ def render(
+@@ -267,8 +248,12 @@ def render(
+     dst_points,
+     hyphenate,
+     line_spacing,
+-    disable_font_border
++    disable_font_border,
++    vertical_rtl: bool = True
+ ):
++    # 兜底: 极小框/异常计算可能导致字号为 0 或负，统一钳到 >= 1 防止除零
++    if not region.font_size or region.font_size < 1:
++        region.font_size = max(1, int(region.font_size or 22))
+     fg, bg = region.get_font_colors()
+     fg, bg = fg_bg_compare(fg, bg)
+ 
+@@ -317,6 +302,7 @@ def render(
+             fg,
+             bg,
+             line_spacing,
++            vertical_rtl,
+         )
+     h, w, _ = temp_box.shape
+     r_temp = w / h
+diff --git a/manga_translator/rendering/text_render.py b/manga_translator/rendering/text_render.py
+index 068d1b9..d6abbeb 100644
+--- a/manga_translator/rendering/text_render.py
++++ b/manga_translator/rendering/text_render.py
+@@ -538,7 +538,7 @@ def put_char_vertical(font_size: int, cdpt: str, pen_l: Tuple[int, int], canvas_
+     # Return vertical advance value  
+     return char_offset_y  
+ 
+-def put_text_vertical(font_size: int, text: str, h: int, alignment: str, fg: Tuple[int, int, int], bg: Optional[Tuple[int, int, int]], line_spacing: int):
++def put_text_vertical(font_size: int, text: str, h: int, alignment: str, fg: Tuple[int, int, int], bg: Optional[Tuple[int, int, int]], line_spacing: int, reversed_columns: bool = False):
+     text = compact_special_symbols(text)
+     if not text :
+         return
+@@ -546,7 +546,7 @@ def put_text_vertical(font_size: int, text: str, h: int, alignment: str, fg: Tup
+     spacing_x = int(font_size * (line_spacing or 0.2))
+ 
+     # make large canvas
+-    num_char_y = h // font_size
++    num_char_y = max(1, h // font_size)   # 字号大于框高时至少 1 列，避免除零崩溃
+     num_char_x = len(text) // num_char_y + 1
+     canvas_x = font_size * num_char_x + spacing_x * (num_char_x - 1) + (font_size + bg_size) * 2
+     canvas_y = font_size * num_char_y + (font_size + bg_size) * 2
+@@ -556,8 +556,12 @@ def put_text_vertical(font_size: int, text: str, h: int, alignment: str, fg: Tup
+     canvas_text = np.zeros((canvas_y, canvas_x), dtype=np.uint8)
+     canvas_border = canvas_text.copy()
+ 
+-    # pen (x, y)
+-    pen_orig = [canvas_text.shape[1] - (font_size + bg_size), font_size + bg_size]
++    # pen (x, y) —— 竖排列序: 默认从右到左（reversed_columns=True，日漫阅读习惯）；
++    # False 时从左到右排
++    if reversed_columns:
++        pen_orig = [canvas_x - (font_size + bg_size), font_size + bg_size]
++    else:
++        pen_orig = [font_size + bg_size, font_size + bg_size]
+ 
+     # write stuff
+     for line_text, line_height in zip(line_text_list, line_height_list):
+@@ -570,7 +574,10 @@ def put_text_vertical(font_size: int, text: str, h: int, alignment: str, fg: Tup
+         for c in line_text:
+             offset_y = put_char_vertical(font_size, c, pen_line, canvas_text, canvas_border, border_size=bg_size)
+             pen_line[1] += offset_y
+-        pen_orig[0] -= spacing_x + font_size
++        if reversed_columns:
++            pen_orig[0] -= spacing_x + font_size
++        else:
++            pen_orig[0] += spacing_x + font_size
+ 
+     # colorize
+     canvas_border = np.clip(canvas_border, 0, 255)
+-- 
+2.55.0.windows.3
+

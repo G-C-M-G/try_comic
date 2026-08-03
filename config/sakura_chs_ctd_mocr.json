@@ -1,0 +1,24 @@
+{
+  "translator": {
+    "translator": "sakura",
+    "target_lang": "CHS"
+  },
+  "detector": {
+    "detector": "ctd",
+    "det_rotate": true,
+    "det_auto_rotate": true,
+    "box_threshold": 0.6
+  },
+  "ocr": {
+    "ocr": "mocr",
+    "use_mocr_merge": true
+  },
+  "inpainter": {
+    "inpainter": "lama_large"
+  },
+  "render": {
+    "renderer": "default",
+    "alignment": "auto",
+    "font_size_minimum": 22
+  }
+}

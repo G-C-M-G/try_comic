@@ -1,0 +1,19 @@
+{
+  "translator": {
+    "translator": "sakura",
+    "target_lang": "CHS"
+  },
+  "detector": {
+    "detector": "default"
+  },
+  "ocr": {
+    "ocr": "48px"
+  },
+  "inpainter": {
+    "inpainter": "lama_large"
+  },
+  "render": {
+    "renderer": "default",
+    "alignment": "auto"
+  }
+}
