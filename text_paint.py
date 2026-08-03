@@ -8,6 +8,7 @@
 - 返回画布尺寸 = (max_w, max_h)，内容按对齐放置；调用方以框中心对齐粘贴
 """
 import os
+import re
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -17,6 +18,12 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 FONT_PATH = os.path.join(ROOT, "manga-image-translator", "fonts", "msyh.ttc")
 
 _font_cache = {}
+_VERTICAL_ELLIPSIS_RE = re.compile(r"(?:…{2,}|[.．]{2,})")
+
+
+def normalize_vertical_text(text: str) -> str:
+    """Use the Unicode presentation form for ellipses in vertical layouts."""
+    return _VERTICAL_ELLIPSIS_RE.sub("︙", str(text or ""))
 
 
 def get_font(size: int, font_path: str = None, bold: bool = False) -> ImageFont.FreeTypeFont:
@@ -72,6 +79,7 @@ def render_text_image(text: str, font_size: int, vertical: bool,
         d.rectangle([0, 0, max_w - 1, max_h - 1], fill=tuple(fill_bg_color) + (255,))
 
     if vertical:
+        text = normalize_vertical_text(text)
         _render_vertical(d, font, text, font_size, max_w, max_h, fill, stroke_fill, stroke,
                          rtl, line_h, char_spacing, align_h, align_v)
     else:

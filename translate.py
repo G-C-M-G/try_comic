@@ -72,7 +72,7 @@ from manual_state import save_page_state
 from glossary import Glossary, make_glossary_dict_file
 from memory import TranslationMemory
 from cache import PageCache
-from text_segments import attach_translation_segments
+from text_segments import attach_translation_segments, make_sentence_grouping_hook
 
 SUPPORTED_IMAGES = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
 
@@ -146,11 +146,15 @@ def build_hooks(input_path: str, params: dict, args, cache: PageCache, cache_sig
     if os.path.exists(sfx_report):
         os.remove(sfx_report)
 
-    hook = make_sfx_hook(sfx_max_count=args.sfx_max,
-                         enable=not args.no_sfx,
-                         white_threshold=args.sfx_threshold,
-                         min_white_ratio=args.sfx_ratio,
-                         report_path=sfx_report)
+    sfx_hook = make_sfx_hook(sfx_max_count=args.sfx_max,
+                             enable=not args.no_sfx,
+                             white_threshold=args.sfx_threshold,
+                             min_white_ratio=args.sfx_ratio,
+                             report_path=sfx_report)
+    hook = make_sentence_grouping_hook(
+        sfx_hook,
+        enable=not args.no_sentence_merge,
+    )
     sfx_post = make_sfx_post_hook(enable=not args.no_sfx, report_path=sfx_report)
     name_hook = make_transliteration_hook(enable=True, report_path=sfx_report, memory=memory if memory_enable else None)
 
@@ -162,10 +166,10 @@ def build_hooks(input_path: str, params: dict, args, cache: PageCache, cache_sig
             keep = sfx_post(ctx)
             if keep is not None:
                 ctx.text_regions = keep
-        if memory_enable and memory is not None:
-            memory.record_hook(ctx)
         for region in ctx.text_regions:
             attach_translation_segments(region)
+        if memory_enable and memory is not None:
+            memory.record_hook(ctx)
         return None
 
     # 术语表: 生成 pre_dict 字典文件（翻译前替换原文）
@@ -268,6 +272,8 @@ async def main():
     ap.add_argument("--no-glossary", action="store_true", help="关闭术语表")
     ap.add_argument("--no-memory", action="store_true", help="关闭翻译记忆库")
     ap.add_argument("--no-cache", action="store_true", help="关闭译文缓存")
+    ap.add_argument("--no-sentence-merge", action="store_true",
+                    help="关闭按画格和句末标点合并 OCR 框（诊断用）")
     # 诊断: 打印完整调用参数（排障用，异常时可在日志中看到真实调用）
     print(f"[translate] ARGV: {' '.join(sys.argv)}", file=sys.stderr)
     try:
@@ -367,13 +373,14 @@ async def main():
     # 注意: 不含翻译记忆 mtime——记忆自动记录每页都变化，会使缓存永不命中；
     # 手动编辑记忆后想重新应用，可在「词典与缓存」页清空缓存
     sig_parts = [
-        "pipeline2",
+        "pipeline3-sentence-merge",
         "cfg" + hashlib.sha256(
             json.dumps(cfg, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()[:16],
         f"f{args.font_min}",
         f"sfx{0 if args.no_sfx else 1}",
         f"dir{direction}",
+        f"sent{0 if args.no_sentence_merge else 1}",
         f"gl{round(glossary.file_mtime() if glossary else 0, 3)}",
     ]
     cache_signature = "|".join(sig_parts)

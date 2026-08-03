@@ -45,6 +45,11 @@ def region_to_dict(r: TextBlock) -> dict:
     translation_segments = getattr(r, "translation_segments", None)
     if translation_segments:
         d["translation_segments"] = list(translation_segments)
+    render_segments = getattr(r, "render_segments", None)
+    if render_segments:
+        d["render_segments"] = list(render_segments)
+    if getattr(r, "sentence_grouped", False):
+        d["sentence_grouped"] = True
     # PS 式文字样式字段（可选，缺省=旧行为）
     for k, default in (
         ("font", None), ("font_bold", False), ("stroke_w", None),
@@ -89,6 +94,10 @@ def region_from_dict(d: dict) -> TextBlock:
             setattr(r, k, d[k])
     if d.get("translation_segments"):
         r.translation_segments = list(d["translation_segments"])
+    if d.get("render_segments"):
+        r.render_segments = list(d["render_segments"])
+    if d.get("sentence_grouped"):
+        r.sentence_grouped = True
     for key in ("ocr_backend", "ocr_confidence", "ocr_score_proxy"):
         if key in d:
             setattr(r, key, d[key])

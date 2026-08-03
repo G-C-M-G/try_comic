@@ -19,6 +19,8 @@ __pycache__/
 /依赖备份.zip
 /backup_*.zip
 /漫画翻译助手.exe
+/outputs/
+/result/
 
 # User/runtime state
 /config/cache_index.json

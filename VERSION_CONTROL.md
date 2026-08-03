@@ -5,7 +5,7 @@
 - 根目录仓库：GUI、翻译编排、工作台、缓存与文档。
 - `manga-image-translator`：上游 MITS 引擎及本项目补丁，独立维护在 `local/try-comic` 分支。
 
-当前引擎基线：上游 `95227a2`，本地补丁提交 `d7dbd60`。根仓库还保存了可移植补丁：`patches/0001-feat-preserve-local-translation-pipeline-customizati.patch`。
+当前引擎基线：上游 `95227a2`，本地补丁提交依次为 `d7dbd60`、`269588d`。根仓库保存对应的两个可移植补丁，位于 `patches/`。
 
 大型 ZIP 备份、虚拟环境、模型、缓存、翻译输出和运行期用户数据都由根目录 `.gitignore` 排除；这些文件没有被删除。
 
@@ -37,4 +37,5 @@ git restore -- path\to\file
 ```powershell
 git -C manga-image-translator switch -c local/try-comic 95227a2
 git -C manga-image-translator am ..\patches\0001-feat-preserve-local-translation-pipeline-customizati.patch
+git -C manga-image-translator am ..\patches\0001-feat-preserve-sentence-segments-through-OCR-renderin.patch
 ```
