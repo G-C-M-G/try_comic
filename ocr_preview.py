@@ -53,6 +53,8 @@ def sorted_columns(data: dict) -> list[dict]:
 
 
 def source_color(column: dict) -> str:
+    if column.get("review_required"):
+        return "#D55E00"
     return SOURCE_COLORS.get(column.get("text_source", ""), "#CC79A7")
 
 
@@ -110,11 +112,12 @@ def render_preview(data: dict, output_path: Path) -> None:
     y += title_font.size + 14 if hasattr(title_font, "size") else 50
 
     summary = data.get("fusion_summary", {})
+    review = data.get("manual_review", {})
     agreement = summary.get("cross_validated_columns", 0)
-    supplement = summary.get("paddle_supplemented_columns", 0)
     draw.text(
         (x0, y),
-        f"识别 {len(columns)} 列 | 双模型定位确认 {agreement} | Paddle 补充 {supplement}",
+        f"识别 {len(columns)} 列 | 双模型定位确认 {agreement} | "
+        f"待核对 {review.get('pending_count', 0)} | 已绕过 {review.get('bypassed_count', 0)}",
         font=small_font,
         fill="#4A4D50",
     )
@@ -123,7 +126,7 @@ def render_preview(data: dict, output_path: Path) -> None:
     legend_items = (
         ("#009E73", "双模型文字一致"),
         ("#0072B2", "Paddle 补充区域"),
-        ("#D55E00", "双模型文字有分歧"),
+        ("#D55E00", "待人工核对"),
         ("#CC79A7", "区域确认，采用单模型文字"),
     )
     legend_width = (panel_width - 56) // 2
@@ -162,7 +165,10 @@ def render_preview(data: dict, output_path: Path) -> None:
         )
         text_x = entry_x + 46
         max_width = list_width - 54
-        lines = wrap_text(draw, column.get("text", ""), body_font, max_width)
+        display_text = column.get("text", "")
+        if column.get("review_required"):
+            display_text += "  [待核对]"
+        lines = wrap_text(draw, display_text, body_font, max_width)
         line_height = max(22, getattr(body_font, "size", 18) + 3)
         for line_index, line in enumerate(lines[:2]):
             draw.text(
@@ -184,14 +190,30 @@ def write_report(items: list[tuple[Path, dict]], output_path: Path) -> None:
         lines.extend((f"## Page {page}", "", "### Columns", ""))
         for index, column in enumerate(columns, start=1):
             sources = ", ".join(column.get("detection_sources", []))
+            review_reasons = ", ".join(column.get("review_reasons", []))
             lines.append(
                 f"{index:02d}. {column.get('text', '')}  "
-                f"`{column.get('id', '')}; {column.get('text_source', '')}; {sources}`"
+                f"`{column.get('id', '')}; {column.get('text_source', '')}; {sources}; "
+                f"review={column.get('review_status', 'unknown')}`"
             )
+            if review_reasons:
+                lines.append(f"    Review reasons: `{review_reasons}`")
         lines.extend(("", "### Grouped sentences", ""))
         for unit in data.get("translation_units", []):
             ids = ", ".join(unit.get("column_ids", []))
             lines.append(f"- {unit.get('source_text', '')}  `{ids}`")
+        lines.extend(("", "### Manual review queue", ""))
+        queue = data.get("manual_review_queue", [])
+        if not queue:
+            lines.append("- None")
+        for item in queue:
+            readings = " / ".join(item.get("mangaocr_readings", []))
+            reasons = ", ".join(item.get("reason_codes", []))
+            lines.append(
+                f"- `{item.get('column_id')}` {item.get('current_text', '')} "
+                f"status=`{item.get('status')}` reasons=`{reasons}` "
+                f"MangaOCR=`{readings}` PaddleOCR=`{item.get('paddleocr_text', '')}`"
+            )
         lines.extend(("", f"Source JSON: `{json_path}`", ""))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines), encoding="utf-8")

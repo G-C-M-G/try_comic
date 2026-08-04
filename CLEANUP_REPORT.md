@@ -31,7 +31,7 @@
 
 ```text
 outputs/
-├── hybrid_batch/        # 4 个最终 OCR JSON
+├── hybrid_batch/        # 4 个最终 OCR JSON + 4 个人工决定模板
 ├── paddle_batch_input/  # 4 张对应原图
 ├── ocr_baselines/       # 1、8、19 页照片基准
 └── ocr_review/          # 4 张核对图和 OCR_result.md
@@ -58,7 +58,7 @@ outputs/
 ## 验证结论
 
 - 根仓库与 MITS 仓库工作树在交接前均为干净状态。
-- 根仓库全部 38 项单元测试通过。
+- 根仓库全部 43 项单元测试通过，其中 5 项覆盖人工核对判定、开关、BOM 兼容和校正回填。
 - 四个最终 JSON 均为 schema 4，原图存在且尺寸匹配。
 - 1/8/19 页继续满足框 F1 不低于 90%、CER 不高于 10%、多字符正文零遗漏。
 - OCR 核对图可由 `ocr_preview.py` 从最终 JSON 重新生成。

@@ -12,7 +12,9 @@
     "reading_order",
     "translation_units",
     "ignored_regions",
-    "fusion_summary"
+    "fusion_summary",
+    "manual_review",
+    "manual_review_queue"
   ],
   "properties": {
     "schema_version": { "const": 4 },
@@ -43,6 +45,32 @@
     },
     "ignored_regions": { "type": "array" },
     "fusion_summary": { "type": "object" },
+    "manual_review": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "status",
+        "translation_blocked",
+        "candidate_count",
+        "pending_count",
+        "bypassed_count"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "status": { "enum": ["not_required", "pending", "bypassed", "complete"] },
+        "translation_blocked": { "type": "boolean" },
+        "candidate_count": { "type": "integer", "minimum": 0 },
+        "pending_count": { "type": "integer", "minimum": 0 },
+        "bypassed_count": { "type": "integer", "minimum": 0 },
+        "reviewed_count": { "type": "integer", "minimum": 0 },
+        "policy": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "manual_review_queue": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/manualReviewItem" }
+    },
     "benchmark": { "type": "object" }
   },
   "additionalProperties": true,
@@ -81,7 +109,10 @@
         "selection_order",
         "panel_index",
         "text_source",
-        "detection_sources"
+        "detection_sources",
+        "review_required",
+        "review_status",
+        "review_reasons"
       ],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
@@ -98,6 +129,15 @@
           "minItems": 1,
           "uniqueItems": true
         },
+        "review_required": { "type": "boolean" },
+        "review_status": {
+          "enum": ["not_required", "pending", "bypassed", "approved", "corrected"]
+        },
+        "review_reasons": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
         "readings": {
           "type": "array",
           "items": { "type": "string" }
@@ -111,6 +151,33 @@
       "properties": {
         "column_id": { "type": "string", "minLength": 1 },
         "source_text": { "type": "string", "minLength": 1 },
+        "polygon": { "$ref": "#/$defs/polygon" },
+        "image_bbox": { "$ref": "#/$defs/bbox" },
+        "layout_bbox_10pct": { "$ref": "#/$defs/bbox" }
+      },
+      "additionalProperties": true
+    },
+    "manualReviewItem": {
+      "type": "object",
+      "required": [
+        "column_id",
+        "status",
+        "reason_codes",
+        "current_text",
+        "polygon",
+        "image_bbox",
+        "layout_bbox_10pct"
+      ],
+      "properties": {
+        "column_id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["pending", "bypassed", "approved", "corrected", "rejected"] },
+        "reason_codes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "current_text": { "type": "string", "minLength": 1 },
         "polygon": { "$ref": "#/$defs/polygon" },
         "image_bbox": { "$ref": "#/$defs/bbox" },
         "layout_bbox_10pct": { "$ref": "#/$defs/bbox" }

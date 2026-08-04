@@ -46,6 +46,8 @@ _SPACE_RE = re.compile(r"\s+")
 _SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 PADDLE_PYTHON = ROOT / "paddle_venv" / "Scripts" / "python.exe"
 PADDLE_WORKER = ROOT / "paddle_ocr_worker.py"
+MANUAL_REVIEW_BOX_OVERLAP_THRESHOLD = 0.65
+MANUAL_REVIEW_CONSENSUS_THRESHOLD = 0.67
 
 
 def normalize_ocr_text(value: str) -> str:
@@ -333,6 +335,101 @@ def choose_cross_validated_text(
     return manga_text, manga_confidence, "manga_ocr", comparison
 
 
+def manual_review_reasons(column: dict) -> list[str]:
+    """Return auditable reasons why a retained OCR column needs a human decision."""
+    reasons: list[str] = []
+    detection_sources = set(column.get("detection_sources", []))
+    paddle_validation = column.get("paddle_validation", []) or []
+    cross_validation = column.get("cross_validation", {}) or {}
+
+    if column.get("supplemental"):
+        reasons.append("paddle-only-detection")
+    elif not {"ctd", "paddleocr"}.issubset(detection_sources):
+        reasons.append("single-model-detection")
+
+    if paddle_validation:
+        best_overlap = max(float(item.get("box_overlap", 0.0)) for item in paddle_validation)
+        if best_overlap < MANUAL_REVIEW_BOX_OVERLAP_THRESHOLD:
+            reasons.append("weak-box-overlap")
+    elif "paddleocr" in detection_sources:
+        reasons.append("missing-paddle-geometry")
+
+    agrees = cross_validation.get("agrees")
+    if agrees is False:
+        reasons.append("cross-model-text-disagreement")
+    elif agrees is None:
+        reasons.append("missing-cross-model-text-confirmation")
+
+    if column.get("text_source") == "paddleocr-rescue":
+        reasons.append("paddleocr-text-rescue")
+    if (
+        float(column.get("recognition_confidence", 0.0))
+        < MANUAL_REVIEW_CONSENSUS_THRESHOLD
+    ):
+        reasons.append("unstable-mangaocr-readings")
+    return list(dict.fromkeys(reasons))
+
+
+def attach_manual_review_queue(result: dict, enabled: bool = True) -> dict:
+    """Mark uncertain columns and block downstream work until a user resolves them."""
+    queue = []
+    for column in result.get("columns", []):
+        reasons = manual_review_reasons(column)
+        column["review_required"] = bool(reasons)
+        column["review_status"] = (
+            "pending" if enabled and reasons else "bypassed" if reasons else "not_required"
+        )
+        column["review_reasons"] = reasons
+        if not reasons:
+            continue
+        paddle_validation = column.get("paddle_validation", []) or []
+        paddle = max(
+            paddle_validation,
+            key=lambda item: (float(item.get("confidence", 0.0)), len(item.get("text", ""))),
+            default={},
+        )
+        queue.append({
+            "column_id": column["id"],
+            "status": "pending" if enabled else "bypassed",
+            "reason_codes": reasons,
+            "current_text": column.get("text", ""),
+            "mangaocr_readings": list(column.get("readings", [])),
+            "mangaocr_confidence": column.get("recognition_confidence"),
+            "paddleocr_text": paddle.get("text", ""),
+            "paddleocr_confidence": paddle.get("confidence"),
+            "paddle_box_overlap": paddle.get("box_overlap"),
+            "text_source": column.get("text_source"),
+            "detection_sources": list(column.get("detection_sources", [])),
+            "polygon": column.get("polygon"),
+            "image_bbox": column.get("image_bbox"),
+            "layout_bbox_10pct": column.get("layout_bbox_10pct"),
+        })
+
+    candidate_count = len(queue)
+    pending_count = candidate_count if enabled else 0
+    result["manual_review"] = {
+        "enabled": enabled,
+        "status": (
+            "pending" if pending_count else "bypassed" if candidate_count else "not_required"
+        ),
+        "translation_blocked": bool(enabled and pending_count),
+        "candidate_count": candidate_count,
+        "pending_count": pending_count,
+        "bypassed_count": candidate_count if not enabled else 0,
+        "reviewed_count": 0,
+        "policy": {
+            "cross_model_text_agreement_required": True,
+            "minimum_box_overlap": MANUAL_REVIEW_BOX_OVERLAP_THRESHOLD,
+            "minimum_mangaocr_consensus": MANUAL_REVIEW_CONSENSUS_THRESHOLD,
+            "single_model_detection_requires_review": True,
+            "paddleocr_rescue_requires_review": True,
+        },
+    }
+    result["manual_review_queue"] = queue
+    result.setdefault("fusion_summary", {})["manual_review_columns"] = candidate_count
+    return result
+
+
 def run_paddle_worker(source: Path, device: str = "cpu") -> dict[str, list[dict]]:
     if not PADDLE_PYTHON.is_file():
         raise RuntimeError(
@@ -509,6 +606,7 @@ class BackgroundMangaOCR:
         path: str,
         box_threshold: float = 0.30,
         paddle_predictions: Sequence[dict] | None = None,
+        manual_review_enabled: bool = True,
     ) -> dict:
         source = str(Path(path).resolve())
         image = np.array(Image.open(source).convert("RGB"))
@@ -568,7 +666,7 @@ class BackgroundMangaOCR:
             ),
             "paddle_rejected_candidates": len(paddle_rejected),
         }
-        return {
+        result = {
             "schema_version": 4,
             "backend": (
                 "Headless CTD + MangaOCR + PaddleOCR cross-validation"
@@ -585,6 +683,7 @@ class BackgroundMangaOCR:
                 "paddleocr_model": "PP-OCRv6 medium",
                 "single_character_confidence_threshold": 0.67,
                 "layout_overflow_allowance": 0.10,
+                "manual_review_enabled": manual_review_enabled,
             },
             "columns": columns,
             "reading_order": reading_order,
@@ -593,6 +692,7 @@ class BackgroundMangaOCR:
             "fusion_summary": fusion_summary,
             "paddle_rejected_regions": paddle_rejected,
         }
+        return attach_manual_review_queue(result, enabled=manual_review_enabled)
 
 
 def _cuda_available() -> bool:
@@ -700,7 +800,10 @@ async def _run(args) -> int:
             else paddle_by_source.get(os.path.normcase(str(image_path.resolve())), [])
         )
         result = await engine.process_image(
-            str(image_path), args.box_threshold, paddle_predictions
+            str(image_path),
+            args.box_threshold,
+            paddle_predictions,
+            manual_review_enabled=not args.no_manual_review,
         )
         target = output if output_is_file else output / f"{image_path.stem}.ocr.json"
         if args.photos_baseline and len(image_paths) == 1:
@@ -721,6 +824,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--paddle-device", choices=["cpu", "gpu:0"], default="cpu")
     parser.add_argument("--no-paddle", action="store_true", help="Diagnostic CTD/MangaOCR-only mode")
+    parser.add_argument(
+        "--no-manual-review",
+        action="store_true",
+        help="Keep uncertainty metadata but bypass the human-review translation gate",
+    )
     return asyncio.run(_run(parser.parse_args(argv)))
 
 

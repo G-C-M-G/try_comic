@@ -10,6 +10,7 @@ schema 4 JSON，完成以下闭环：
 ```text
 原图 + OCR JSON
   -> 校验图片尺寸和 OCR 数据
+  -> 人工核对 pending OCR 框（默认开启，可绕过）
   -> 按 translation_units 整句翻译
   -> 按 layout_regions 逐块生成擦字掩膜
   -> 局部修复背景
@@ -25,6 +26,7 @@ schema 4 JSON，完成以下闭环：
   `translation_query` 的 `<1>...<N>` 标记对齐。
 - 最大可用排版范围是 `layout_bbox_10pct`，已经包含总宽高 10% 的越界余量，不要再次放大。
 - `ocr_schema_v4.json` 提供机器可读的结构校验；跨字段的 ID 对应和图片尺寸仍需下游显式检查。
+- `manual_review.translation_blocked=true` 时，下游必须停止该页翻译，等待人工决定。
 
 ## 2. 上游架构
 
@@ -61,6 +63,8 @@ Windows“照片”路径已经降级为基准采集器。它的清单只用于�
 | `ignored_regions` | 明确放弃的区域及原因；不得静默当作正文处理 |
 | `fusion_summary` | 双模型确认、分歧、Paddle 补漏和拒绝统计 |
 | `benchmark` | 有“照片”基准时的框 F1、CER 和验收结论 |
+| `manual_review` | 人工核对开关、阻断状态和候选/待核对/绕过数量 |
+| `manual_review_queue` | 不确定框、两模型读数、坐标、原因和人工决定 |
 
 ### `columns[]` 关键字段
 
@@ -95,8 +99,37 @@ Windows“照片”路径已经降级为基准采集器。它的清单只用于�
 4. `column_ids` 全部存在，且与 `layout_regions.column_id` 一一对应。
 5. 所有坐标裁剪到图片边界；坐标错误必须报错，不能静默使用全页框。
 6. 图片路径失效时，按显式 `--image`、JSON 同目录、样本目录中的同名文件依次解析。
+7. `manual_review.translation_blocked=true` 时拒绝翻译；只有完成核对或显式绕过才能继续。
 
-## 4. 擦字与嵌字边界
+## 4. 人工核对规则
+
+人工核对默认开启。以下任一情况会保留该框，但把它放进 `manual_review_queue`：
+
+- CTD 与 PaddleOCR 的最终文字不一致。
+- 文字框只得到一个检测模型确认，或属于 Paddle 独有补漏框。
+- 两个模型的框重叠低于 0.65。
+- MangaOCR 三次读数一致性低于 0.67。
+- 最终文字由高置信 PaddleOCR 接管。
+
+默认状态为 `pending`，同时设置 `translation_blocked=true`。运行 OCR 时传入
+`--no-manual-review` 可关闭阻断；候选仍保存在队列中，状态改为 `bypassed`，不会静默丢失。
+
+人工核对工作流：
+
+```powershell
+venv\Scripts\python.exe ocr_review.py prepare outputs\hybrid_batch\1.ocr.json
+# 编辑 1.ocr.review.json：decision 改为 approved/corrected/rejected
+venv\Scripts\python.exe ocr_review.py apply `
+  outputs\hybrid_batch\1.ocr.json `
+  outputs\hybrid_batch\1.ocr.review.json `
+  outputs\hybrid_batch\1.reviewed.ocr.json
+```
+
+`corrected` 时填写 `corrected_text`，必要时也可填写 `corrected_polygon` 或
+`corrected_image_bbox`。`apply` 会校验原 OCR 文件 SHA-256；仍有 `pending`、哈希不匹配、
+坐标越界或没有填写修改时会直接报错。回填后同步重建阅读顺序、完整句子和嵌字区域。
+
+## 5. 擦字与嵌字边界
 
 推荐的实现规则：
 
@@ -110,7 +143,7 @@ Windows“照片”路径已经降级为基准采集器。它的清单只用于�
    不得越过 `layout_bbox_10pct`。
 8. 画面艺术字默认黑字加白描边；气泡正文默认黑字。样式由可替换策略判断，不写死在 OCR 层。
 
-## 5. 已验收样本
+## 6. 已验收样本
 
 | 页面 | 有效列 | 翻译单元 | 框 F1 | CER | 多字符漏列 |
 |---|---:|---:|---:|---:|---:|
@@ -127,12 +160,12 @@ Windows“照片”路径已经降级为基准采集器。它的清单只用于�
 ```text
 outputs/
 ├── paddle_batch_input/  # 1、8、19、22 原图
-├── hybrid_batch/        # 对应的最终 *.ocr.json
+├── hybrid_batch/        # 最终 *.ocr.json 和可编辑 *.ocr.review.json
 ├── ocr_baselines/       # 1、8、19 的 Windows“照片”验收清单
 └── ocr_review/          # 编号框核对图和完整文本报告
 ```
 
-## 6. 下游验收要求
+## 7. 下游验收要求
 
 - 输入一张图及其 OCR JSON，可生成同尺寸最终翻译图。
 - 每个保留列都有处理状态：已擦除并嵌字、合并到句级区域、或带明确原因进入复核队列。
@@ -143,8 +176,10 @@ outputs/
 - 输出 `*.state.json`，记录源 OCR 哈希、原文、译文、擦字策略、掩膜、字体、字号、方向、
   描边和最终渲染框，保证可以只改文字后重新嵌字。
 - 提供 dry-run 核对图、单元测试和 1/8/19/22 四页端到端回归。
+- 默认开启人工核对开关；存在 `pending` 时不得翻译。界面和 CLI 都必须允许显式关闭并显示
+  `bypassed` 数量。
 
-## 7. 版本与恢复点
+## 8. 版本与恢复点
 
 - 根仓库 OCR 实现提交：`7f9c175 feat: add headless hybrid manga OCR`
 - OCR 核对图工具提交：`f20e647 feat: add OCR result preview`
