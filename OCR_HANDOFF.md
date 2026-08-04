@@ -24,7 +24,9 @@ schema 4 JSON，完成以下闭环：
 - 擦字使用该单元下每个 `layout_regions` 的 `polygon` 或 `image_bbox`，不得用整句外接大框覆盖画面。
 - 嵌字优先在多个原列框的联合区域内排版；需要严格逐列回填时，再利用 `column_ids` 和
   `translation_query` 的 `<1>...<N>` 标记对齐。
-- 最大可用排版范围是 `layout_bbox_10pct`，已经包含总宽高 10% 的越界余量，不要再次放大。
+- `layout_bbox_10pct` 是默认排版硬边界，已经包含总宽高 10% 的余量，不要在其上再次放大。
+  下游只有在排版失败且进入人工核对时，才可从人工确认后的原始完整框直接计算 20% 框；
+  总宽高 20% 是绝对上限，禁止复合扩张。
 - `ocr_schema_v4.json` 提供机器可读的结构校验；跨字段的 ID 对应和图片尺寸仍需下游显式检查。
 - `manual_review.translation_blocked=true` 时，下游必须停止该页翻译，等待人工决定。
 
@@ -108,6 +110,7 @@ Windows“照片”路径已经降级为基准采集器。它的清单只用于�
 - CTD 与 PaddleOCR 的最终文字不一致。
 - 文字框只得到一个检测模型确认，或属于 Paddle 独有补漏框。
 - 两个模型的框重叠低于 0.65。
+- PaddleOCR 的高置信完整框沿阅读方向明显超出当前框，可能存在截字。
 - MangaOCR 三次读数一致性低于 0.67。
 - 最终文字由高置信 PaddleOCR 接管。
 
@@ -126,8 +129,10 @@ venv\Scripts\python.exe ocr_review.py apply `
 ```
 
 `corrected` 时填写 `corrected_text`，必要时也可填写 `corrected_polygon` 或
-`corrected_image_bbox`。`apply` 会校验原 OCR 文件 SHA-256；仍有 `pending`、哈希不匹配、
-坐标越界或没有填写修改时会直接报错。回填后同步重建阅读顺序、完整句子和嵌字区域。
+`corrected_image_bbox`。队列同时提供 `paddle_polygon`、`paddle_image_bbox` 和沿阅读方向的
+`paddle_geometry_coverage`；确认 PaddleOCR 框更完整时可设置 `use_paddle_geometry=true`。
+`apply` 会校验原 OCR 文件 SHA-256；仍有 `pending`、哈希不匹配、坐标越界或没有填写修改时
+会直接报错。回填后同步重建阅读顺序、完整句子和嵌字区域。
 
 ## 5. 擦字与嵌字边界
 
@@ -140,7 +145,8 @@ venv\Scripts\python.exe ocr_review.py apply `
 5. 翻译按完整句子进行，默认生成自然、简洁、符合人物语气的中文，不照搬日语语序。
 6. 嵌字按整句联合区域排版，保留 `column_ids` 映射；严格逐列模式才把译文切回各列。
 7. 字号采用“在允许范围内尽可能大”的二分搜索。译文仍放不下时应报告或进入复核队列，
-   不得越过 `layout_bbox_10pct`。
+   默认不得越过 `layout_bbox_10pct`。确需使用 20% 时必须从已核对的完整 `image_bbox` 直接
+   计算、记录原因并再次人工确认，任何像素不得超过该 20% 框。
 8. 画面艺术字默认黑字加白描边；气泡正文默认黑字。样式由可替换策略判断，不写死在 OCR 层。
 
 ## 6. 已验收样本
@@ -160,7 +166,7 @@ venv\Scripts\python.exe ocr_review.py apply `
 ```text
 outputs/
 ├── paddle_batch_input/  # 1、8、19、22 原图
-├── hybrid_batch/        # 最终 *.ocr.json 和可编辑 *.ocr.review.json
+├── hybrid_batch/        # *.ocr.json、核对模板及核对完成的 *.reviewed.ocr.json
 ├── ocr_baselines/       # 1、8、19 的 Windows“照片”验收清单
 └── ocr_review/          # 编号框核对图和完整文本报告
 ```
@@ -170,7 +176,8 @@ outputs/
 - 输入一张图及其 OCR JSON，可生成同尺寸最终翻译图。
 - 每个保留列都有处理状态：已擦除并嵌字、合并到句级区域、或带明确原因进入复核队列。
 - 擦字不得跨越相邻气泡/分镜；掩膜外不产生无关像素改动。
-- 译文不得超过 `layout_bbox_10pct`，允许的总越界上限仍为 10%。
+- 译文默认不得超过 `layout_bbox_10pct`；人工确认的例外最多使用从完整 OCR 框直接计算的
+  总宽高 20% 边界，20% 为不可突破的绝对上限。
 - 默认按完整句子翻译，中文应自然口语化，专名受术语表约束。
 - 支持单图和目录批量；批量运行不打开窗口、不控制鼠标。
 - 输出 `*.state.json`，记录源 OCR 哈希、原文、译文、擦字策略、掩膜、字体、字号、方向、

@@ -20,6 +20,8 @@ SOURCE_COLORS = {
     "cross-model-disagreement": "#D55E00",
 }
 
+PADDLE_GEOMETRY_COLOR = "#0072B2"
+
 
 def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     for candidate in FONT_CANDIDATES:
@@ -66,8 +68,26 @@ def render_preview(data: dict, output_path: Path) -> None:
     overlay = Image.new("RGBA", source.size, (0, 0, 0, 0))
     marks = ImageDraw.Draw(overlay)
     label_font = load_font(max(16, round(source.width / 55)))
+    review_queue = {
+        item.get("column_id"): item for item in data.get("manual_review_queue", [])
+    }
 
     for number, column in enumerate(columns, start=1):
+        review_item = review_queue.get(column.get("id"), {})
+        paddle_polygon = [
+            tuple(point) for point in review_item.get("paddle_polygon", []) or []
+        ]
+        if "paddle-box-extends-current-region" in review_item.get("reason_codes", []):
+            if len(paddle_polygon) < 3 and review_item.get("paddle_image_bbox"):
+                px1, py1, px2, py2 = review_item["paddle_image_bbox"]
+                paddle_polygon = [(px1, py1), (px2, py1), (px2, py2), (px1, py2)]
+            if len(paddle_polygon) >= 3:
+                marks.line(
+                    paddle_polygon + [paddle_polygon[0]],
+                    fill=PADDLE_GEOMETRY_COLOR,
+                    width=4,
+                    joint="curve",
+                )
         polygon = [tuple(point) for point in column.get("polygon", [])]
         if len(polygon) < 3:
             x1, y1, x2, y2 = column["image_bbox"]
@@ -125,7 +145,7 @@ def render_preview(data: dict, output_path: Path) -> None:
 
     legend_items = (
         ("#009E73", "双模型文字一致"),
-        ("#0072B2", "Paddle 补充区域"),
+        ("#0072B2", "Paddle 完整框候选"),
         ("#D55E00", "待人工核对"),
         ("#CC79A7", "区域确认，采用单模型文字"),
     )
@@ -167,7 +187,12 @@ def render_preview(data: dict, output_path: Path) -> None:
         max_width = list_width - 54
         display_text = column.get("text", "")
         if column.get("review_required"):
-            display_text += "  [待核对]"
+            reasons = review_queue.get(column.get("id"), {}).get("reason_codes", [])
+            display_text += (
+                "  [文字/框待核对]"
+                if "paddle-box-extends-current-region" in reasons
+                else "  [待核对]"
+            )
         lines = wrap_text(draw, display_text, body_font, max_width)
         line_height = max(22, getattr(body_font, "size", 18) + 3)
         for line_index, line in enumerate(lines[:2]):
@@ -212,7 +237,10 @@ def write_report(items: list[tuple[Path, dict]], output_path: Path) -> None:
             lines.append(
                 f"- `{item.get('column_id')}` {item.get('current_text', '')} "
                 f"status=`{item.get('status')}` reasons=`{reasons}` "
-                f"MangaOCR=`{readings}` PaddleOCR=`{item.get('paddleocr_text', '')}`"
+                f"MangaOCR=`{readings}` PaddleOCR=`{item.get('paddleocr_text', '')}` "
+                f"current_box=`{item.get('image_bbox')}` "
+                f"PaddleBox=`{item.get('paddle_image_bbox')}` "
+                f"coverage=`{item.get('paddle_geometry_coverage')}`"
             )
         lines.extend(("", f"Source JSON: `{json_path}`", ""))
     output_path.parent.mkdir(parents=True, exist_ok=True)

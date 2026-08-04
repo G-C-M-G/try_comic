@@ -16,6 +16,8 @@ D:\workplace\opencode\try_comic\backups\2026-08-04_ocr-handoff\ocr-handoff-final
 
 请先完整阅读交接包中的 OCR_交接文档.md、架构说明.md、使用说明.md、OCR_BASELINE.md，
 再检查 samples 下 1、8、19、22 四页的原图、最终 *.ocr.json、照片基准和 OCR 核对图。
+同页存在 `*.reviewed.ocr.json` 时必须优先使用它；只有 `manual_review.translation_blocked=false`
+的 OCR JSON 才能进入翻译和嵌字。
 不要重新开发 OCR，也不要把旧项目的 GUI、缓存和整个 MITS 目录复制进新项目。把 schema 4
 OCR JSON 当作稳定只读输入；如果未来需要新 OCR，只通过旧项目 background_ocr.py 的 CLI
 或清晰的适配器调用。
@@ -30,8 +32,12 @@ OCR JSON 当作稳定只读输入；如果未来需要新 OCR，只通过旧项�
    translation_query，不能把一条完整台词拆成若干列各自直译。
 2. 擦字必须按 translation_units.layout_regions/columns 中的 polygon 逐块生成 mask，不能用
    完整句子的巨大外接矩形盖住画面。需要合并 mask 时仍要保留 column_id 级审计记录。
-3. layout_bbox_10pct 是最终文字允许使用的最大范围，已经包含总宽高 10% 的余量，禁止二次
-   扩张。译文放不下时缩小字号、合理换列或进入人工复核，不能静默越界。
+3. 排版边界必须以“人工核对完成后的完整 OCR 框”为唯一基准，不能使用漏字、截断或核对前
+   的小框。`layout_bbox_10pct` 是默认硬边界：总宽和总高相对完整框各增加 10%（即每侧约
+   5%），禁止在这个框上再次叠加扩张。译文放不下时，必须先缩小字号、调整行列和字间距；
+   仍无法容纳时才允许从原始完整框直接计算 `layout_bbox_20pct`（总宽高各增加 20%，每侧约
+   10%）。20% 是绝对上限，任何模式都不得越过。使用 20% 必须记录原因、实际边界和
+   `overflow_level=20`，并进入人工核对；默认 `overflow_level=10`。
 4. 人工核对默认开启。若 manual_review.translation_blocked=true，必须暂停该页，把
    manual_review_queue 中的框、两模型候选文字和原因显示给我。我可以批准、改字、改框或
    拒绝误检。只有全部解决后才能翻译。提供“人工核对”开关；关闭时允许继续，但界面和状态
@@ -45,7 +51,8 @@ OCR JSON 当作稳定只读输入；如果未来需要新 OCR，只通过旧项�
    生硬书面语和无意义扩写，保持台词简洁。
 8. 输出原图同尺寸的最终图片，以及可重新编辑的 *.state.json。状态至少记录 OCR 文件哈希、
    原图哈希、column_id/unit_id、原文、译文、mask、擦除策略、排版框、字体、字号、方向、
-   字色、描边、处理状态和失败原因。只修改译文后应能跳过 OCR/擦字直接重嵌。
+   字色、描边、`overflow_level`、实际越界比例、处理状态和失败原因。只修改译文后应能跳过
+   OCR/擦字直接重嵌。
 9. 图片路径不能依赖 OCR JSON 中旧机器的绝对路径。CLI 显式 --image 优先，其次解析 JSON
    同目录或样本目录的同名图片，并验证 width/height。
 10. 先做可审计的命令行核心，再做 GUI。首个可用版本至少提供：
@@ -53,6 +60,7 @@ OCR JSON 当作稳定只读输入；如果未来需要新 OCR，只通过旧项�
    - batch.py --images <目录> --ocr-dir <目录> --output-dir <目录>
    - --dry-run：只画 region/mask/layout 编号核对图，不擦字、不翻译
    - --state：从已有状态重新嵌字
+   - --max-layout-overflow 10|20：默认 10；选择 20 仍须逐项记录并进入人工核对
 11. 代码按职责拆分，建议模块为 ocr_contract、review、region_masks、eraser、translator、layout、
     renderer、state、pipeline、cli。核心算法不能埋在 GUI 事件里。
 
@@ -63,7 +71,7 @@ B. 实现 schema 4 解析/校验、人工核对开关/阻断和 dry-run 核对�
    映射与人工决定回填正确。
 C. 实现逐列 mask 与局部擦字，并做 mask 外像素不变测试；先不接翻译。
 D. 实现完整句翻译、术语表、缓存和 column_ids 映射。
-E. 实现中文自动排版、10% 边界约束和白描边艺术字策略。
+E. 实现中文自动排版、默认 10%/绝对上限 20% 的两级边界约束和白描边艺术字策略。
 F. 串联单图/批量 CLI，输出 state、阶段图和错误报告。
 G. 在 1、8、19、22 上端到端运行，逐页给出原图、mask、擦字图、嵌字图和越界报告。
 
@@ -71,12 +79,14 @@ G. 在 1、8、19、22 上端到端运行，逐页给出原图、mask、擦字�
 
 - 四页所有保留 OCR 列均有明确处理结果，不漏掉多字符正文。
 - 不跨气泡、分镜或相邻台词擦除；mask 外没有无关改图。
-- 最终文字不超过 layout_bbox_10pct。
+- 最终文字默认不超过 `layout_bbox_10pct`；只有已记录且经人工确认的项目可使用从原完整框
+  直接计算的 `layout_bbox_20pct`，任何像素不得超过 20% 绝对上限。
 - 翻译按完整句子生成，中文可直接用于漫画阅读。
 - 同一输入重复运行结果可复现，缓存不会用错原图/OCR/译文。
 - 批量运行不打开窗口、不控制鼠标。
 - 人工核对默认开启；任何 `pending` 框阻止翻译。开关关闭时明确记录 `bypassed`。
-- 自动测试覆盖 schema 校验、路径解析、mask、句列映射、排版边界、缓存签名和失败恢复。
+- 自动测试覆盖 schema 校验、路径解析、mask、句列映射、10%/20% 排版边界、禁止复合扩张、
+  缓存签名和失败恢复。
 
 开始时先梳理交接数据并给出短计划，然后直接实现 B 阶段。不要停在只写方案；完成 dry-run
 实现、测试，并生成四页核对图后再汇报。

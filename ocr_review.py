@@ -39,6 +39,7 @@ def build_review_template(result: dict, source_ocr: Path) -> dict:
             "corrected_text": None,
             "corrected_polygon": None,
             "corrected_image_bbox": None,
+            "use_paddle_geometry": False,
             "note": "",
         })
     return {
@@ -156,6 +157,19 @@ def apply_review(source: Path, review_path: Path, output: Path) -> None:
             corrected_text = decision_item.get("corrected_text")
             corrected_polygon = decision_item.get("corrected_polygon")
             corrected_bbox = decision_item.get("corrected_image_bbox")
+            use_paddle_geometry = bool(decision_item.get("use_paddle_geometry"))
+            if use_paddle_geometry:
+                if corrected_polygon is not None or corrected_bbox is not None:
+                    raise ValueError(
+                        f"use_paddle_geometry cannot be combined with corrected geometry for {column_id}"
+                    )
+                corrected_polygon = decision_item.get("paddle_polygon")
+                corrected_bbox = (
+                    None if corrected_polygon is not None
+                    else decision_item.get("paddle_image_bbox")
+                )
+                if corrected_polygon is None and corrected_bbox is None:
+                    raise ValueError(f"no PaddleOCR geometry is available for {column_id}")
             normalized_text = (
                 str(corrected_text).strip() if corrected_text is not None else ""
             )
@@ -190,6 +204,13 @@ def apply_review(source: Path, review_path: Path, output: Path) -> None:
             **queue_item,
             "status": decision,
             "resolved_text": None if decision == "rejected" else column.get("text"),
+            "resolved_polygon": None if decision == "rejected" else column.get("polygon"),
+            "resolved_image_bbox": (
+                None if decision == "rejected" else column.get("image_bbox")
+            ),
+            "resolved_layout_bbox_10pct": (
+                None if decision == "rejected" else column.get("layout_bbox_10pct")
+            ),
             "note": str(decision_item.get("note", "")),
         })
 

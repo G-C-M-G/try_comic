@@ -47,6 +47,7 @@ _SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 PADDLE_PYTHON = ROOT / "paddle_venv" / "Scripts" / "python.exe"
 PADDLE_WORKER = ROOT / "paddle_ocr_worker.py"
 MANUAL_REVIEW_BOX_OVERLAP_THRESHOLD = 0.65
+MANUAL_REVIEW_PADDLE_COVERAGE_THRESHOLD = 0.72
 MANUAL_REVIEW_CONSENSUS_THRESHOLD = 0.67
 
 
@@ -201,6 +202,21 @@ def intersection_over_smaller(left: Sequence[int], right: Sequence[int]) -> floa
     return float(intersection / smaller)
 
 
+def directional_bbox_coverage(
+    covering: Sequence[int], target: Sequence[int], direction: str
+) -> float:
+    """Return target coverage along the text's reading axis."""
+    ax1, ay1, ax2, ay2 = covering
+    bx1, by1, bx2, by2 = target
+    if direction == "horizontal":
+        intersection = max(0, min(ax2, bx2) - max(ax1, bx1))
+        target_length = max(0, bx2 - bx1)
+    else:
+        intersection = max(0, min(ay2, by2) - max(ay1, by1))
+        target_length = max(0, by2 - by1)
+    return float(intersection / target_length) if target_length else 0.0
+
+
 def deduplicate_candidates(candidates: list[dict]) -> list[dict]:
     ordered = sorted(
         candidates,
@@ -335,6 +351,20 @@ def choose_cross_validated_text(
     return manga_text, manga_confidence, "manga_ocr", comparison
 
 
+def best_paddle_validation(column: dict) -> dict:
+    validations = column.get("paddle_validation", []) or []
+    current_text = column.get("text", "")
+    return max(
+        validations,
+        key=lambda item: (
+            text_similarity(current_text, item.get("text", "")),
+            float(item.get("confidence", 0.0)),
+            float(item.get("box_overlap", 0.0)),
+        ),
+        default={},
+    )
+
+
 def manual_review_reasons(column: dict) -> list[str]:
     """Return auditable reasons why a retained OCR column needs a human decision."""
     reasons: list[str] = []
@@ -351,6 +381,26 @@ def manual_review_reasons(column: dict) -> list[str]:
         best_overlap = max(float(item.get("box_overlap", 0.0)) for item in paddle_validation)
         if best_overlap < MANUAL_REVIEW_BOX_OVERLAP_THRESHOLD:
             reasons.append("weak-box-overlap")
+        paddle = best_paddle_validation(column)
+        paddle_bbox = paddle.get("image_bbox")
+        current_bbox = column.get("image_bbox")
+        current_text = normalize_ocr_text(column.get("text", ""))
+        paddle_text = normalize_ocr_text(paddle.get("text", ""))
+        if (
+            paddle_bbox
+            and current_bbox
+            and float(paddle.get("confidence", 0.0)) >= 0.90
+            and text_similarity(current_text, paddle_text) >= 0.60
+            and (
+                column.get("text_source") == "paddleocr-rescue"
+                or len(paddle_text) >= len(current_text)
+            )
+            and directional_bbox_coverage(
+                current_bbox, paddle_bbox, column.get("direction", "vertical")
+            )
+            < MANUAL_REVIEW_PADDLE_COVERAGE_THRESHOLD
+        ):
+            reasons.append("paddle-box-extends-current-region")
     elif "paddleocr" in detection_sources:
         reasons.append("missing-paddle-geometry")
 
@@ -382,12 +432,9 @@ def attach_manual_review_queue(result: dict, enabled: bool = True) -> dict:
         column["review_reasons"] = reasons
         if not reasons:
             continue
-        paddle_validation = column.get("paddle_validation", []) or []
-        paddle = max(
-            paddle_validation,
-            key=lambda item: (float(item.get("confidence", 0.0)), len(item.get("text", ""))),
-            default={},
-        )
+        paddle = best_paddle_validation(column)
+        paddle_bbox = paddle.get("image_bbox")
+        current_bbox = column.get("image_bbox")
         queue.append({
             "column_id": column["id"],
             "status": "pending" if enabled else "bypassed",
@@ -398,6 +445,20 @@ def attach_manual_review_queue(result: dict, enabled: bool = True) -> dict:
             "paddleocr_text": paddle.get("text", ""),
             "paddleocr_confidence": paddle.get("confidence"),
             "paddle_box_overlap": paddle.get("box_overlap"),
+            "paddle_polygon": paddle.get("polygon"),
+            "paddle_image_bbox": paddle_bbox,
+            "paddle_geometry_coverage": (
+                round(
+                    directional_bbox_coverage(
+                        current_bbox,
+                        paddle_bbox,
+                        column.get("direction", "vertical"),
+                    ),
+                    4,
+                )
+                if current_bbox and paddle_bbox
+                else None
+            ),
             "text_source": column.get("text_source"),
             "detection_sources": list(column.get("detection_sources", [])),
             "polygon": column.get("polygon"),
@@ -420,6 +481,7 @@ def attach_manual_review_queue(result: dict, enabled: bool = True) -> dict:
         "policy": {
             "cross_model_text_agreement_required": True,
             "minimum_box_overlap": MANUAL_REVIEW_BOX_OVERLAP_THRESHOLD,
+            "minimum_paddle_geometry_coverage": MANUAL_REVIEW_PADDLE_COVERAGE_THRESHOLD,
             "minimum_mangaocr_consensus": MANUAL_REVIEW_CONSENSUS_THRESHOLD,
             "single_model_detection_requires_review": True,
             "paddleocr_rescue_requires_review": True,
