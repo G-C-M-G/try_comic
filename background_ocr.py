@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from difflib import SequenceMatcher
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -38,6 +39,13 @@ from manga_translator.detection import dispatch as dispatch_detection
 from manga_translator.utils import TextBlock
 from manga_translator.utils.sort import sort_regions
 from manga_ocr import MangaOcr
+from ocr_hybrid import (
+    align_photos_inventory,
+    assign_dialogue_containers,
+    attach_photos_overlay,
+    load_quick_capture,
+    repair_abnormal_geometry,
+)
 from text_segments import group_regions_into_sentences
 
 
@@ -417,6 +425,14 @@ def manual_review_reasons(column: dict) -> list[str]:
         < MANUAL_REVIEW_CONSENSUS_THRESHOLD
     ):
         reasons.append("unstable-mangaocr-readings")
+    if column.get("geometry_repaired"):
+        reasons.append("abnormal-geometry-repaired")
+    if column.get("photos_agrees") is False:
+        reasons.append("windows-photos-text-disagreement")
+    if column.get("photos_inventory_unmatched"):
+        reasons.append("windows-photos-inventory-unmatched")
+    if column.get("role") == "uncertain":
+        reasons.append("ambiguous-dialogue-role")
     return list(dict.fromkeys(reasons))
 
 
@@ -461,6 +477,14 @@ def attach_manual_review_queue(result: dict, enabled: bool = True) -> dict:
             ),
             "text_source": column.get("text_source"),
             "detection_sources": list(column.get("detection_sources", [])),
+            "photos_text": column.get("photos_text", ""),
+            "photos_similarity": column.get("photos_similarity"),
+            "photos_agrees": column.get("photos_agrees"),
+            "role": column.get("role", "text"),
+            "container_id": column.get("container_id"),
+            "break_after": bool(column.get("break_after", False)),
+            "geometry_repaired": bool(column.get("geometry_repaired", False)),
+            "geometry_repair_source": column.get("geometry_repair_source"),
             "polygon": column.get("polygon"),
             "image_bbox": column.get("image_bbox"),
             "layout_bbox_10pct": column.get("layout_bbox_10pct"),
@@ -492,7 +516,122 @@ def attach_manual_review_queue(result: dict, enabled: bool = True) -> dict:
     return result
 
 
-def run_paddle_worker(source: Path, device: str = "cpu") -> dict[str, list[dict]]:
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_fast_capture(capture_dir: str | Path | None, image_path: Path) -> dict | None:
+    """Load one fast-mask capture manifest and validate it against the image."""
+    if not capture_dir:
+        return None
+    manifest_path = Path(capture_dir).resolve() / image_path.stem / "capture.json"
+    if not manifest_path.is_file():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    capture = manifest.get("capture", {})
+    if not capture.get("complete"):
+        raise RuntimeError(f"Photos fast capture is incomplete: {manifest_path}")
+    if capture.get("method") != "fast-mask":
+        raise RuntimeError(f"Photos capture is not a fast-mask manifest: {manifest_path}")
+    source = manifest.get("source", {})
+    if int(source.get("width", 0)) <= 0 or int(source.get("height", 0)) <= 0:
+        raise RuntimeError(f"Photos fast capture lacks source dimensions: {manifest_path}")
+    if source.get("sha256") and source["sha256"] != _sha256_file(image_path):
+        raise RuntimeError(f"Photos fast capture image hash mismatch: {manifest_path}")
+    manifest["manifest_path"] = str(manifest_path)
+    manifest["manifest_sha256"] = _sha256_file(manifest_path)
+    return manifest
+
+
+def fast_review_reasons(column: dict, alignment: dict | None) -> list[str]:
+    """Review triggers specific to the Photos-island + PaddleOCR fast flow."""
+    reasons = []
+    confidence = float(column.get("paddle_confidence") or 0.0)
+    if column.get("text_source") == "photos-fallback":
+        reasons.append("photos-fallback-text")
+    if len(column.get("text", "")) == 1:
+        if confidence < 0.90:
+            reasons.append("low-confidence-single-character")
+    elif confidence < 0.55:
+        reasons.append("low-paddle-confidence")
+    if column.get("needs_review"):
+        reasons.append("fast-capture-needs-review")
+    if column.get("photos_inventory_unmatched"):
+        reasons.append("photos-inventory-unmatched")
+    if column.get("photos_agrees") is False:
+        reasons.append("photos-text-conflict")
+    if column.get("cross_engine_agrees") is False:
+        reasons.append("cross-engine-text-conflict")
+    if column.get("cross_engine_missed"):
+        reasons.append("cross-engine-not-detected")
+    return reasons
+
+
+def attach_fast_review_queue(result: dict, enabled: bool = True) -> dict:
+    """Build the schema-4 manual review queue for fast-capture columns."""
+    queue = []
+    for column in result.get("columns", []):
+        reasons = fast_review_reasons(column, result.get("photos_alignment"))
+        column["review_required"] = bool(reasons)
+        column["review_status"] = (
+            "pending" if enabled and reasons else "bypassed" if reasons else "not_required"
+        )
+        column["review_reasons"] = reasons
+        if not reasons:
+            continue
+        queue.append({
+            "column_id": column["id"],
+            "status": "pending" if enabled else "bypassed",
+            "reason_codes": reasons,
+            "current_text": column.get("text", ""),
+            "paddleocr_text": column.get("text", ""),
+            "paddleocr_confidence": column.get("paddle_confidence"),
+            "photos_text": column.get("photos_text", ""),
+            "photos_similarity": column.get("photos_similarity"),
+            "photos_agrees": column.get("photos_agrees"),
+            "text_source": column.get("text_source"),
+            "detection_sources": list(column.get("detection_sources", [])),
+            "role": column.get("role", "text"),
+            "container_id": column.get("container_id"),
+            "break_after": bool(column.get("break_after", False)),
+            "polygon": column.get("polygon"),
+            "image_bbox": column.get("image_bbox"),
+            "layout_bbox_10pct": column.get("layout_bbox_10pct"),
+        })
+    candidate_count = len(queue)
+    pending_count = candidate_count if enabled else 0
+    result["manual_review"] = {
+        "enabled": enabled,
+        "status": (
+            "pending" if pending_count else "bypassed" if candidate_count else "not_required"
+        ),
+        "translation_blocked": bool(enabled and pending_count),
+        "candidate_count": candidate_count,
+        "pending_count": pending_count,
+        "bypassed_count": candidate_count if not enabled else 0,
+        "reviewed_count": 0,
+        "policy": {
+            "photos_islands_authoritative": True,
+            "minimum_multi_character_paddle_confidence": 0.55,
+            "minimum_single_character_paddle_confidence": 0.90,
+            "photos_fallback_requires_review": True,
+            "photos_inventory_unmatched_requires_review": True,
+        },
+    }
+    result["manual_review_queue"] = queue
+    result.setdefault("fusion_summary", {})["manual_review_columns"] = candidate_count
+    return result
+
+
+def run_paddle_worker(
+    source: Path,
+    device: str = "cpu",
+    pages: set[str] | None = None,
+) -> dict[str, list[dict]]:
     if not PADDLE_PYTHON.is_file():
         raise RuntimeError(
             f"PaddleOCR environment is unavailable: {PADDLE_PYTHON}. "
@@ -507,8 +646,18 @@ def run_paddle_worker(source: Path, device: str = "cpu") -> dict[str, list[dict]
             "PADDLE_PDX_CACHE_HOME": str(ROOT / "models" / "paddle"),
             "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK": "1",
         })
+        command = [
+            str(PADDLE_PYTHON),
+            str(PADDLE_WORKER),
+            str(source),
+            str(output),
+            "--device",
+            device,
+        ]
+        if pages:
+            command.extend(("--pages", ",".join(sorted(pages))))
         completed = subprocess.run(
-            [str(PADDLE_PYTHON), str(PADDLE_WORKER), str(source), str(output), "--device", device],
+            command,
             cwd=str(ROOT),
             env=environment,
             capture_output=True,
@@ -583,6 +732,8 @@ def build_translation_units(columns: list[dict], image: np.ndarray) -> tuple[lis
             target_lang="CHS",
         )
         region.column_id = column["id"]
+        region.container_id = column.get("container_id")
+        region.break_after = bool(column.get("break_after", False))
         regions.append(region)
         by_geometry[_geometry_key(polygon)] = column
 
@@ -591,7 +742,7 @@ def build_translation_units(columns: list[dict], image: np.ndarray) -> tuple[lis
     for order, region in enumerate(ordered):
         column = next(item for item in columns if item["id"] == region.column_id)
         column["selection_order"] = order
-        column["panel_index"] = getattr(region, "panel_index", None)
+        column["panel_index"] = int(getattr(region, "panel_index", 0) or 0)
 
     units = []
     for index, sentence in enumerate(group_regions_into_sentences(ordered), 1):
@@ -599,10 +750,12 @@ def build_translation_units(columns: list[dict], image: np.ndarray) -> tuple[lis
         if not segments:
             segments = [{"lines": np.asarray(sentence.lines).reshape(-1, 4, 2).tolist()}]
         unit_columns = []
+        seen_column_ids: set[str] = set()
         for segment in segments:
             column = by_geometry.get(_geometry_key(segment["lines"]))
-            if column is None:
+            if column is None or column["id"] in seen_column_ids:
                 continue
+            seen_column_ids.add(column["id"])
             unit_columns.append({
                 "column_id": column["id"],
                 "source_text": column["text"],
@@ -613,11 +766,22 @@ def build_translation_units(columns: list[dict], image: np.ndarray) -> tuple[lis
         units.append({
             "id": f"sentence_{index:03d}",
             "column_ids": [item["column_id"] for item in unit_columns],
-            "source_text": str(sentence.text or ""),
-            "translation_query": str(
-                getattr(sentence, "translation_query", None) or sentence.text or ""
+            "source_text": "".join(item["source_text"] for item in unit_columns),
+            "translation_query": (
+                unit_columns[0]["source_text"]
+                if len(unit_columns) == 1
+                else "".join(
+                    f"<{marker}>{item['source_text']}"
+                    for marker, item in enumerate(unit_columns, 1)
+                )
             ),
             "panel_index": getattr(sentence, "panel_index", None),
+            "container_id": getattr(sentence, "container_id", None),
+            "grouping_basis": (
+                "container"
+                if (getattr(sentence, "container_id", None) or "").startswith("container_")
+                else "geometry" if getattr(sentence, "container_id", None) is None else "unassigned-column"
+            ),
             "layout_regions": unit_columns,
         })
     return units, reading_order
@@ -669,6 +833,8 @@ class BackgroundMangaOCR:
         box_threshold: float = 0.30,
         paddle_predictions: Sequence[dict] | None = None,
         manual_review_enabled: bool = True,
+        photos_capture: dict | None = None,
+        dialogue_only: bool = False,
     ) -> dict:
         source = str(Path(path).resolve())
         image = np.array(Image.open(source).convert("RGB"))
@@ -676,6 +842,10 @@ class BackgroundMangaOCR:
         candidates, paddle_rejected = fuse_paddle_detections(
             ctd_candidates, paddle_predictions or [], image.shape[:2]
         )
+        candidates, photos_unmatched_overlay = attach_photos_overlay(
+            candidates, photos_capture
+        )
+        candidates = repair_abnormal_geometry(candidates, image.shape[:2])
         recognizer = self._recognizer()
         columns = []
         ignored = []
@@ -704,11 +874,29 @@ class BackgroundMangaOCR:
                 continue
             columns.append(record)
 
+        columns, containers = assign_dialogue_containers(image, columns)
+        if dialogue_only:
+            retained = []
+            for column in columns:
+                if column.get("role") == "non_dialogue":
+                    ignored.append({**column, "reason": "dialogue-only-filter"})
+                else:
+                    retained.append(column)
+            columns = retained
+
         columns.sort(key=lambda item: (item["image_bbox"][1], -item["image_bbox"][2]))
         for index, column in enumerate(columns, 1):
             column["id"] = f"column_{index:03d}"
-            column["role"] = "text"
+            column.setdefault("role", "text")
         translation_units, reading_order = build_translation_units(columns, image)
+        photos_alignment = None
+        if photos_capture:
+            photos_alignment = align_photos_inventory(
+                columns, reading_order, photos_capture.get("inventory", [])
+            )
+            # Photos arbitration may have changed accepted text, so rebuild all
+            # sentence source strings and marker queries from the final columns.
+            translation_units, reading_order = build_translation_units(columns, image)
         columns.sort(key=lambda item: item["selection_order"])
         paddle_enabled = paddle_predictions is not None
         fusion_summary = {
@@ -727,11 +915,24 @@ class BackgroundMangaOCR:
                 bool(column.get("supplemental")) for column in columns
             ),
             "paddle_rejected_candidates": len(paddle_rejected),
+            "photos_capture_enabled": photos_capture is not None,
+            "photos_overlay_candidates": len(
+                photos_capture.get("overlay_blocks", []) if photos_capture else []
+            ),
+            "photos_unmatched_overlay_candidates": len(photos_unmatched_overlay),
+            "photos_inventory_items": len(
+                photos_capture.get("inventory", []) if photos_capture else []
+            ),
+            "photos_inventory_matches": len(
+                photos_alignment.get("matches", []) if photos_alignment else []
+            ),
         }
         result = {
             "schema_version": 4,
             "backend": (
-                "Headless CTD + MangaOCR + PaddleOCR cross-validation"
+                "CTD + MangaOCR + PaddleOCR + Windows Photos assisted"
+                if photos_capture
+                else "Headless CTD + MangaOCR + PaddleOCR cross-validation"
                 if paddle_enabled
                 else "Headless CTD + MangaOCR consensus"
             ),
@@ -746,6 +947,19 @@ class BackgroundMangaOCR:
                 "single_character_confidence_threshold": 0.67,
                 "layout_overflow_allowance": 0.10,
                 "manual_review_enabled": manual_review_enabled,
+                "dialogue_only": dialogue_only,
+                "photos_quick_capture": (
+                    {
+                        "manifest": photos_capture.get("manifest_path"),
+                        "manifest_sha256": photos_capture.get("manifest_sha256"),
+                        "inventory_count": photos_capture.get("inventory_count", 0),
+                        "coordinate_transform": photos_capture.get("capture", {}).get(
+                            "coordinate_transform"
+                        ),
+                    }
+                    if photos_capture
+                    else None
+                ),
             },
             "columns": columns,
             "reading_order": reading_order,
@@ -753,8 +967,255 @@ class BackgroundMangaOCR:
             "ignored_regions": ignored,
             "fusion_summary": fusion_summary,
             "paddle_rejected_regions": paddle_rejected,
+            "photos_unmatched_overlay_regions": photos_unmatched_overlay,
+            "photos_alignment": photos_alignment,
+            "recovery_candidates": [
+                *paddle_rejected,
+                *photos_unmatched_overlay,
+                *(photos_alignment.get("unmatched_inventory", []) if photos_alignment else []),
+            ],
+            "containers": containers,
         }
-        return attach_manual_review_queue(result, enabled=manual_review_enabled)
+        reviewed = attach_manual_review_queue(result, enabled=manual_review_enabled)
+        recovery_count = len(reviewed.get("recovery_candidates", []))
+        reviewed["manual_review"]["recovery_candidate_count"] = recovery_count
+        reviewed["manual_review"]["recovery_status"] = (
+            "pending"
+            if recovery_count and manual_review_enabled
+            else "bypassed"
+            if recovery_count
+            else "not_required"
+        )
+        return reviewed
+
+    async def process_fast_manifest(
+        self,
+        path: str,
+        manifest: dict,
+        *,
+        manual_review_enabled: bool = True,
+        dialogue_only: bool = False,
+        cross_check: bool = False,
+        paddle_predictions: Sequence[dict] | None = None,
+    ) -> dict:
+        """Convert a fast-mask capture manifest into a schema-4 OCR result.
+
+        Photos islands are the geometric authority and PaddleOCR supplies the
+        text.  With ``cross_check`` the headless CTD + MangaOCR + PaddleOCR
+        arbitration runs as supplementary evidence only.
+        """
+        source = str(Path(path).resolve())
+        image = np.array(Image.open(source).convert("RGB"))
+        fast_source = manifest.get("source") or {}
+        if fast_source.get("width") and int(fast_source["width"]) != image.shape[1]:
+            raise RuntimeError(f"Photos fast capture width mismatch: {source}")
+        if fast_source.get("height") and int(fast_source["height"]) != image.shape[0]:
+            raise RuntimeError(f"Photos fast capture height mismatch: {source}")
+
+        dropped_noise = list(manifest.get("capture", {}).get("dropped_noise_columns") or [])
+        columns = []
+        ignored = []
+        for raw in manifest.get("columns") or []:
+            bbox = [int(value) for value in raw.get("image_bbox") or []]
+            if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                ignored.append({**raw, "reason": "invalid-bbox"})
+                continue
+            text = normalize_ocr_text(raw.get("text", ""))
+            if not text or not _JAPANESE_RE.search(text):
+                ignored.append({**raw, "reason": "no-japanese-text"})
+                continue
+            record = {
+                "id": str(raw.get("id") or f"column_{len(columns) + 1:03d}"),
+                "text": text,
+                "polygon": [
+                    [bbox[0], bbox[1]],
+                    [bbox[2], bbox[1]],
+                    [bbox[2], bbox[3]],
+                    [bbox[0], bbox[3]],
+                ],
+                "image_bbox": bbox,
+                "layout_bbox_10pct": expand_bbox_10pct(
+                    bbox, (image.shape[1], image.shape[0])
+                ),
+                "selection_order": int(raw.get("selection_order", len(columns))),
+                "direction": raw.get("direction", "vertical"),
+                "text_source": raw.get("text_source") or "windows-photos-islands",
+                "detection_sources": ["windows-photos-islands", "paddleocr"],
+                "paddle_confidence": raw.get("paddle_confidence"),
+                "needs_review": bool(raw.get("needs_review", False)),
+                "review_status": "not_required",
+                "review_reasons": [],
+                "role": raw.get("role", "text"),
+                "container_id": raw.get("container_id"),
+                "break_after": bool(raw.get("break_after", False)),
+            }
+            columns.append(record)
+
+        columns, containers = assign_dialogue_containers(image, columns)
+        if dialogue_only:
+            retained = []
+            for column in columns:
+                if column.get("role") == "non_dialogue":
+                    ignored.append({**column, "reason": "dialogue-only-filter"})
+                else:
+                    retained.append(column)
+            columns = retained
+
+        # Paddle column clustering can emit exact-duplicate polygons; keep the
+        # first occurrence so every retained column maps to exactly one unit.
+        seen_keys: set[tuple[int, ...]] = set()
+        deduped = []
+        for column in columns:
+            key = _geometry_key(
+                np.asarray(column["polygon"], dtype=np.int32).reshape(-1, 4, 2)
+            )
+            if key in seen_keys:
+                ignored.append({**column, "reason": "duplicate-polygon"})
+                continue
+            seen_keys.add(key)
+            deduped.append(column)
+        columns = deduped
+
+        columns.sort(key=lambda item: (item["image_bbox"][1], -item["image_bbox"][2]))
+        for index, column in enumerate(columns, 1):
+            column["id"] = f"column_{index:03d}"
+        translation_units, reading_order = build_translation_units(columns, image)
+        photos_alignment = None
+        inventory = list(manifest.get("capture", {}).get("inventory") or [])
+        if inventory:
+            photos_alignment = align_photos_inventory(columns, reading_order, inventory)
+            translation_units, reading_order = build_translation_units(columns, image)
+
+        cross_evidence = None
+        if cross_check:
+            headless = await self.process_image(
+                source,
+                0.30,
+                paddle_predictions,
+                manual_review_enabled=False,
+                dialogue_only=False,
+            )
+            extras = []
+            for column in columns:
+                best = None
+                best_overlap = 0.0
+                for candidate in headless.get("columns", []):
+                    overlap = intersection_over_smaller(
+                        column["image_bbox"], candidate["image_bbox"]
+                    )
+                    if overlap > best_overlap:
+                        best, best_overlap = candidate, overlap
+                if best and best_overlap >= 0.5:
+                    column["cross_engine_text"] = best["text"]
+                    column["cross_engine_overlap"] = round(best_overlap, 4)
+                    column["cross_engine_agrees"] = (
+                        canonical_benchmark_text(column["text"])
+                        == canonical_benchmark_text(best["text"])
+                    )
+                else:
+                    column["cross_engine_missed"] = True
+            for candidate in headless.get("columns", []):
+                covered = any(
+                    intersection_over_smaller(candidate["image_bbox"], column["image_bbox"])
+                    >= 0.5
+                    for column in columns
+                )
+                if not covered:
+                    extras.append({**candidate, "reason": "cross-engine-extra-column"})
+            cross_evidence = {
+                "headless_columns": len(headless.get("columns", [])),
+                "extra_columns": extras,
+            }
+
+        columns_by_id = {column["id"]: column for column in columns}
+        cross_bubble_count = 0
+        for unit in translation_units:
+            containers_in_unit = {
+                columns_by_id[cid].get("container_id")
+                for cid in unit.get("column_ids", [])
+                if cid in columns_by_id
+            }
+            if len(containers_in_unit - {None}) > 1:
+                cross_bubble_count += 1
+
+        fusion_summary = {
+            "method": "fast-mask",
+            "island_count": manifest.get("capture", {}).get("island_count", 0),
+            "page_scale_islands": manifest.get("capture", {}).get("page_scale_islands", 0),
+            "ignored_tiny_islands": len(
+                manifest.get("capture", {}).get("ignored_tiny_islands") or []
+            ),
+            "dropped_noise_columns": len(dropped_noise),
+            "masked_columns": sum(
+                column["text_source"] == "paddle-masked" for column in columns
+            ),
+            "retry_columns": sum(
+                column["text_source"] == "paddle-retry" for column in columns
+            ),
+            "fallback_columns": sum(
+                column["text_source"] == "photos-fallback" for column in columns
+            ),
+            "photos_inventory_items": len(inventory),
+            "photos_inventory_matches": len(
+                photos_alignment.get("matches", []) if photos_alignment else []
+            ),
+            "photos_inventory_unmatched": len(
+                photos_alignment.get("unmatched_inventory", []) if photos_alignment else []
+            ),
+            "cross_bubble_count": cross_bubble_count,
+            "cross_check": cross_check,
+        }
+        result = {
+            "schema_version": 4,
+            "backend": (
+                "Windows Photos Scan Text islands + PaddleOCR + CTD/MangaOCR cross-check"
+                if cross_check
+                else "Windows Photos Scan Text islands + PaddleOCR"
+            ),
+            "source": {"path": source, "width": image.shape[1], "height": image.shape[0]},
+            "capture": {
+                "headless": True,
+                "opens_windows": False,
+                "controls_mouse": False,
+                "photos_fast_capture": {
+                    "manifest": manifest.get("manifest_path"),
+                    "manifest_sha256": manifest.get("manifest_sha256"),
+                    "timing": manifest.get("capture", {}).get("timing"),
+                    "foreground_active_seconds": (
+                        manifest.get("capture", {})
+                        .get("timing", {})
+                        .get("foreground_active_seconds")
+                    ),
+                },
+                "manual_review_enabled": manual_review_enabled,
+                "dialogue_only": dialogue_only,
+                "cross_check": cross_check,
+            },
+            "columns": columns,
+            "reading_order": reading_order,
+            "translation_units": translation_units,
+            "ignored_regions": ignored,
+            "fusion_summary": fusion_summary,
+            "photos_alignment": photos_alignment,
+            "cross_engine_evidence": cross_evidence,
+            "recovery_candidates": [
+                *dropped_noise,
+                *(cross_evidence.get("extra_columns", []) if cross_evidence else []),
+                *(photos_alignment.get("unmatched_inventory", []) if photos_alignment else []),
+            ],
+            "containers": containers,
+        }
+        reviewed = attach_fast_review_queue(result, enabled=manual_review_enabled)
+        recovery_count = len(reviewed.get("recovery_candidates", []))
+        reviewed["manual_review"]["recovery_candidate_count"] = recovery_count
+        reviewed["manual_review"]["recovery_status"] = (
+            "pending"
+            if recovery_count and manual_review_enabled
+            else "bypassed"
+            if recovery_count
+            else "not_required"
+        )
+        return reviewed
 
 
 def _cuda_available() -> bool:
@@ -833,12 +1294,36 @@ def benchmark_against_photos(result: dict, photos: dict) -> dict:
     }
 
 
-def _images(path: Path) -> Iterable[Path]:
+def _natural_image_key(path: Path) -> list[object]:
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", path.stem)
+    ]
+
+
+def parse_pages(value: str | None) -> set[str] | None:
+    if not value:
+        return None
+    result: set[str] = set()
+    for raw in value.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if "-" in item:
+            left, right = item.split("-", 1)
+            result.update(str(number) for number in range(int(left), int(right) + 1))
+        else:
+            result.add(str(int(item)) if item.isdigit() else item)
+    return result
+
+
+def _images(path: Path, pages: set[str] | None = None) -> Iterable[Path]:
     if path.is_file():
-        yield path
+        if pages is None or path.stem in pages:
+            yield path
         return
-    for child in sorted(path.iterdir(), key=lambda item: item.name.lower()):
-        if child.suffix.lower() in _SUPPORTED_IMAGES:
+    for child in sorted(path.iterdir(), key=_natural_image_key):
+        if child.suffix.lower() in _SUPPORTED_IMAGES and (pages is None or child.stem in pages):
             yield child
 
 
@@ -846,27 +1331,46 @@ async def _run(args) -> int:
     engine = BackgroundMangaOCR(args.device)
     source = Path(args.input).resolve()
     output = Path(args.output).resolve()
-    image_paths = list(_images(source))
+    selected_pages = parse_pages(args.pages)
+    image_paths = list(_images(source, selected_pages))
     if not image_paths:
         raise RuntimeError(f"No supported images found in {source}")
     paddle_by_source = (
-        {} if args.no_paddle else await asyncio.to_thread(run_paddle_worker, source, args.paddle_device)
+        {}
+        if args.no_paddle
+        else await asyncio.to_thread(
+            run_paddle_worker, source, args.paddle_device, selected_pages
+        )
     )
     output_is_file = len(image_paths) == 1 and output.suffix.lower() == ".json"
     if not output_is_file:
         output.mkdir(parents=True, exist_ok=True)
+    review_required = False
     for image_path in image_paths:
         paddle_predictions = (
             None
             if args.no_paddle
             else paddle_by_source.get(os.path.normcase(str(image_path.resolve())), [])
         )
-        result = await engine.process_image(
-            str(image_path),
-            args.box_threshold,
-            paddle_predictions,
-            manual_review_enabled=not args.no_manual_review,
-        )
+        fast_capture = load_fast_capture(args.photos_fast_dir, image_path)
+        if fast_capture is not None:
+            result = await engine.process_fast_manifest(
+                str(image_path),
+                fast_capture,
+                manual_review_enabled=not args.no_manual_review,
+                dialogue_only=args.dialogue_only,
+                cross_check=args.cross_check,
+                paddle_predictions=paddle_predictions if args.cross_check else None,
+            )
+        else:
+            result = await engine.process_image(
+                str(image_path),
+                args.box_threshold,
+                paddle_predictions,
+                manual_review_enabled=not args.no_manual_review,
+                photos_capture=load_quick_capture(args.photos_capture_dir, image_path),
+                dialogue_only=args.dialogue_only,
+            )
         target = output if output_is_file else output / f"{image_path.stem}.ocr.json"
         if args.photos_baseline and len(image_paths) == 1:
             photos = json.loads(Path(args.photos_baseline).read_text(encoding="utf-8"))
@@ -874,7 +1378,14 @@ async def _run(args) -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print(target)
-    return 0
+        review_required = review_required or bool(
+            not args.no_manual_review
+            and (
+                result.get("manual_review", {}).get("translation_blocked")
+                or result.get("recovery_candidates")
+            )
+        )
+    return 2 if review_required else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -882,6 +1393,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("input", help="Image or image directory")
     parser.add_argument("output", help="JSON file or output directory")
     parser.add_argument("--photos-baseline", help="Optional Windows Photos manifest for metrics")
+    parser.add_argument("--photos-capture-dir", help="Quick Photos capture batch directory")
+    parser.add_argument(
+        "--photos-fast-dir",
+        help="Fast-mask Photos capture batch directory (photos_capture.py batch --fast)",
+    )
+    parser.add_argument(
+        "--cross-check",
+        action="store_true",
+        help="with --photos-fast-dir, run CTD + MangaOCR + PaddleOCR arbitration as evidence",
+    )
+    parser.add_argument("--pages", help="Comma-separated page stems or numeric ranges")
+    parser.add_argument(
+        "--dialogue-only",
+        action="store_true",
+        help="Retain dialogue/narration and audit non-dialogue artwork text as ignored",
+    )
     parser.add_argument("--box-threshold", type=float, default=0.30)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--paddle-device", choices=["cpu", "gpu:0"], default="cpu")

@@ -1,0 +1,26 @@
+{
+  "page": "33",
+  "lazy": true,
+  "items": [
+    {
+      "island_id": "island_009",
+      "decision": "approve",
+      "corrected_text": null
+    },
+    {
+      "island_id": "island_012",
+      "decision": "approve",
+      "corrected_text": null
+    },
+    {
+      "island_id": "island_015",
+      "decision": "approve",
+      "corrected_text": null
+    },
+    {
+      "island_id": "island_017",
+      "decision": "approve",
+      "corrected_text": null
+    }
+  ]
+}

@@ -10,6 +10,7 @@ from photos_capture import (
     _launch_photos,
     _normalize_text,
     detect_overlay_blocks,
+    map_display_bbox_affine,
 )
 
 
@@ -40,6 +41,17 @@ class PhotosCaptureTests(unittest.TestCase):
         image[45:65, 50:65] = 20
 
         self.assertEqual(_glyph_clicks(image), [(32, 30), (57, 55)])
+
+    def test_maps_bbox_with_calibrated_affine_transform(self):
+        transform = {
+            "source_to_display": [[0.5, 0.0, 10.0], [0.0, 0.5, 20.0]],
+            "valid": True,
+        }
+
+        self.assertEqual(
+            map_display_bbox_affine([20, 30, 40, 60], transform, (200, 200)),
+            [20, 20, 60, 80],
+        )
 
     @patch("photos_capture.subprocess.Popen")
     @patch("photos_capture.os.startfile")

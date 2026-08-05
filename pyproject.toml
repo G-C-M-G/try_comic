@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "manga-localizer"
+version = "0.6.0"
+description = "Auditable Japanese manga erasure, translation, and Chinese typesetting pipeline"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "jsonschema>=4.18,<5",
+  "numpy>=1.24,<3",
+  "opencv-contrib-python-headless>=4.8,<5",
+  "Pillow>=10,<13",
+  "PySide6>=6.8,<7",
+]
+
+[project.scripts]
+manga-render = "manga_localizer.cli:main"
+manga-batch = "manga_localizer.batch_cli:main"
+manga-gui = "manga_localizer.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["manga_localizer*"]

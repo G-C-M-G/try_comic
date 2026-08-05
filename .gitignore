@@ -15,7 +15,10 @@ __pycache__/
 /sakura/*.log
 /manga_translator.log
 
-# Generated output and large local backups
+# Legacy archive (kept locally, not tracked)
+/legacy/
+
+# Generated output, caches and large local artifacts
 /打包输出/
 /译文缓存/
 /依赖备份/
@@ -25,15 +28,11 @@ __pycache__/
 /outputs/
 /result/
 /backups/
+/var/
+/wechat_ocr/
 
 # User/runtime state
 /config/cache_index.json
-/config/glossary.json
 /config/translation_memory.json
-/config/ui.json
-/sfx_report.txt
-
-# Tooling
-.pytest_cache/
-.coverage
-*.tmp
+/config/settings.json
+/config/sakura_*.json

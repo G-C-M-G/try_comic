@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.try-comic.invalid/schema/ocr-review-v2.json",
+  "title": "Editable OCR correction decisions",
+  "type": "object",
+  "required": ["schema_version", "source_ocr_sha256", "items", "recoveries", "additions"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "source_ocr": {"type": "string"},
+    "source_ocr_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "items": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/item"}
+    },
+    "recoveries": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "additions": {
+      "type": "array",
+      "items": {"type": "object"}
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "item": {
+      "type": "object",
+      "required": [
+        "column_id",
+        "decision",
+        "current_text",
+        "current_polygon",
+        "current_image_bbox",
+        "role",
+        "selection_order"
+      ],
+      "properties": {
+        "column_id": {"type": "string", "minLength": 1},
+        "decision": {"enum": ["pending", "approved", "corrected", "rejected"]},
+        "current_text": {"type": "string", "minLength": 1},
+        "role": {
+          "enum": ["text", "dialogue", "narration", "uncertain", "non_dialogue", "sfx", "ignore"]
+        },
+        "container_id": {"type": ["string", "null"]},
+        "break_after": {"type": "boolean"},
+        "selection_order": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    }
+  }
+}
