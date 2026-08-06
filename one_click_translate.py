@@ -126,16 +126,10 @@ def stage1_capture(images: Path, out_root: Path, pages: set[str] | None, paralle
         if not image_path.is_file():
             continue
         selection_blocks = capture.get("selection_blocks") or []
+        # Check image = the original page with blue boxes drawn directly on
+        # top (no dimming/filling): review shows true pixel brightness.
         image = Image.open(image_path).convert("RGB")
-        arr = np.array(image)
-        keep = np.zeros(arr.shape[:2], dtype=bool)
-        for block in selection_blocks:
-            x1, y1, x2, y2 = block["image_bbox"]
-            keep[max(0, y1 - pad):min(image_size[1], y2 + pad),
-                 max(0, x1 - pad):min(image_size[0], x2 + pad)] = True
-        canvas_arr = np.where(keep[..., None], arr, np.zeros_like(arr))
-        canvas = Image.fromarray(canvas_arr)
-        draw = ImageDraw.Draw(canvas)
+        draw = ImageDraw.Draw(image)
         for block in selection_blocks:
             x1, y1, x2, y2 = block["image_bbox"]
             x1 = max(0, x1 - pad)
@@ -143,9 +137,9 @@ def stage1_capture(images: Path, out_root: Path, pages: set[str] | None, paralle
             x2 = min(image_size[0], x2 + pad)
             y2 = min(image_size[1], y2 + pad)
             draw.rectangle([x1, y1, x2, y2], outline="#4363d8", width=3)
-            draw.text((x1, min(canvas.height - 14, y2 + 2)), block["id"],
+            draw.text((x1, min(image.height - 14, y2 + 2)), block["id"],
                       fill="#4363d8")
-        canvas.save(check_dir / f"{page_dir.name}.bluebox_check.png")
+        image.save(check_dir / f"{page_dir.name}.bluebox_check.png")
     print(f"blue-box check images -> {check_dir}")
 
     # Report pages that will not be processed because no blue boxes (or no

@@ -153,17 +153,11 @@ def detect_blue_boxes_dual(
         raise ValueError(f"frame size mismatch {active.shape} vs {selected.shape}")
     active_f = active.astype(np.int16)
     selected_f = selected.astype(np.int16)
-    # Compare the two frames: pixels that changed between scan-text and
-    # all-selected AND sit in the bright blue overlay family are boxes
-    # (same signal as photos_capture.detect_selection_boxes).
-    delta = np.max(np.abs(selected_f - active_f), axis=2)
-    blue = (
-        (selected_f[..., 2] - selected_f[..., 0] > 40)
-        & (selected_f[..., 2] - selected_f[..., 1] > -5)
-        & (selected_f[..., 2] >= 150)
-    )
-    mask = (delta > 12) & blue
-    return _boxes_from_mask(mask)
+    # Compare the two frames: a pixel is part of the overlay when ANY
+    # single RGB channel changed by more than 8 (same signal as
+    # photos_capture.detect_selection_boxes; no other filtering).
+    changed = (np.abs(selected_f - active_f) > 8).any(axis=2)
+    return _boxes_from_mask(changed)
 
 
 def annotate_boxes(image: np.ndarray, boxes: Sequence[dict]) -> np.ndarray:

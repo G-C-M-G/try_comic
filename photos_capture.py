@@ -399,85 +399,117 @@ def _text_aware_split(
     return boxes
 
 
-# Photos scan-text selection overlay (measured): normal blend of
-# RGB(0, 120, 211) at alpha 81/255.  A covered pixel is detected by
-# comparing the two captured frames: the scan-text frame (``active`` /
-# photos_ocr) vs the all-selected frame (``selected`` / photos_selected).
-# The selection box pixels (a) changed between the two frames (RGB delta)
-# and (b) sit in the bright blue overlay family (B high, R suppressed).
-_MASK_B_FLOOR = 150  # brightness gate: overlay family sits at B >= 150
-_MASK_BR_MIN = 40  # blue dominance: B - R floor of the overlay family
-_MASK_BG_MIN = -5  # green gate: G must not exceed B (rejects yellow-green)
-_MASK_DELTA_MIN = 12  # per-channel RGB change between the two frames
+# Photos scan-text selection overlay: detected by comparing the two
+# captured frames -- the scan-text frame (``active`` / photos_ocr) vs the
+# all-selected frame (``selected`` / photos_selected).  A pixel belongs to
+# the overlay when ANY single RGB channel changed by more than the
+# threshold between the two frames; no other filtering is applied.
+_MASK_DELTA_MIN = 8  # per-channel RGB change between the two frames
+
+# Photos' blue selection overlay (measured): a normal blend of
+# RGB(0, 120, 211) at alpha 81/255 over the ORIGINAL pixel.  A covered
+# pixel c becomes c' = c * 174/255 + (0, 38, 67), so the exact overlay is
+# reconstructed from the base frame and the boxes are found by comparing
+# the all-selected frame against that reconstruction.
+BLUE_OVERLAY_KEEP = 174.0 / 255.0
+BLUE_OVERLAY_OFFSET_G = 38.0
+BLUE_OVERLAY_OFFSET_B = 67.0
+# Match slack for the overlay formula.  Measured residuals at real box
+# pixels are <= 3 per channel, so 12 is safe; tightening it (e.g. to 2)
+# fragments boxes and drops the stored-box hit rate (97.2% -> 95.8%).
+BLUE_OVERLAY_TOLERANCE = 12.0
+# A pixel must have been repainted by more than this to count as part of
+# the overlay (untouched pure-blue artwork satisfies the formula ~by
+# identity and must not become a box).  Tolerance 2 is permissive; the
+# formula gate above is the real discriminator.
+BLUE_OVERLAY_PAINT_DELTA = 2.0
+
+
+def blue_overlay_image(base: np.ndarray) -> np.ndarray:
+    """Expected all-selected frame under Photos' blue selection overlay.
+
+    A pixel painted by the overlay is c' = c * 174/255 + (0, 38, 67) with
+    the offsets applied to the original G/B channels.
+    """
+    f = base.astype(np.float64)
+    out = f * BLUE_OVERLAY_KEEP
+    out[..., 1] += BLUE_OVERLAY_OFFSET_G
+    out[..., 2] += BLUE_OVERLAY_OFFSET_B
+    return out
 
 
 def detect_selection_boxes(
     active: np.ndarray,
     selected: np.ndarray,
     *,
+    base: np.ndarray | None = None,
     island_blocks: Sequence[OverlayBlock] | None = None,
 ) -> list[OverlayBlock]:
     """Find the blue selection rectangles Photos draws over recognized text.
 
     After Ctrl+A every scan-text range gets a blue overlay box (Photos draws
     them as a composition layer, so only a screen grab sees them).  Each blue
-    box is one atomic OCR unit -- it must never be split.  The pipeline:
+    box is one atomic OCR unit -- it must never be split.
 
-    1. **RGB change**: compare the scan-text frame (``active``) with the
-       all-selected frame (``selected``) per pixel; only pixels whose RGB
-       changed between the two frames can be the selection overlay.
-    2. **Blue family**: the changed pixel must sit in the measured overlay
-       colour family (``B - R > 40`` and ``B >= 150``).
-    3. **Highlight-island gate** (``island_blocks``, optional): pixels
-       outside the undimmed scan-text islands are not selection boxes.
+    Primary detection (``base`` given): the selection overlay is Photos'
+    blue RGB(0, 120, 211) blended at 31.76% over the ORIGINAL pixel, i.e.
+    ``selected == blue_overlay_image(base)``.  Pixels that match the
+    formula but were NOT repainted (blue artwork whose overlay is ~the
+    identity) are excluded by the paint-delta guard, so only genuine
+    selection boxes survive.
+
+    Fallback (no ``base`` or the formula found nothing): a pixel belongs
+    to the selection overlay when ANY single RGB channel differs by more
+    than ``_MASK_DELTA_MIN`` between the scan-text frame (``active``) and
+    the all-selected frame (``selected``).  ``island_blocks`` is accepted
+    for call-site compatibility but plays no role in the detection.
     """
     if active.shape != selected.shape:
         active, selected = _align_frames(active, selected)
+    gray_once = np.mean(active, axis=2).astype(np.float32)
+    if base is not None:
+        if base.shape != selected.shape:
+            base, selected = _align_frames(base, selected)
+        expected = blue_overlay_image(base)
+        formula = np.abs(selected.astype(np.float64) - expected).max(axis=2) <= BLUE_OVERLAY_TOLERANCE
+        painted = np.abs(selected.astype(np.float64) - base.astype(np.float64)).max(axis=2) > BLUE_OVERLAY_PAINT_DELTA
+        mask = cv2.morphologyEx(
+            (formula & painted).astype(np.uint8) * 255,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        )
+        values = _selection_boxes_from_mask(mask, gray_once, active.shape)
+        if values:
+            return sorted(values, key=lambda item: (item.y, -item.x))
     active_f = active.astype(np.int16)
     selected_f = selected.astype(np.int16)
-    delta = np.max(np.abs(selected_f - active_f), axis=2)
-    blue_dominant = (
-        (selected_f[..., 2] - selected_f[..., 0] > _MASK_BR_MIN)
-        & (selected_f[..., 2] - selected_f[..., 1] > _MASK_BG_MIN)
-        & (selected_f[..., 2] >= _MASK_B_FLOOR)
-    )
-    mask = (delta > _MASK_DELTA_MIN) & blue_dominant
-    if island_blocks:
-        island = np.zeros(active.shape[:2], dtype=bool)
-        for block in island_blocks:
-            island[block.y:block.y + block.height, block.x:block.x + block.width] = True
-        mask &= island
-    frame_area = active.shape[0] * active.shape[1]
-    gray_once = np.mean(active, axis=2).astype(np.float32)
-    # Despeckle only: never bridge neighbouring boxes -- adjacent selection
-    # boxes (one per OCR column) often sit only a few pixels apart.
+    changed = (np.abs(selected_f - active_f) > _MASK_DELTA_MIN).any(axis=2)
     mask = cv2.morphologyEx(
-        mask.astype(np.uint8) * 255,
+        changed.astype(np.uint8) * 255,
         cv2.MORPH_OPEN,
         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
     )
-    values = _selection_boxes_from_mask(mask, gray_once, frame_area, active.shape)
+    values = _selection_boxes_from_mask(mask, gray_once, active.shape)
     return sorted(values, key=lambda item: (item.y, -item.x))
 
 
 def _selection_boxes_from_mask(
-    mask: np.ndarray, gray: np.ndarray, frame_area: int, shape
+    mask: np.ndarray, gray: np.ndarray, shape
 ) -> list[OverlayBlock]:
     """Connected-component box extraction from a blue-selection mask.
 
-    Shared by the delta-based and the no-delta fallback passes of
-    ``detect_selection_boxes``: despeckled components become atomic boxes,
-    big components are split by x projection and text-aware gaps.
+    Despeckled components become atomic boxes; components covering more
+    than 20% of the frame (Photos treating a whole page as one OCR block)
+    are dropped -- a whole-page selection is not an atomic text box.
+    Big components are split by x projection and text-aware gaps.
     """
     _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
     values = []
     for x, y, width, height, area in stats[1:]:
         if area < 60 or width < 6 or height < 8:
             continue
-        # A selection region covering most of the page (e.g. Photos treats a
-        # cover page as one OCR block) is not an atomic text box: drop it
-        # entirely instead of returning a meaningless whole-page box.
-        if (width * height) > frame_area * 0.20:
+        # Whole-page selections are not atomic text boxes: drop them.
+        if (width * height) > shape[0] * shape[1] * 0.20:
             continue
         # Split a component at empty x columns: Photos may fuse a few boxes
         # that touch, but columns leave measurable gaps between the boxes.
@@ -593,6 +625,7 @@ def _capture_selection_boxes(
     active: np.ndarray,
     debug_dir: str | None = None,
     island_blocks: Sequence[OverlayBlock] | None = None,
+    base: np.ndarray | None = None,
 ) -> tuple[list[OverlayBlock], np.ndarray | None, str | None]:
     """Ctrl+A all scan-text ranges and grab the blue selection overlay.
 
@@ -616,7 +649,9 @@ def _capture_selection_boxes(
                 keyboard.send_keys("^a")
                 time.sleep(wait)
                 selected = _capture_control_region(window, active_control)
-                blocks = detect_selection_boxes(active, selected, island_blocks=island_blocks)
+                blocks = detect_selection_boxes(
+                    active, selected, base=base, island_blocks=island_blocks
+                )
             if blocks:
                 if debug_dir:
                     os.makedirs(debug_dir, exist_ok=True)
@@ -1453,7 +1488,7 @@ def _capture_photos_fast_page(
     if fixed_window_rect is not None:
         _ensure_window_rect(window, fixed_window_rect)
     selection_blocks, selected_frame, selection_error = _capture_selection_boxes(
-        window, active_control, active, debug_dir, island_blocks=blocks
+        window, active_control, active, debug_dir, island_blocks=blocks, base=base
     )
     _tick("selection_boxes")
     selection_boxes_status = (
