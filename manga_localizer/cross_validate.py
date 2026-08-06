@@ -40,6 +40,7 @@ class IslandVerdict:
     review_reasons: Tuple[str, ...]
     empty_paddle: bool
     dropped_reason: Optional[str] = None
+    excluded_foreign: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -79,8 +80,28 @@ _PUNCTUATION_FOR_MATCH = frozenset(
     " 、。！？…‥．.・,，!?\"'「」『』”’‘«»~〜ー-–—_()（）[]【】:：;；"
 )
 
+# Small kana normalize to their base forms for matching: manga may read
+# まぁ where Paddle reads まあ; both are the same text.
+_SMALL_KANA = str.maketrans({
+    "ぁ": "あ", "ぃ": "い", "ぅ": "う", "ぇ": "え", "ぉ": "お",
+    "ゃ": "や", "ゅ": "ゆ", "ょ": "よ", "っ": "つ", "ゎ": "わ",
+    "ゕ": "か", "ゖ": "け",
+})
+
 
 def _normalize_for_match(text: str) -> str:
+    text = text.translate(_SMALL_KANA)
+    # full-width ASCII -> half-width (manga may read １ where Paddle reads 1)
+    converted = []
+    for char in text:
+        code = ord(char)
+        if 0xFF01 <= code <= 0xFF5E:
+            converted.append(chr(code - 0xFEE0))
+        elif code == 0x3000:
+            converted.append(" ")
+        else:
+            converted.append(char)
+    text = "".join(converted)
     return "".join(char for char in text if char not in _PUNCTUATION_FOR_MATCH)
 
 
@@ -108,6 +129,44 @@ def _paddle_contained_in_manga(manga_text: str, paddle_fragments: Sequence[str])
             return False
         matched_any = True
     return matched_any
+
+
+def _split_foreign_fragments(
+    manga_text: str, paddle_items: Sequence[OcrLine]
+) -> tuple[list[OcrLine], list[OcrLine]]:
+    """Split Paddle fragments into evidence and foreign columns.
+
+    A fragment that is not contained in the manga reading is foreign when
+    its x range does not overlap the x range of any contained fragment: it
+    is a separate text column that Photos highlighted together with the
+    island's own text (e.g. ``純然たる`` next to ``ワテクアは``).  Foreign
+    fragments are excluded from the divergence computation but kept in the
+    verdict for audit.
+    """
+    normalized_manga = _normalize_for_match(manga_text)
+    contained: list[OcrLine] = []
+    foreign: list[OcrLine] = []
+    for item in paddle_items:
+        fragment = _normalize_for_match(str(item.text or "").strip())
+        if not fragment or len(fragment) < 2 or fragment in normalized_manga:
+            contained.append(item)
+        else:
+            foreign.append(item)
+    if not contained or not foreign:
+        return contained, []
+
+    evidence_x: list[tuple[float, float]] = []
+    for item in contained:
+        xs = [point[0] for point in item.polygon]
+        evidence_x.append((min(xs), max(xs)))
+    kept_foreign: list[OcrLine] = []
+    for item in foreign:
+        xs = [point[0] for point in item.polygon]
+        fx1, fx2 = min(xs), max(xs)
+        overlaps = any(fx1 <= ex2 and ex1 <= fx2 for ex1, ex2 in evidence_x)
+        if not overlaps:
+            kept_foreign.append(item)
+    return contained, kept_foreign
 
 
 def _containing_island_id(
@@ -198,6 +257,8 @@ def cross_validate_page(
             continue
 
         manga_text = manga_by_island.get(island.id, "")
+        normalized_manga = _normalize_for_match(manga_text)
+        punct_only = bool(manga_text) and not normalized_manga
         paddle_items = paddle_by_island.get(island.id, [])
         paddle_fragments = tuple(
             str(item.text or "").strip()
@@ -213,20 +274,43 @@ def cross_validate_page(
         reasons = []
         if not manga_text:
             reasons.append("manga-ocr empty")
-        if not paddle_items:
+        if not paddle_items and not punct_only:
             reasons.append("paddle empty")
         distance = None
-        if manga_text and paddle_text:
+        excluded_foreign: tuple[str, ...] = ()
+        if manga_text and paddle_text and not punct_only:
             if _paddle_contained_in_manga(manga_text, paddle_fragments):
                 distance = 0.0
             else:
-                distance = _normalized_edit_distance(
-                    _normalize_for_match(manga_text),
-                    _normalize_for_match(paddle_text),
+                evidence, foreign = _split_foreign_fragments(manga_text, paddle_items)
+                if foreign:
+                    excluded_foreign = tuple(
+                        str(item.text or "").strip() for item in foreign
+                    )
+                evidence_text = "".join(
+                    str(item.text or "").strip() for item in evidence
                 )
-                if distance > edit_distance_threshold:
-                    reasons.append(f"engines diverge (edit={distance:.2f})")
-        if low_lines:
+                if evidence_text and _paddle_contained_in_manga(
+                    manga_text,
+                    [str(item.text or "") for item in evidence],
+                ):
+                    distance = 0.0
+                elif evidence_text:
+                    distance = _normalized_edit_distance(
+                        normalized_manga,
+                        _normalize_for_match(evidence_text),
+                    )
+                    if distance > edit_distance_threshold:
+                        reasons.append(f"engines diverge (edit={distance:.2f})")
+                else:
+                    distance = _normalized_edit_distance(
+                        normalized_manga, _normalize_for_match(paddle_text)
+                    )
+                    if distance > edit_distance_threshold:
+                        reasons.append(f"engines diverge (edit={distance:.2f})")
+        # Low confidence only matters when the texts disagree: a confident
+        # reading of the same text must not push the island to review.
+        if low_lines and distance != 0.0:
             reasons.append(f"low-confidence lines: {len(low_lines)}")
         status = _PASS if not reasons else _REVIEW
         verdicts.append(
@@ -244,6 +328,7 @@ def cross_validate_page(
                 low_confidence_lines=low_lines,
                 review_reasons=tuple(reasons),
                 empty_paddle=not paddle_items,
+                excluded_foreign=excluded_foreign,
             )
         )
 
@@ -312,6 +397,7 @@ def verdicts_to_json(result: PageCrossValidation) -> dict:
                 "low_confidence_lines": list(v.low_confidence_lines),
                 "review_reasons": list(v.review_reasons),
                 "dropped_reason": v.dropped_reason,
+                "excluded_foreign": list(v.excluded_foreign),
             }
             for v in result.verdicts
         ],

@@ -12,6 +12,7 @@ from manga_localizer.island_typeset import (
     _block_metrics,
     _slots_centered,
     _slots_follow_columns,
+    _slots_horizontal,
     typeset_island_page,
 )
 
@@ -75,6 +76,42 @@ class MinRatioTest(unittest.TestCase):
     def test_min_ratio_configurable(self):
         self.assertEqual(TypesetConfig(min_ratio=0.5).min_ratio, 0.5)
 
+    def test_min_font_size_floor_is_30(self):
+        self.assertEqual(TypesetConfig().min_font_size, 30)
+
+
+class AlignmentRulesTest(unittest.TestCase):
+    def test_vertical_columns_top_aligned(self):
+        # Two columns of one sentence share the same top edge.
+        dataset = _dataset([_island((10, 10, 200, 300))])
+        island = dataset.islands[0]
+        slots = _slots_centered(
+            "甲乙丙丁戊己", 30, island, (105, 155), TypesetConfig(),
+            layout_bbox=(10, 10, 200, 300), top_align=12,
+        )
+        step = 30 + 30 // 16
+        expected_tops = [
+            slot.y_center - ((slot.char_count - 1) * step + 30) / 2.0
+            for slot in slots
+        ]
+        self.assertEqual(len(set(round(top, 3) for top in expected_tops)), 1)
+        self.assertAlmostEqual(expected_tops[0], 12.0, places=3)
+
+    def test_horizontal_rows_left_aligned(self):
+        # A short last row starts at the same left edge as the full rows.
+        dataset = _dataset([_island((10, 10, 300, 200))])
+        island = dataset.islands[0]
+        slots = _slots_horizontal(
+            "甲乙丙丁戊己", 24, island, (155, 105), TypesetConfig(),
+            layout_bbox=(10, 10, 300, 200),
+        )
+        step = 24 + 24 // 16
+        lefts = [
+            slot.x_center - (slot.char_count - 1) * step / 2.0
+            for slot in slots
+        ]
+        self.assertEqual(len(set(round(left, 3) for left in lefts)), 1)
+
 
 class TypesetPageTest(unittest.TestCase):
     def _page(self):
@@ -102,7 +139,10 @@ class TypesetPageTest(unittest.TestCase):
         )
         audits = {item.island_id: item for item in result.audits}
         self.assertEqual(audits["island_001"].status, "typeset")
-        self.assertEqual(audits["island_002"].status, "typeset")
+        # island_002's short text under-fills the island at the 22px font
+        # floor -> area ratio below the 0.6 target -> pending_review (still
+        # rendered, never blank).
+        self.assertEqual(audits["island_002"].status, "typeset_pending_review")
         self.assertTrue(audits["island_001"].area_ratio >= 0.6)
         self.assertLessEqual(audits["island_001"].area_ratio, 1.1)
         self.assertLessEqual(audits["island_002"].center_offset, audits["island_002"].center_tolerance)
@@ -120,9 +160,13 @@ class TypesetPageTest(unittest.TestCase):
     def test_untranslatable_island_failed_audit(self):
         dataset = _dataset([_island((10, 10, 30, 30), area=400.0)])
         image = Image.new("RGB", (300, 400), (255, 255, 255))
-        translations = {"island_001": "这是一段非常长的测试文字内容"}
+        translations = {"island_001": "这是一段非常长的测试文字"}
         result = typeset_island_page(image, dataset, translations, [], config=TypesetConfig())
-        self.assertEqual(result.audits[0].status, "translation_failed")
+        # The text cannot fit at the 30px font floor, but it is still
+        # rendered (clipped to the island) so the island is never blank:
+        # the status is pending_review, not translation_failed.
+        self.assertEqual(result.audits[0].status, "typeset_pending_review")
+        self.assertEqual(result.audits[0].font_size, 30)
 
 
 if __name__ == "__main__":

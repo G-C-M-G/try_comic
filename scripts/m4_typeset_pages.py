@@ -16,7 +16,11 @@ from PIL import Image
 from manga_localizer.island_contract import load_island_dataset
 from manga_localizer.island_dry_run import OcrLine
 from manga_localizer.island_state import build_page_state, write_page_state
-from manga_localizer.island_typeset import TypesetConfig, typeset_island_page
+from manga_localizer.island_typeset import (
+    TypesetConfig,
+    infer_island_directions,
+    typeset_island_page,
+)
 
 
 def _parse_pages(value: str) -> list[str]:
@@ -71,10 +75,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             for item in paddle_payload.get("lines", [])
         ]
+        # Horizontal typesetting for pages whose Photos blue boxes are
+        # mostly wider than tall (afterword pages etc.); falls back to
+        # vertical when no selection_blocks.json exists.
+        selection_json = root / page / "selection_blocks.json"
+        direction_overrides = None
+        if selection_json.is_file():
+            direction_overrides = infer_island_directions(selection_json, dataset.islands)
         started = time.perf_counter()
         with Image.open(erase_dir / f"{page}.erased.png") as erased:
             result = typeset_island_page(
-                erased, dataset, translations, paddle_lines, config=config
+                erased,
+                dataset,
+                translations,
+                paddle_lines,
+                config=config,
+                direction_overrides=direction_overrides,
             )
         seconds = round(time.perf_counter() - started, 3)
         result.image.save(out_dir / f"{page}.typeset.png")

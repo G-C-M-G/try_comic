@@ -31,7 +31,12 @@ import numpy as np
 import cv2
 from PIL import Image, ImageDraw
 
-from island_extract import parse_color, process_page
+from island_extract import (
+    extract_islands,
+    load_selection_blocks,
+    parse_color,
+    process_page,
+)
 
 _ANNOTATION_COLORS = [
     "#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
@@ -120,6 +125,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="precise island contour annotation (default off): shape-faithful "
         "filled masks + outline polygons + islands_annotated.png",
     )
+    parser.add_argument(
+        "--min-island-area",
+        type=float,
+        default=800.0,
+        help="drop islands below this image-area (px^2, default 800)",
+    )
     args = parser.parse_args(argv)
 
     fill_black = parse_color(args.fill_black)
@@ -149,18 +160,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             image_size = Image.open(image_path).size
             timing = {}
-            black_result = process_page(capture_page_dir, image_size, timing, fill_black, args.contours)
-            blue_result = process_page(capture_page_dir, image_size, dict(timing), fill_blue, args.contours)
+            selection_blocks = load_selection_blocks(capture_page_dir)
+            result = extract_islands(
+                capture_page_dir,
+                image_size,
+                timing,
+                contours=args.contours,
+                min_island_area=args.min_island_area,
+                selection_blocks=selection_blocks,
+            )
+            islands = result["islands"]
+            island_mask = result["island_mask"]
             out_page.mkdir(parents=True, exist_ok=True)
-            islands = blue_result["islands"]
             if args.contours:
                 # Precise contour-annotation fills (default off): the
                 # non-background pixels are the exact island shapes.
                 Image.fromarray(
-                    _filled_shape(str(image_path), black_result["island_mask"], image_size, fill_black)
+                    _filled_shape(str(image_path), island_mask, image_size, fill_black)
                 ).save(out_page / "filled_black.png")
                 Image.fromarray(
-                    _filled_shape(str(image_path), blue_result["island_mask"], image_size, fill_blue)
+                    _filled_shape(str(image_path), island_mask, image_size, fill_blue)
                 ).save(out_page / "filled_blue.png")
             else:
                 # Default: simple bounding-box fills.
@@ -174,6 +193,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             overlay = capture_page_dir / "photos_ocr.png"
             if overlay.is_file():
                 shutil.copyfile(overlay, out_page / "photos_ocr.png")
+            selected = capture_page_dir / "photos_selected.png"
+            if selected.is_file():
+                shutil.copyfile(selected, out_page / "photos_selected.png")
+            selection_json = capture_page_dir / "capture.json"
+            if selection_json.is_file():
+                try:
+                    manifest = json.loads(selection_json.read_text(encoding="utf-8-sig"))
+                    capture = manifest.get("capture", {})
+                    selection_blocks_out = {
+                        "schema_version": 1,
+                        "page": page,
+                        "image_size": list(image_size),
+                        "selection_blocks": capture.get("selection_blocks") or [],
+                        "selection_groups": capture.get("selection_groups") or [],
+                        "selection_boxes_status": capture.get("selection_boxes_status"),
+                    }
+                    with open(out_page / "selection_blocks.json", "w", encoding="utf-8") as handle:
+                        json.dump(selection_blocks_out, handle, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
             with open(out_page / "islands.json", "w", encoding="utf-8") as handle:
                 json.dump(
                     {
@@ -184,8 +223,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "fill_blue": list(fill_blue),
                         "contours": args.contours,
                         "fill_mode": "shape" if args.contours else "bbox",
+                        "min_island_area": args.min_island_area,
                         "islands": islands,
-                        "timing": blue_result["timing"],
+                        "dropped_tiny": result["dropped_tiny"],
+                        "splits": result["splits"],
+                        "timing": result["timing"],
                     },
                     handle,
                     ensure_ascii=False,
@@ -196,7 +238,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             row.update({
                 "status": "ok",
                 "island_count": len(islands),
-                "dim_fraction": blue_result["timing"]["dim_fraction"],
+                "dim_fraction": result["timing"]["dim_fraction"],
+                "dropped_tiny_count": result["timing"]["dropped_tiny_count"],
+                "split_count": result["timing"]["split_count"],
                 "contours": args.contours,
             })
         except Exception as error:
@@ -222,7 +266,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dump(summary, handle, ensure_ascii=False, indent=2)
     for row in rows:
         if row["status"] == "ok":
-            print(f"page {row['page']}: ok islands={row['island_count']} dim={row['dim_fraction']:.2f} contours={row['contours']}")
+            print(
+                f"page {row['page']}: ok islands={row['island_count']} "
+                f"dim={row['dim_fraction']:.2f} dropped={row['dropped_tiny_count']} "
+                f"splits={row['split_count']} contours={row['contours']}"
+            )
         else:
             print(f"page {row['page']}: FAIL {row['error']}")
     print(f"wall={wall:.2f}s output={output_root}")

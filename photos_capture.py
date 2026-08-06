@@ -11,11 +11,13 @@ import argparse
 from collections import Counter
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +43,40 @@ PADDLE_ENV_OVERRIDES = {
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 _SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
+# Right boundary for the display-scale window layout: the rightmost window
+# never crosses this x (e.g. 2400 keeps windows clear of an obstruction on
+# a 2560px-wide screen).  0 = screen edge.
+DISPLAY_RIGHT_LIMIT = 2400
+
+# Run in physical pixels: a DPI-unaware process gets display-scaled system
+# metrics (e.g. 1707x1067 for a 2560x1600 screen at 150%), which shrinks
+# the layout budget and makes 6 pinned windows impossible.  DPI awareness
+# makes GetSystemMetrics / SetWindowPos / ImageGrab all agree in real
+# pixels and keeps the captured frames sharp.
+try:
+    import ctypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+    except Exception:
+        ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
+# Serializes focus + keyboard sequences across parallel Photos windows:
+# SendInput delivers to the focused window, so only one worker may hold
+# focus while typing at a time.  Frame grabs (ImageGrab) stay parallel.
+_INPUT_LOCK = threading.Lock()
+
+
+class PhotosNoTextError(RuntimeError):
+    """Photos scan-text found no text (e.g. a pure-illustration page).
+
+    The page itself is normal -- it simply has nothing to translate.  The
+    capture flow treats it like a black page: no retries, no fallback
+    dialog, ``no_text`` is recorded in the manifest and downstream skips it.
+    """
+
 
 @dataclass(frozen=True)
 class OverlayBlock:
@@ -48,6 +84,8 @@ class OverlayBlock:
     y: int
     width: int
     height: int
+    page_scale: bool = False
+    split_region: bool = False
 
     @property
     def center(self) -> tuple[int, int]:
@@ -240,6 +278,25 @@ def _inventory_text(active_control, block: OverlayBlock) -> list[str]:
     ]
 
 
+def _align_frames(first: np.ndarray, second: np.ndarray):
+    """Tolerate tiny layout drift between two screen grabs.
+
+    Photos resizes its window by 1-2px between the base grab and the
+    scan-text switch (window-edge jitter).  Frames within 2px are aligned
+    to their common top-left region; larger mismatches raise.
+    """
+    if first.shape == second.shape:
+        return first, second
+    if (
+        abs(first.shape[0] - second.shape[0]) <= 2
+        and abs(first.shape[1] - second.shape[1]) <= 2
+    ):
+        height = min(first.shape[0], second.shape[0])
+        width = min(first.shape[1], second.shape[1])
+        return first[:height, :width], second[:height, :width]
+    raise ValueError("Photos OCR before/after frames have different sizes")
+
+
 def detect_overlay_blocks(base: np.ndarray, active: np.ndarray) -> list[OverlayBlock]:
     """Find the highlight islands Photos renders in scan-text mode.
 
@@ -250,8 +307,7 @@ def detect_overlay_blocks(base: np.ndarray, active: np.ndarray) -> list[OverlayB
     the overlay is not yet present so the caller keeps polling instead of
     mistaking plain page regions for OCR islands.
     """
-    if base.shape != active.shape:
-        raise ValueError("Photos OCR before/after frames have different sizes")
+    base, active = _align_frames(base, active)
     base_f = base.astype(np.int16)
     active_f = active.astype(np.int16)
     delta = np.mean(np.abs(active_f - base_f), axis=2)
@@ -289,6 +345,300 @@ def detect_overlay_blocks(base: np.ndarray, active: np.ndarray) -> list[OverlayB
             continue
         values.append(OverlayBlock(int(x), int(y), int(width), int(height)))
     return sorted(values, key=lambda item: (item.y, -item.x))
+
+
+def _text_aware_split(
+    frame: np.ndarray,
+    x: int, y: int, width: int, height: int,
+) -> list[tuple[int, int, int, int]]:
+    """Split a large selection box into text blocks by x projection gaps.
+
+    Photos sometimes draws ONE selection box around several text blocks
+    (e.g. a footer bar with a few columns).  The box is split where the
+    local-contrast text mask shows a real x gap (>= 6px, a column pitch),
+    so every returned rectangle hugs one block of text.
+    """
+    if frame is None or width <= 0 or height <= 0:
+        return []
+    gray = frame[y:y + height, x:x + width]
+    if gray.size == 0:
+        return []
+    gray = gray.astype(np.float32)
+    median = cv2.medianBlur(gray.astype(np.uint8), 15).astype(np.float32)
+    text = np.abs(gray - median) > 45
+    proj = text.sum(axis=0)
+    segments = []
+    start = None
+    for index in range(proj.shape[0] + 1):
+        present = index < proj.shape[0] and proj[index] > 2
+        if present and start is None:
+            start = index
+        elif not present and start is not None:
+            segments.append((start, index - 1))
+            start = None
+    if len(segments) < 2:
+        return []
+    merged = []
+    for left, right in segments:
+        if merged and left - merged[-1][1] - 1 < 6:
+            merged[-1] = (merged[-1][0], right)
+        else:
+            merged.append((left, right))
+    if len(merged) < 2:
+        return []
+    boxes = []
+    for left, right in merged:
+        band = text[:, left:right + 1]
+        rows = np.where(band.any(axis=1))[0]
+        if rows.size == 0:
+            continue
+        top, bottom = int(rows.min()), int(rows.max()) + 1
+        if bottom - top < 8 or right - left + 1 < 6:
+            continue
+        boxes.append((x + left, y + top, right - left + 1, bottom - top))
+    return boxes
+
+
+# Photos scan-text selection overlay (measured): normal blend of
+# RGB(0, 120, 211) at alpha 81/255.  A covered pixel is detected by
+# comparing the two captured frames: the scan-text frame (``active`` /
+# photos_ocr) vs the all-selected frame (``selected`` / photos_selected).
+# The selection box pixels (a) changed between the two frames (RGB delta)
+# and (b) sit in the bright blue overlay family (B high, R suppressed).
+_MASK_B_FLOOR = 150  # brightness gate: overlay family sits at B >= 150
+_MASK_BR_MIN = 40  # blue dominance: B - R floor of the overlay family
+_MASK_BG_MIN = -5  # green gate: G must not exceed B (rejects yellow-green)
+_MASK_DELTA_MIN = 12  # per-channel RGB change between the two frames
+
+
+def detect_selection_boxes(
+    active: np.ndarray,
+    selected: np.ndarray,
+    *,
+    island_blocks: Sequence[OverlayBlock] | None = None,
+) -> list[OverlayBlock]:
+    """Find the blue selection rectangles Photos draws over recognized text.
+
+    After Ctrl+A every scan-text range gets a blue overlay box (Photos draws
+    them as a composition layer, so only a screen grab sees them).  Each blue
+    box is one atomic OCR unit -- it must never be split.  The pipeline:
+
+    1. **RGB change**: compare the scan-text frame (``active``) with the
+       all-selected frame (``selected``) per pixel; only pixels whose RGB
+       changed between the two frames can be the selection overlay.
+    2. **Blue family**: the changed pixel must sit in the measured overlay
+       colour family (``B - R > 40`` and ``B >= 150``).
+    3. **Highlight-island gate** (``island_blocks``, optional): pixels
+       outside the undimmed scan-text islands are not selection boxes.
+    """
+    if active.shape != selected.shape:
+        active, selected = _align_frames(active, selected)
+    active_f = active.astype(np.int16)
+    selected_f = selected.astype(np.int16)
+    delta = np.max(np.abs(selected_f - active_f), axis=2)
+    blue_dominant = (
+        (selected_f[..., 2] - selected_f[..., 0] > _MASK_BR_MIN)
+        & (selected_f[..., 2] - selected_f[..., 1] > _MASK_BG_MIN)
+        & (selected_f[..., 2] >= _MASK_B_FLOOR)
+    )
+    mask = (delta > _MASK_DELTA_MIN) & blue_dominant
+    if island_blocks:
+        island = np.zeros(active.shape[:2], dtype=bool)
+        for block in island_blocks:
+            island[block.y:block.y + block.height, block.x:block.x + block.width] = True
+        mask &= island
+    frame_area = active.shape[0] * active.shape[1]
+    gray_once = np.mean(active, axis=2).astype(np.float32)
+    # Despeckle only: never bridge neighbouring boxes -- adjacent selection
+    # boxes (one per OCR column) often sit only a few pixels apart.
+    mask = cv2.morphologyEx(
+        mask.astype(np.uint8) * 255,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+    )
+    values = _selection_boxes_from_mask(mask, gray_once, frame_area, active.shape)
+    return sorted(values, key=lambda item: (item.y, -item.x))
+
+
+def _selection_boxes_from_mask(
+    mask: np.ndarray, gray: np.ndarray, frame_area: int, shape
+) -> list[OverlayBlock]:
+    """Connected-component box extraction from a blue-selection mask.
+
+    Shared by the delta-based and the no-delta fallback passes of
+    ``detect_selection_boxes``: despeckled components become atomic boxes,
+    big components are split by x projection and text-aware gaps.
+    """
+    _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    values = []
+    for x, y, width, height, area in stats[1:]:
+        if area < 60 or width < 6 or height < 8:
+            continue
+        # A selection region covering most of the page (e.g. Photos treats a
+        # cover page as one OCR block) is not an atomic text box: drop it
+        # entirely instead of returning a meaningless whole-page box.
+        if (width * height) > frame_area * 0.20:
+            continue
+        # Split a component at empty x columns: Photos may fuse a few boxes
+        # that touch, but columns leave measurable gaps between the boxes.
+        sub = mask[y:y + height, x:x + width]
+        proj = sub.sum(axis=0)
+        segments = []
+        start = None
+        for index in range(proj.shape[0] + 1):
+            present = index < proj.shape[0] and proj[index] > 0
+            if present and start is None:
+                start = index
+            elif not present and start is not None:
+                segments.append((start, index - 1))
+                start = None
+        for left, right in segments:
+            box_width = right - left + 1
+            if box_width < 6:
+                continue
+            band = sub[:, left:right + 1]
+            rows = np.where(band.any(axis=1))[0]
+            if rows.size == 0:
+                continue
+            box_y1 = y + int(rows.min())
+            box_y2 = y + int(rows.max()) + 1
+            if box_y2 - box_y1 < 8:
+                continue
+            # A large non-page-scale box often wraps several text blocks
+            # (e.g. a footer bar): split it by text x gaps so each returned
+            # box hugs one block of text.
+            if (
+                (box_width > shape[1] * 0.35
+                 or (box_y2 - box_y1) > shape[0] * 0.35)
+            ):
+                pieces = _text_aware_split(
+                    gray, x + left, box_y1, box_width, box_y2 - box_y1
+                )
+                if len(pieces) >= 2:
+                    for px, py, pw, ph in pieces:
+                        if pw < 6 or ph < 8:
+                            continue
+                        values.append(
+                            OverlayBlock(
+                                int(px), int(py), int(pw), int(ph),
+                                page_scale=False,
+                            )
+                        )
+                    continue
+            values.append(
+                OverlayBlock(
+                    int(x + left), int(box_y1), int(box_width), int(box_y2 - box_y1),
+                    page_scale=False,
+                )
+            )
+    return values
+
+
+def aggregate_selection_boxes(
+    blocks: Sequence[OverlayBlock], x_gap: int = 24, y_pad: int = 8
+) -> list[tuple[tuple[int, int, int, int], list[OverlayBlock]]]:
+    """Group atomic selection boxes into sentence-level blocks.
+
+    Two boxes belong to one group when their x gap is within *x_gap* and
+    their y ranges overlap (within *y_pad*): horizontally adjacent columns
+    of the same line merge, while vertically split halves of different text
+    (e.g. ``同様に`` above ``純然たる``) stay separate.  The group bbox is
+    the union of its member boxes -- downstream OCR then does not need to
+    decide which boxes form a line.
+    """
+    ordered = sorted(blocks, key=lambda item: (item.y, item.x))
+    parent = list(range(len(ordered)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i, item in enumerate(ordered):
+        for j in range(i + 1, len(ordered)):
+            other = ordered[j]
+            y_overlap = min(
+                item.y + item.height, other.y + other.height
+            ) - max(item.y, other.y)
+            if y_overlap < -y_pad:
+                continue
+            gap = max(item.x, other.x) - min(
+                item.x + item.width, other.x + other.width
+            )
+            if gap <= x_gap:
+                union(i, j)
+
+    groups: dict[int, list[OverlayBlock]] = {}
+    for index, block in enumerate(ordered):
+        groups.setdefault(find(index), []).append(block)
+    result = []
+    for members in groups.values():
+        x1 = min(item.x for item in members)
+        y1 = min(item.y for item in members)
+        x2 = max(item.x + item.width for item in members)
+        y2 = max(item.y + item.height for item in members)
+        result.append(((x1, y1, x2, y2), members))
+    return sorted(result, key=lambda item: (item[0][1], -item[0][2]))
+
+
+def _capture_selection_boxes(
+    window,
+    active_control,
+    active: np.ndarray,
+    debug_dir: str | None = None,
+    island_blocks: Sequence[OverlayBlock] | None = None,
+) -> tuple[list[OverlayBlock], np.ndarray | None, str | None]:
+    """Ctrl+A all scan-text ranges and grab the blue selection overlay.
+
+    The focus + Ctrl+A sequence is serialized, then the blue frame is
+    grabbed and verified: when no blue boxes appear (the overlay is still
+    rendering or focus was stolen), Ctrl+A is re-sent with an increasing
+    wait (0.4s / 0.8s / 1.2s) up to three attempts.  Fails soft only after
+    all attempts: the frame is still saved and the caller marks the page
+    ``selection_missing`` so the batch is never blocked.
+    """
+    from pywinauto import keyboard
+
+    last_selected = None
+    error = None
+    for attempt in range(3):
+        wait = 0.4 + 0.4 * attempt
+        try:
+            with _INPUT_LOCK:
+                window.set_focus()
+                time.sleep(0.2)
+                keyboard.send_keys("^a")
+                time.sleep(wait)
+                selected = _capture_control_region(window, active_control)
+                blocks = detect_selection_boxes(active, selected, island_blocks=island_blocks)
+            if blocks:
+                if debug_dir:
+                    os.makedirs(debug_dir, exist_ok=True)
+                    Image.fromarray(selected).save(
+                        os.path.join(debug_dir, "photos_selected.png")
+                    )
+                return blocks, selected, None
+            last_selected = selected
+            error = "no blue boxes after Ctrl+A (retrying)"
+        except Exception as exc:  # noqa: BLE001 - soft failure by design
+            error = str(exc)
+            last_selected = None
+        time.sleep(0.3)
+    if debug_dir and last_selected is not None:
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+            Image.fromarray(last_selected).save(
+                os.path.join(debug_dir, "photos_selected.png")
+            )
+        except Exception:
+            pass
+    return [], last_selected, error or "selection boxes unavailable"
 
 
 def _projection_clicks(active: np.ndarray, block: OverlayBlock) -> list[tuple[int, int]]:
@@ -1042,8 +1392,18 @@ def _capture_photos_fast_page(
     paddle_device: str = "cpu",
     paddle: PaddleSession | None = None,
     keep_sfx: bool = True,
+    frames_only: bool = False,
+    fixed_window_rect: tuple[int, int, int, int] | None = None,
+    display_scale: int = 100,
 ) -> tuple[dict, object]:
-    """One fast-mask page capture; returns ``(manifest, window)`` for reuse."""
+    """One fast-mask page capture; returns ``(manifest, window)`` for reuse.
+
+    ``frames_only`` captures only the three frames (base / overlay /
+    all-selected) plus the blue selection boxes and returns immediately --
+    no masked OCR, no column pass, no clipboard work.  All recognition
+    happens later in a background batch, so the Photos window is held open
+    for the shortest possible time.
+    """
     timings: dict[str, float] = {}
 
     def _tick(name: str) -> None:
@@ -1074,16 +1434,34 @@ def _capture_photos_fast_page(
                     break
             except Exception:
                 pass
-            time.sleep(0.25)
+            time.sleep(0.15)
         if not base_ready:
             raise RuntimeError(f"Photos window did not become available: {source}")
         photos_wait_open = round(time.monotonic() - open_start, 2)
-    base, active, blocks, active_control = _prepare_overlay(window, timeout, screen_capture=True)
+    if fixed_window_rect is not None:
+        _fix_window(window, fixed_window_rect)
+    base, active, blocks, active_control = _prepare_overlay(
+        window, timeout, screen_capture=True,
+        fixed_window_rect=fixed_window_rect,
+    )
     _tick("overlay")
     timings["photos_wait_seconds"] = round(photos_wait_open + timings["overlay"], 2)
     viewport = (active.shape[1], active.shape[0])
     if not _display_matches(_thumbnail(image_arr), base):
         raise RuntimeError(f"Photos displayed a different image than requested: {source}")
+
+    if fixed_window_rect is not None:
+        _ensure_window_rect(window, fixed_window_rect)
+    selection_blocks, selected_frame, selection_error = _capture_selection_boxes(
+        window, active_control, active, debug_dir, island_blocks=blocks
+    )
+    _tick("selection_boxes")
+    selection_boxes_status = (
+        "ok" if not selection_error else f"failed: {selection_error}"
+    )
+    selection_missing = bool(selection_error)
+    if selection_error:
+        selection_blocks = []
 
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
@@ -1095,6 +1473,73 @@ def _capture_photos_fast_page(
         screenshot_path = os.path.abspath(screenshot)
         os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
         Image.fromarray(active).save(screenshot_path)
+
+    if frames_only:
+        # Publish the frames + blue boxes and stop: no masked OCR, no
+        # column pass.  Recognition runs later in a background batch.
+        timings["total"] = round(time.monotonic() - start, 2)
+        timings["foreground_started_at"] = foreground_started_at
+        timings["foreground_ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        timings["foreground_active_seconds"] = timings["total"]
+        manifest = {
+            "schema_version": 2,
+            "backend": "Windows Photos Scan Text",
+            "source": {"path": source, "width": image.width, "height": image.height},
+            "capture": {
+                "app": "Windows Photos",
+                "automation_control": "OcrControl",
+                "viewport_size": viewport,
+                "method": "frames-only",
+                "frames_only": True,
+                "display_scale": display_scale,
+                "screenshot": screenshot_path,
+                "timing": timings,
+                "island_count": len(blocks),
+                "selection_boxes_status": selection_boxes_status,
+                "selection_missing": selection_missing,
+                "selection_blocks": [
+                    {
+                        "id": f"sel_{index:03d}",
+                        "display_bbox": [
+                            block.x, block.y,
+                            block.x + block.width, block.y + block.height,
+                        ],
+                        "image_bbox": _display_bbox_to_image(
+                            [block.x, block.y, block.x + block.width, block.y + block.height],
+                            viewport,
+                            image.size,
+                        ),
+                        "page_scale": block.page_scale,
+                    }
+                    for index, block in enumerate(selection_blocks, 1)
+                ],
+                "selection_groups": [
+                    {
+                        "id": f"selg_{index:03d}",
+                        "display_bbox": list(bbox),
+                        "image_bbox": _display_bbox_to_image(
+                            bbox, viewport, image.size
+                        ),
+                        "members": [
+                            f"sel_{selection_blocks.index(member) + 1:03d}"
+                            for member in members
+                        ],
+                    }
+                    for index, (bbox, members) in enumerate(
+                        aggregate_selection_boxes(selection_blocks), 1
+                    )
+                ],
+                "complete": True,
+            },
+            "columns": [],
+        }
+        if opened_window:
+            try:
+                window.close()
+            except Exception:
+                pass
+            window = None
+        return manifest, window
 
     viewport_area = active.shape[0] * active.shape[1]
     page_scale_blocks = [
@@ -1393,6 +1838,7 @@ def _capture_photos_fast_page(
             "automation_control": "OcrControl",
             "viewport_size": viewport,
             "method": "fast-mask",
+            "display_scale": display_scale,
             "screenshot": screenshot_path,
             "timing": timings,
             "inventory": inventory,
@@ -1400,6 +1846,35 @@ def _capture_photos_fast_page(
             "inventory_count": len(inventory),
             "island_count": len(blocks),
             "page_scale_islands": len(page_scale_blocks),
+            "selection_boxes_status": selection_boxes_status,
+                "selection_missing": selection_missing,
+            "selection_blocks": [
+                {
+                    "id": f"sel_{index:03d}",
+                    "display_bbox": [block.x, block.y, block.x + block.width, block.y + block.height],
+                    "image_bbox": _display_bbox_to_image(
+                        [block.x, block.y, block.x + block.width, block.y + block.height],
+                        viewport,
+                        image.size,
+                    ),
+                    "page_scale": block.page_scale,
+                }
+                for index, block in enumerate(selection_blocks, 1)
+            ],
+            "selection_groups": [
+                {
+                    "id": f"selg_{index:03d}",
+                    "display_bbox": list(bbox),
+                    "image_bbox": _display_bbox_to_image(bbox, viewport, image.size),
+                    "members": [
+                        f"sel_{selection_blocks.index(member) + 1:03d}"
+                        for member in members
+                    ],
+                }
+                for index, (bbox, members) in enumerate(
+                    aggregate_selection_boxes(selection_blocks), 1
+                )
+            ],
             "ignored_tiny_islands": tiny_islands if not keep_sfx else [],
             "dropped_noise_columns": dropped_noise,
             "sfx_columns": sum(column["role"] == "sfx" for column in columns),
@@ -1639,7 +2114,11 @@ def ingest_photos_batch(
         "images": str(source_dir),
         "output_dir": str(destination),
         "pages": results,
-        "complete": bool(results) and all(item["status"] in {"ingested", "reused"} for item in results),
+        "complete": bool(results)
+        and all(
+            item["status"] in {"captured", "reused", "black-page", "no-text"}
+            for item in results
+        ),
     }
     _write_json_atomic(destination / "batch.capture.json", report)
     return report
@@ -1702,6 +2181,508 @@ def capture_photos_batch(
     return report
 
 
+def _fix_window(window, rect: tuple[int, int, int, int]) -> None:
+    """Pin the Photos window to a fixed screen rect.
+
+    A pinned window eliminates the 1-2px edge jitter between the base and
+    overlay grabs (the root cause of the occasional "frames have different
+    sizes" failures) and keeps rendering consistent.
+    """
+    try:
+        import ctypes
+
+        x1, y1, x2, y2 = (int(value) for value in rect)
+        ctypes.windll.user32.SetWindowPos(
+            window.handle,
+            0,
+            x1,
+            y1,
+            max(100, x2 - x1),
+            max(100, y2 - y1),
+            0x0004,  # SWP_NOZORDER
+        )
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+
+def _prompt_fallback(image_path: str | Path) -> bool:
+    """Ask the user whether to route a failed capture to the manga fallback.
+
+    Returns True when the user clicks "Yes" (fallback-manga), False for
+    "No" (page stays failed).  Falls back to False when no interactive
+    desktop is available (e.g. a service session).
+    """
+    try:
+        import ctypes
+
+        message = (
+            f"第 {Path(image_path).stem} 页（{Path(image_path).name}）采集失败。\n\n"
+            "是否用 manga 兜底？\n"
+            "（winrt/Paddle 文本定位 + manga 识别 + 翻译嵌字）"
+        )
+        answer = ctypes.windll.user32.MessageBoxW(
+            None, message, "采集失败 - manga 兜底", 0x00000004 | 0x00000020
+        )
+        return answer == 6  # IDYES
+    except Exception:
+        return False
+
+
+def _virtual_screen_bounds() -> tuple[int, int, int, int]:
+    """(x, y, width, height) of the full virtual screen."""
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        vx = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        vy = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+        vw = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        vh = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        if vw <= 0 or vh <= 0:
+            vx = vy = 0
+            vw = user32.GetSystemMetrics(0)
+            vh = user32.GetSystemMetrics(1)
+    except Exception:
+        vx, vy, vw, vh = 0, 0, 2560, 1660
+    return vx, vy, vw, vh
+
+
+def _page_display_rects(
+    image_paths: Sequence[Path],
+    scale: int,
+    *,
+    parallel: int = 3,
+    margin: int = 24,
+    gap: int = 40,
+    min_width: int = 320,
+    min_height: int = 240,
+    max_per_row: int = 3,
+    screen_bounds: tuple[int, int, int, int] | None = None,
+    right_limit: int | None = None,
+    row_gap_px: int | None = None,
+    bottom_shift_up: int = 0,
+) -> tuple[dict[str, tuple[int, int, int, int]], int]:
+    """Window rects at ``scale`` percent of each page's size, tile-aligned.
+
+    Every rect keeps its page's aspect ratio, so Photos fit-in-view renders
+    the whole page at exactly ``scale`` percent (the image file itself is
+    never resized -- resolution is unchanged; coordinates map back to the
+    original image through the existing fit transform).  Rects follow the
+    batch slot layout: each worker slot gets one position; slots fill rows
+    of ``max_per_row`` windows; every row spans the usable width (the
+    left window hugs the left edge, the right window hugs the right edge --
+    or ``right_limit`` when given, e.g. to keep the rightmost window clear
+    of an obstruction); the first row hugs the top, a second row hugs the
+    bottom, further rows spread evenly.  ``row_gap_px`` overrides the
+    per-column spacing with a fixed value (e.g. 20 keeps the rightmost
+    window further left than the spread layout would); ``bottom_shift_up``
+    lifts the last row that many pixels off the bottom edge.  Rows that
+    cannot fit on the screen (their heights plus the gaps exceed the usable
+    height, e.g. two 720px rows on a 1067px screen) are dropped until they
+    fit -- the zoom and the alignment stay unchanged, only fewer windows
+    run concurrently.  ``screen_bounds`` overrides the detected screen
+    (testing only).  Windows are re-pinned before every grab so overlap
+    cannot pollute screen grabs.
+
+    Returns ``({page_stem: rect}, effective_count)``.
+    """
+    vx, vy, vw, vh = (
+        screen_bounds if screen_bounds is not None else _virtual_screen_bounds()
+    )
+    right = min(vx + vw, right_limit) if right_limit else vx + vw
+    fraction = max(1, int(scale)) / 100.0
+    sizes: dict[str, tuple[int, int]] = {}
+    for path in image_paths:
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+        except (OSError, ValueError):
+            width = height = 0
+        if width <= 0 or height <= 0:
+            continue
+        win_w = max(min_width, min(right - vx - 2 * margin, int(round(width * fraction))))
+        win_h = max(min_height, min(vh - 2 * margin, int(round(height * fraction))))
+        sizes[path.stem] = (win_w, win_h)
+    if not sizes:
+        return {}, 0
+    keys = list(sizes.keys())
+    cols = max(1, int(max_per_row))
+    requested = max(1, int(parallel))
+    usable_h = vh - 2 * margin
+
+    def _slot_of(count: int) -> dict[str, int]:
+        return {key: index % count for index, key in enumerate(keys)}
+
+    def _row_heights(count: int, row_count: int) -> list[int]:
+        slots = _slot_of(count)
+        return [
+            max(
+                (sizes[key][1] for key in keys if slots[key] // cols == row),
+                default=min_height,
+            )
+            for row in range(row_count)
+        ]
+
+    # Drop rows until they physically fit on the screen (same zoom, same
+    # alignment; fewer concurrent windows instead of overlapping ones).
+    row_count = (requested + cols - 1) // cols
+    while row_count > 1:
+        candidate = min(requested, row_count * cols)
+        heights = _row_heights(candidate, row_count)
+        if sum(heights) + gap * (row_count - 1) <= usable_h:
+            break
+        row_count -= 1
+    count = min(requested, row_count * cols)
+    slot_of = _slot_of(count)
+    row_heights = _row_heights(count, row_count)
+
+    # Vertical distribution: the first row hugs the top, a second row hugs
+    # the bottom (lifted by ``bottom_shift_up`` when given), further rows
+    # spread evenly.
+    row_tops: list[int] = []
+    if row_count == 1:
+        row_tops.append(vy + margin)
+    elif row_count == 2:
+        top = vy + margin
+        bottom = vy + vh - margin - row_heights[1] - bottom_shift_up
+        row_tops = [top, max(top + gap, bottom)]
+    else:
+        total = sum(row_heights)
+        pitch = max(gap, (usable_h - total) // (row_count - 1)) if row_count > 1 else gap
+        cursor = vy + margin
+        for height in row_heights:
+            row_tops.append(cursor)
+            cursor += height + pitch
+
+    rects: dict[str, tuple[int, int, int, int]] = {}
+    usable_w = (right - vx) - 2 * margin
+    for row in range(row_count):
+        in_row = [key for key in keys if slot_of[key] // cols == row]
+        if not in_row:
+            continue
+        # Uniform spacing from the row's widest window so the row spans the
+        # full width (manga books have uniform page sizes).  The row holds
+        # at most ``cols`` slots -- the page count in the row may be larger.
+        # ``row_gap_px`` fixes the column spacing instead of spreading the
+        # row across the usable width (keeps the rightmost window inset).
+        row_w = max((sizes[key][0] for key in in_row), default=min_width)
+        n = min(cols, count - row * cols)
+        total_w = row_w * n
+        spread = usable_w - total_w
+        if row_gap_px is not None:
+            row_gap = max(1, int(row_gap_px)) if n > 1 else 0
+        else:
+            row_gap = max(gap, spread // (n - 1)) if n > 1 else 0
+        xs: list[int] = []
+        x = vx + margin
+        for _ in range(n):
+            xs.append(x)
+            x += row_w + row_gap
+        y = row_tops[row]
+        for key in in_row:
+            win_w, win_h = sizes[key]
+            slot_x = xs[slot_of[key] % cols]
+            rects[key] = (slot_x, y, slot_x + win_w, y + win_h)
+    return rects, count
+
+
+def _tile_rects(
+    parallel: int,
+    *,
+    columns: int | None = None,
+    rows: int | None = None,
+    margin: int = 24,
+    shrink: int = 8,
+) -> list[tuple[int, int, int, int]]:
+    """Split the virtual screen into ``parallel`` vertical (portrait) tiles.
+
+    Windows are portrait (wider than tall is avoided): ``parallel=3`` gives
+    one row of 3 portrait windows (~800x1560 on a 2560x1660 screen),
+    ``parallel=6`` gives 3 columns x 2 rows (~800x750).  The column count
+    auto-picks a portrait-biased grid when not given.  Every window rect
+    shrinks ``shrink`` px inside its tile so frames can never overlap a
+    neighbour's tile.
+    """
+    vx, vy, vw, vh = _virtual_screen_bounds()
+    count = max(1, int(parallel))
+    # Windows keep Photos' natural width (~462px incl. frame) and are laid
+    # out in rows of three, top-aligned.  A single row keeps the natural
+    # height (~660px); more rows shrink the height so every row fits with a
+    # fixed gap below the row above (e.g. 6 windows = 3 above + 3 below).
+    natural_w = 462
+    cols = 3
+    row_count = int(math.ceil(count / cols))
+    col_gap = 136
+    if row_count == 1:
+        natural_h = 660
+        row_gap = 40
+    else:
+        # rows must never overlap: reserve a gap of 150% of the window
+        # height between rows, solving h*rows + 1.5h*(rows-1) = total.
+        total = vh - 2 * margin
+        natural_h = int(total / (row_count + 1.5 * (row_count - 1)))
+        row_gap = max(40, int(1.5 * natural_h))
+        natural_h = max(300, natural_h)
+    col_x = [
+        vx + margin + index * (natural_w + col_gap)
+        for index in range(cols)
+    ]
+    rects = []
+    for index in range(count):
+        col = index % cols
+        row = index // cols
+        x1 = col_x[col]
+        y1 = vy + margin + row * (natural_h + row_gap)
+        rects.append((x1, y1, x1 + natural_w, y1 + natural_h))
+    return rects
+
+
+def _ensure_window_rect(window, rect: tuple[int, int, int, int]) -> None:
+    """Re-pin the Photos window to its tile before every screen grab.
+
+    Parallel workers set focus on their own windows; Windows may move or
+    restore a window between grabs, letting it drift over a neighbour's
+    tile and pollute that neighbour's screen grab.  Locking the rectangle
+    right before each grab makes overlap impossible.
+    """
+    try:
+        x1, y1, x2, y2 = (int(value) for value in rect)
+        current = window.rectangle()
+        drift = (
+            abs(current.left - x1) > 2
+            or abs(current.top - y1) > 2
+            or abs(current.right - x2) > 2
+            or abs(current.bottom - y2) > 2
+        )
+        if drift:
+            _fix_window(window, rect)
+    except Exception:
+        pass
+
+
+_BLACK_PAGE_DARK_FRACTION = 0.90
+
+
+def _is_black_page(path: str | Path) -> bool:
+    """A solid black / no-content page (e.g. a back cover) is normal.
+
+    Photos renders no image control for it, so capture would waste retries
+    and dialogs on something that has nothing to translate.
+    """
+    try:
+        image = Image.open(path).convert("L")
+        small = image.resize((64, 64))
+        arr = np.asarray(small, dtype=np.float32)
+        return float((arr < 60).mean()) > _BLACK_PAGE_DARK_FRACTION
+    except Exception:
+        return False
+
+
+def _capture_one_page(
+    image_path: str | Path,
+    destination: Path,
+    timeout: float,
+    resume: bool,
+    paddle_device: str,
+    max_attempts: int,
+    ask_fallback: bool,
+    frames_only: bool,
+    fixed_rect: tuple[int, int, int, int] | None,
+    display_scale: int = 100,
+) -> tuple[dict, float | None]:
+    """Capture one page with per-page retries.
+
+    Returns ``(result_dict, foreground_seconds_or_None)``.
+    """
+    page_dir = destination / image_path.stem
+    manifest_path = page_dir / "capture.json"
+    if _is_black_page(image_path):
+        # A solid black page is normal: no retries, no fallback dialog.
+        failure = {
+            "schema_version": 2,
+            "backend": "Windows Photos Scan Text",
+            "source": {"path": str(image_path), "sha256": _sha256(image_path)},
+            "capture": {
+                "complete": False,
+                "error": "black page (no content)",
+                "black_page": True,
+                "attempts": 0,
+                "display_scale": display_scale,
+            },
+        }
+        _write_json_atomic(manifest_path, failure)
+        return (
+            {
+                "page": image_path.stem,
+                "status": "black-page",
+                "manifest": str(manifest_path),
+            },
+            None,
+        )
+    if resume and manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+            if (
+                existing.get("capture", {}).get("complete")
+                and existing.get("source", {}).get("sha256") == _sha256(image_path)
+                and existing.get("capture", {}).get("display_scale", 100) == display_scale
+            ):
+                return (
+                    {
+                        "page": image_path.stem,
+                        "status": "reused",
+                        "selection_boxes": len(
+                            existing.get("capture", {}).get("selection_blocks") or []
+                        ),
+                        "selection_missing": bool(
+                            existing.get("capture", {}).get("selection_missing")
+                        ),
+                        "manifest": str(manifest_path),
+                    },
+                    None,
+                )
+        except (OSError, ValueError):
+            pass
+    attempts = 0
+    last_error = ""
+    window = None
+    while attempts < max(1, max_attempts):
+        attempts += 1
+        try:
+            page_dir.mkdir(parents=True, exist_ok=True)
+            # A fresh Photos window per page: startfile does not guarantee
+            # same-window reuse, and stale OCR sessions make title/control
+            # matching unreliable.  Content matching still guards against
+            # capturing the wrong page.  Frames-only mode closes the window
+            # as soon as the frames + blue boxes are captured.
+            manifest, window = _capture_photos_fast_page(
+                None,
+                str(image_path),
+                timeout,
+                debug_dir=str(page_dir),
+                paddle_device=paddle_device,
+                screenshot=str(page_dir / "photos_ocr.png"),
+                paddle=None,
+                frames_only=frames_only,
+                fixed_window_rect=fixed_rect,
+                display_scale=display_scale,
+            )
+            manifest["source"]["sha256"] = _sha256(image_path)
+            capture = manifest.setdefault("capture", {})
+            capture["attempts"] = attempts
+            _write_json_atomic(manifest_path, manifest)
+            if not frames_only:
+                inventory = manifest.get("capture", {}).get("inventory") or []
+                (page_dir / "inventory.txt").write_text(
+                    "\n".join(inventory), encoding="utf-8"
+                )
+            timing = manifest.get("capture", {}).get("timing") or {}
+            active = timing.get("foreground_active_seconds")
+            seconds = float(active) if isinstance(active, (int, float)) else None
+            return (
+                {
+                    "page": image_path.stem,
+                    "status": "captured",
+                    "attempts": attempts,
+                    "selection_boxes": len(
+                        manifest.get("capture", {}).get("selection_blocks") or []
+                    ),
+                    "selection_missing": bool(
+                        manifest.get("capture", {}).get("selection_missing")
+                    ),
+                    "manifest": str(manifest_path),
+                },
+                seconds,
+            )
+        except PhotosNoTextError as error:
+            # A page without any text is normal (pure illustration, cover):
+            # no retries and no fallback dialog -- mark it like a black page.
+            failure = {
+                "schema_version": 2,
+                "backend": "Windows Photos Scan Text",
+                "source": {"path": str(image_path), "sha256": _sha256(image_path)},
+                "capture": {
+                    "complete": False,
+                    "error": str(error),
+                    "attempts": attempts,
+                    "no_text": True,
+                    "display_scale": display_scale,
+                },
+            }
+            _write_json_atomic(manifest_path, failure)
+            if window is not None:
+                try:
+                    window.close()
+                except Exception:
+                    pass
+                window = None
+            return (
+                {
+                    "page": image_path.stem,
+                    "status": "no-text",
+                    "manifest": str(manifest_path),
+                },
+                None,
+            )
+        except Exception as error:
+            last_error = str(error)
+            if window is not None:
+                try:
+                    window.close()
+                except Exception:
+                    pass
+                window = None
+            if attempts < max(1, max_attempts):
+                time.sleep(2)
+    if ask_fallback and _prompt_fallback(image_path):
+        failure = {
+            "schema_version": 2,
+            "backend": "Windows Photos Scan Text",
+            "source": {"path": str(image_path), "sha256": _sha256(image_path)},
+            "capture": {
+                "complete": False,
+                "error": last_error,
+                "attempts": attempts,
+                "fallback_manga": True,
+                "display_scale": display_scale,
+            },
+        }
+        _write_json_atomic(manifest_path, failure)
+        return (
+            {
+                "page": image_path.stem,
+                "status": "fallback-manga",
+                "error": last_error,
+                "attempts": attempts,
+                "manifest": str(manifest_path),
+            },
+            None,
+        )
+    failure = {
+        "schema_version": 2,
+        "backend": "Windows Photos Scan Text",
+        "source": {"path": str(image_path), "sha256": _sha256(image_path)},
+        "capture": {
+            "complete": False,
+            "error": last_error,
+            "attempts": attempts,
+            "display_scale": display_scale,
+        },
+    }
+    _write_json_atomic(manifest_path, failure)
+    return (
+        {
+            "page": image_path.stem,
+            "status": "failed",
+            "error": last_error,
+            "attempts": attempts,
+            "manifest": str(manifest_path),
+        },
+        None,
+    )
+
+
 def capture_photos_fast_batch(
     images: str | Path,
     output_dir: str | Path,
@@ -1711,8 +2692,35 @@ def capture_photos_fast_batch(
     resume: bool = False,
     paddle_device: str = "cpu",
     close_window: bool = True,
+    max_attempts: int = 3,
+    ask_fallback: bool = True,
+    parallel: int = 1,
+    frames_only: bool = False,
+    fixed_window: bool = True,
+    display_scale: int = 100,
+    row_gap_px: int | None = None,
+    bottom_shift_up: int = 0,
 ) -> dict:
-    """Batch fast capture: one Photos window and one Paddle session for all pages."""
+    """Batch fast capture: one Photos window per page, retried up to
+    ``max_attempts`` times (a fresh window each attempt; first success
+    exits the retry loop).  When a page fails all attempts and
+    ``ask_fallback`` is set, a dialog asks whether to route the page to
+    the manga fallback path (winrt/Paddle text location + manga reading).
+
+    ``frames_only`` captures only the three frames + blue selection boxes
+    (no masked OCR / column pass) so the window is held open as briefly as
+    possible; recognition runs later in a background batch.  ``parallel``
+    tiles several Photos windows side by side and captures pages
+    concurrently (keyboard/focus sequences are serialized internally).
+    ``fixed_window`` pins every window to a tile rect (removes the 1-2px
+    edge jitter and keeps rendering consistent).
+
+    ``display_scale`` (percent) pins every window to ``display_scale``
+    percent of its page's size instead of the fixed portrait tiles: the
+    whole page is always fully visible at a fixed zoom, the image file is
+    never resized, and the existing fit transform maps coordinates back to
+    the original resolution.
+    """
     source_dir = Path(images).resolve()
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -1725,69 +2733,64 @@ def capture_photos_fast_batch(
         ),
         key=_natural_key,
     )
-    results = []
-    window = None
+    results: list[dict] = []
     foreground_totals: list[float] = []
-    # Windows.Media.Ocr (ja) reads the islands in-process; PaddleOCR is only a
-    # per-page/per-column fallback, so no persistent Paddle session is kept.
-    for image_path in image_paths:
-        page_dir = destination / image_path.stem
-        manifest_path = page_dir / "capture.json"
-        if resume and manifest_path.is_file():
-            existing = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-            if (
-                existing.get("capture", {}).get("complete")
-                and existing.get("source", {}).get("sha256") == _sha256(image_path)
-            ):
-                results.append({"page": image_path.stem, "status": "reused", "manifest": str(manifest_path)})
-                continue
-        try:
-            page_dir.mkdir(parents=True, exist_ok=True)
-            # A fresh Photos window per page: startfile does not guarantee
-            # same-window reuse, and stale OCR sessions make title/control
-            # matching unreliable.  Content matching still guards against
-            # capturing the wrong page.  The window is minimized during OCR
-            # and closed by the capture itself when done.
-            manifest, window = _capture_photos_fast_page(
-                None,
-                str(image_path),
+    lock = threading.Lock()
+    requested = max(1, int(parallel))
+    count = requested
+    scale_rects = None
+    if display_scale != 100:
+        scale_rects, count = _page_display_rects(
+            image_paths,
+            display_scale,
+            parallel=requested,
+            right_limit=DISPLAY_RIGHT_LIMIT or None,
+            row_gap_px=row_gap_px,
+            bottom_shift_up=bottom_shift_up,
+        )
+    tiles = (
+        _tile_rects(parallel)
+        if (fixed_window or parallel > 1) and scale_rects is None
+        else None
+    )
+
+    def _work(paths: list[Path], slot: int) -> None:
+        for image_path in paths:
+            rect = scale_rects.get(image_path.stem) if scale_rects is not None else (
+                tiles[slot] if tiles else None
+            )
+            result, seconds = _capture_one_page(
+                image_path,
+                destination,
                 timeout,
-                debug_dir=str(page_dir),
-                paddle_device=paddle_device,
-                screenshot=str(page_dir / "photos_ocr.png"),
-                paddle=None,
+                resume,
+                paddle_device,
+                max_attempts,
+                ask_fallback,
+                frames_only,
+                rect,
+                display_scale,
             )
-            manifest["source"]["sha256"] = _sha256(image_path)
-            _write_json_atomic(manifest_path, manifest)
-            inventory = manifest.get("capture", {}).get("inventory") or []
-            (page_dir / "inventory.txt").write_text(
-                "\n".join(inventory), encoding="utf-8"
-            )
-            timing = manifest.get("capture", {}).get("timing") or {}
-            active = timing.get("foreground_active_seconds")
-            if isinstance(active, (int, float)):
-                foreground_totals.append(float(active))
-            results.append({"page": image_path.stem, "status": "captured", "manifest": str(manifest_path)})
-        except Exception as error:
-            if window is not None:
-                try:
-                    window.close()
-                except Exception:
-                    pass
-                window = None
-            failure = {
-                "schema_version": 2,
-                "backend": "Windows Photos Scan Text",
-                "source": {"path": str(image_path), "sha256": _sha256(image_path)},
-                "capture": {"complete": False, "error": str(error)},
-            }
-            _write_json_atomic(manifest_path, failure)
-            results.append({"page": image_path.stem, "status": "failed", "error": str(error), "manifest": str(manifest_path)})
-    if close_window and window is not None:
-        try:
-            window.close()
-        except Exception:
-            pass
+            with lock:
+                results.append(result)
+                if seconds is not None:
+                    foreground_totals.append(seconds)
+
+    count = max(1, int(parallel))
+    count = max(1, int(parallel))
+    if count > 1:
+        chunks = [image_paths[index::count] for index in range(count)]
+        threads = [
+            threading.Thread(target=_work, args=(chunk, index))
+            for index, chunk in enumerate(chunks)
+            if chunk
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    else:
+        _work(image_paths, 0)
 
     def _percentile(values: list[float], ratio: float) -> float | None:
         if not values:
@@ -1801,14 +2804,29 @@ def capture_photos_fast_batch(
         "median_foreground_seconds": _percentile(foreground_totals, 0.5),
         "p95_foreground_seconds": _percentile(foreground_totals, 0.95),
     }
+    no_blue_boxes = [
+        item["page"]
+        for item in results
+        if item["status"] in {"captured", "reused"}
+        and item.get("selection_boxes", 0) == 0
+    ]
     report = {
         "schema_version": 2,
         "artifact": "windows-photos-fast-capture-batch",
         "images": str(source_dir),
         "output_dir": str(destination),
+        "mode": "frames-only" if frames_only else "full",
+        "parallel": requested,
+        "effective_parallel": count,
+        "display_scale": display_scale,
         "foreground": foreground,
         "pages": results,
-        "complete": bool(results) and all(item["status"] in {"captured", "reused"} for item in results),
+        "no_blue_boxes": no_blue_boxes,
+        "complete": bool(results)
+        and all(
+            item["status"] in {"captured", "reused", "black-page", "no-text"}
+            for item in results
+        ),
     }
     _write_json_atomic(destination / "batch.capture.json", report)
     return report
@@ -1944,7 +2962,10 @@ def _display_matches(target_small: np.ndarray, probe) -> bool:
     return correlation > 0.8
 
 
-def _prepare_overlay(window, timeout: float, screen_capture: bool = False):
+def _prepare_overlay(
+    window, timeout: float, screen_capture: bool = False,
+    fixed_window_rect: tuple[int, int, int, int] | None = None,
+):
     """Reset any previous OCR session and capture base/active frames.
 
     Returns ``(base, active, blocks, active_control)`` where ``blocks`` are the
@@ -1958,6 +2979,8 @@ def _prepare_overlay(window, timeout: float, screen_capture: bool = False):
         _get_control(window, "OcrButton").invoke()
         time.sleep(0.5)
     base_control = _get_control(window, "D2DImageControl")
+    if fixed_window_rect is not None:
+        _ensure_window_rect(window, fixed_window_rect)
     if screen_capture:
         base = _capture_control_region(window, base_control)
     else:
@@ -1969,18 +2992,53 @@ def _prepare_overlay(window, timeout: float, screen_capture: bool = False):
     active = None
     blocks = []
     while time.monotonic() < deadline:
-        window.set_focus()
-        active_control = _get_control(window, "OcrControl", timeout)
+        with _INPUT_LOCK:
+            window.set_focus()
+        if fixed_window_rect is not None:
+            _ensure_window_rect(window, fixed_window_rect)
+        try:
+            active_control = _get_control(window, "OcrControl", timeout)
+        except RuntimeError as error:
+            # Scan-text mode was requested but the OCR control never
+            # appeared: Photos found no text on this page.
+            raise PhotosNoTextError(
+                "Photos found no text (OcrControl never appeared)"
+            ) from error
         if screen_capture:
             active = _capture_control_region(window, active_control)
         else:
             active = _capture(active_control)
-        blocks = detect_overlay_blocks(base, active)
+        if active.shape != base.shape:
+            try:
+                active, base = _align_frames(active, base)
+            except ValueError:
+                # Photos changed its layout between the base grab and the
+                # scan-text switch (the OCR panel resized the window):
+                # re-grab the base frame so both frames share the current
+                # layout, then keep polling until the sizes agree.
+                try:
+                    fresh_base_control = _get_control(window, "D2DImageControl", 0.6)
+                    if screen_capture:
+                        base = _capture_control_region(window, fresh_base_control)
+                    else:
+                        base = _capture(fresh_base_control)
+                except Exception:
+                    pass
+                if active.shape != base.shape:
+                    time.sleep(0.3)
+                    continue
+        try:
+            blocks = detect_overlay_blocks(base, active)
+        except ValueError:
+            # base/active still disagree (e.g. the window is mid-resize):
+            # re-grab the base frame on the next pass.
+            time.sleep(0.3)
+            continue
         if blocks:
             break
         time.sleep(0.15)
     if not blocks or active is None:
-        raise RuntimeError("Photos OCR overlay did not produce detectable text")
+        raise PhotosNoTextError("Photos OCR overlay did not produce detectable text")
     return base, active, blocks, active_control
 
 
@@ -2169,6 +3227,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.add_argument("--resume", action="store_true")
         parser.add_argument("--timeout", type=float, default=20)
         parser.add_argument("--paddle-device", default="cpu")
+        parser.add_argument(
+            "--max-attempts",
+            type=int,
+            default=3,
+            help="per-page capture attempts (default 3; first success exits)",
+        )
+        parser.add_argument(
+            "--no-ask-fallback",
+            action="store_true",
+            help="do not ask for manga fallback when a page fails",
+        )
+        parser.add_argument(
+            "--frames-only",
+            action="store_true",
+            help="capture only frames + blue boxes (no masked OCR / columns)",
+        )
+        parser.add_argument(
+            "--parallel",
+            type=int,
+            default=1,
+            help="parallel Photos windows (tiled side by side, default 1)",
+        )
+        parser.add_argument(
+            "--display-scale",
+            type=int,
+            default=100,
+            help="pin every window to this percent of its page's size "
+                 "(default 100 = fixed portrait tiles; e.g. 25 shows the "
+                 "whole page at 25%% zoom, image file never resized)",
+        )
+        parser.add_argument(
+            "--layout-row-gap",
+            type=int,
+            default=None,
+            help="fixed per-column spacing (px) in --display-scale layout; "
+                 "default spreads the row across the usable width",
+        )
+        parser.add_argument(
+            "--layout-bottom-shift-up",
+            type=int,
+            default=0,
+            help="lift the last row of windows this many px off the bottom "
+                 "edge in --display-scale layout (default 0)",
+        )
+        parser.add_argument(
+            "--no-fixed-window",
+            action="store_true",
+            help="do not pin Photos windows to fixed screen tiles",
+        )
         args = parser.parse_args(raw_args)
         if args.fast:
             result = capture_photos_fast_batch(
@@ -2178,6 +3285,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 timeout=args.timeout,
                 resume=args.resume,
                 paddle_device=args.paddle_device,
+                max_attempts=args.max_attempts,
+                ask_fallback=not args.no_ask_fallback,
+                parallel=args.parallel,
+                frames_only=args.frames_only,
+                fixed_window=not args.no_fixed_window,
+                display_scale=args.display_scale,
+                row_gap_px=args.layout_row_gap,
+                bottom_shift_up=args.layout_bottom_shift_up,
             )
         else:
             result = capture_photos_batch(

@@ -133,11 +133,11 @@ class StateRoundTripTest(unittest.TestCase):
             state,
             self.dataset,
             self.erased,
-            edits={"island_002": "修改后的文字内容"},
+            edits={"island_002": "修改"},
             config=TypesetConfig(),
         )
         audits = {item.island_id: item for item in reembedded.audits}
-        self.assertEqual(audits["island_002"].text, "修改后的文字内容")
+        self.assertEqual(audits["island_002"].text, "修改")
         self.assertTrue(audits["island_002"].status in ("typeset", "typeset_pending_review"))
 
     def test_reembed_rejects_stale_islands(self):

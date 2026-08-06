@@ -91,14 +91,23 @@ class CrossValidateTest(unittest.TestCase):
         self.assertEqual(verdict.status, "review")
         self.assertIn("engines diverge", " ".join(verdict.review_reasons))
 
-    def test_review_on_low_confidence(self):
+    def test_low_confidence_passes_when_texts_agree(self):
         dataset = self._dataset()
         manga = [_line(10, 10, 110, 110, "そうで", island_id="island_001")]
         paddle = [_line(15, 15, 40, 90, "そうで", 0.31, island_id="island_001")]
         result = cross_validate_page(dataset, manga, paddle)
         verdict = {v.island_id: v for v in result.verdicts}["island_001"]
-        self.assertEqual(verdict.status, "review")
+        self.assertEqual(verdict.status, "pass")
         self.assertEqual(len(verdict.low_confidence_lines), 1)
+
+    def test_low_confidence_reviews_on_divergence(self):
+        dataset = self._dataset()
+        manga = [_line(10, 10, 110, 110, "そうで", island_id="island_001")]
+        paddle = [_line(15, 15, 40, 90, "そうだ", 0.31, island_id="island_001")]
+        result = cross_validate_page(dataset, manga, paddle)
+        verdict = {v.island_id: v for v in result.verdicts}["island_001"]
+        self.assertEqual(verdict.status, "review")
+        self.assertIn("low-confidence", " ".join(verdict.review_reasons))
 
     def test_review_when_manga_empty(self):
         dataset = self._dataset()

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
@@ -29,6 +30,8 @@ from .translator import (
     Translator,
     load_glossary,
 )
+
+_LOG = logging.getLogger("manga_localizer.island_translate")
 
 ISLAND_PROMPT_VERSION = "island-zh-dialogue-v1-whole-island"
 
@@ -415,8 +418,17 @@ def translate_island_page(
         cache_hit = False
         failure: Optional[str] = None
         kept_source = False
+        if _is_short_symbol(source_text):
+            # 1-2 char punctuation/symbol islands need no translation: keep
+            # the source without calling the engine (avoids leakage).
+            translated = source_text
+            kept_source = True
+            attempts.append(("skip", "short-symbol"))
+        engine_attempts = 0
         for precision in sequence:
             for style in ("contextual", "concise"):
+                if translated is not None:
+                    break
                 translator = factory(config, precision, style)
                 signature = active_cache.signature(request, active_glossary, translator)
                 last_signature = signature
@@ -428,6 +440,13 @@ def translate_island_page(
                     model = cached.model
                     cache_hit = True
                     attempts.append((precision, "cache-hit"))
+                    break
+                engine_attempts += 1
+                if engine_attempts > 3:
+                    # hard cap: three engine calls per island, then keep the
+                    # source (never leave the island blank)
+                    failure = "engine attempts exceeded 3"
+                    attempts.append((precision, f"failed: {failure}"))
                     break
                 try:
                     response = translator.translate(request, active_glossary)
@@ -478,6 +497,13 @@ def translate_island_page(
             storer = getattr(active_cache, "store_kept_source", None)
             if storer is not None and last_signature is not None:
                 storer(last_signature, source_text)
+        if kept_source and not cache_hit:
+            _LOG.warning(
+                "kept-source island=%s text=%r attempts=%s",
+                island_id,
+                source_text,
+                attempts,
+            )
         status = "kept-source" if kept_source else "translated"
         kind = "symbol" if kept_source and _is_symbol_only(source_text) else "text"
         units.append(
@@ -528,6 +554,12 @@ _LEAKED_PROMPT_FIELDS = (
     "无指定术语",
     "输出当前",
     "（无）",
+    "日文漫画翻译",
+    "只输出译文",
+    "简体中文",
+    "不要任何解释",
+    "用户给出的日文",
+    "翻译成",
 )
 
 
@@ -547,6 +579,9 @@ def _validate_island_translation(
         raise TranslationResponseError("translator returned the unchanged source text")
     if any(field in translated for field in _LEAKED_PROMPT_FIELDS):
         raise TranslationResponseError("translator leaked prompt fields")
+    lines = [line for line in translated.splitlines() if line.strip()]
+    if len(lines) > 4 and len(set(lines)) == 1:
+        raise TranslationResponseError("translator repeated one line >4 times")
     for context in context_texts:
         fragment = _normalize_for_leak(context)
         if len(fragment) >= 2 and fragment in translated and fragment not in source:
@@ -580,6 +615,25 @@ def _is_symbol_only(text: str) -> bool:
     if not cleaned:
         return False
     return not re.search(r"[\u3040-\u30ff\u4e00-\u9fffA-Za-z0-9]", cleaned)
+
+
+_SHORT_SYMBOL_CHARS = frozenset(
+    "、。！？…‥．.・,，!?〜ー-–—_·♡♥○●◎◆◇△▲■□☆★"
+    "（）()【】[]「」『』\"'　 "
+)
+
+
+def _is_short_symbol(text: str) -> bool:
+    """True for a 1-2 character punctuation/symbol island.
+
+    Such islands carry no translatable text; asking the engine wastes a
+    call and invites prompt leakage, so they are kept as-is without any
+    engine request.
+    """
+    cleaned = str(text or "").strip()
+    return 0 < len(cleaned) <= 2 and all(
+        char in _SHORT_SYMBOL_CHARS for char in cleaned
+    )
 
 
 def _normalize_for_leak(text: str) -> str:
