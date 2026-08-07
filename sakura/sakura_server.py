@@ -12,10 +12,20 @@ from llama_cpp import Llama
 
 MODEL_PATH = r"D:\workplace\opencode\try_comic\sakura\models\sakura-7b-qwen2.5-v1.0-q6k.gguf"
 N_CTX = 2048
+# Partial GPU offload: the 7B Q6K model plus a 2048-token KV cache exceed
+# the 8GB laptop GPU at n_gpu_layers=99 (llama_decode -1 / CUDA pool
+# asserts under concurrent translation load).  Half offload keeps ~3.5GB
+# on the GPU with headroom; the rest runs on the CPU.
+N_GPU_LAYERS = int(os.environ.get("SAKURA_GPU_LAYERS", "40"))
 
 print("loading sakura model...", flush=True)
 t0 = time.time()
-llm = Llama(model_path=MODEL_PATH, n_ctx=N_CTX, n_gpu_layers=99, verbose=False)
+llm = Llama(
+    model_path=MODEL_PATH,
+    n_ctx=N_CTX,
+    n_gpu_layers=N_GPU_LAYERS,
+    verbose=False,
+)
 print(f"model loaded in {time.time()-t0:.1f}s", flush=True)
 
 app = FastAPI(title="sakura-local")

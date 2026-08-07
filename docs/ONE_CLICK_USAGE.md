@@ -20,8 +20,9 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录"
 
 # 2) 人工核对采集结果
 #    打开 outputs\oneclick\{书名}\check\{page}.bluebox_check.png
-#    蓝色 = 蓝框（正文单位，按 OCR 实际使用的扩 6px 版本绘制）；
-#    红色 = 整页选中（封面等）；无蓝框页保持原样不处理
+#    蓝色 = 蓝框（正文单位，按 OCR 实际使用的扩 6px 版本绘制，叠加在原图上）；
+#    若提示"待人工审核"页（三次采集无蓝色像素），查看后确认无框：
+venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --confirm-no-boxes 100,120
 
 # 3) stage2：后台处理（OCR → 翻译 → 嵌字 → PDF）
 venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --process
@@ -38,9 +39,12 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
 --parallel <n>      Photos 并行窗口数（默认 3；6 窗口布局为上3下3）
 --display-scale <p> 窗口显示缩放百分比（默认 25：窗口=页面×25%，整页完整可见，
                     原图文件不缩放、坐标还原原分辨率；100 = 固定平铺旧布局）
+--layout-row-gap <px>        固定列间距（默认摊铺铺满；右列左移用更小值）
+--layout-bottom-shift-up <px> 第二行上移量（贴底基础上，默认 0）
 --capture-only      只跑 stage1（采集 + 核对图）
 --process           只跑 stage2（后台处理），跳过采集
 --auto              采集完成立即处理
+--confirm-no-boxes <pages>   人工审核确认某页确无蓝色框（标记后 stage2 静默跳过）
 --bluebox-fill R,G,B  填黑图填充色（默认 0,0,0 黑；若文字非黑色可用白 255,255,255）
 ```
 
@@ -50,14 +54,15 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
    一句完整的话会被自动聚合为一个组（selection group）。
 2. **只处理蓝框**：蓝框外的任何内容（SFX、装饰、页眉页脚、版权行）都会原样保留，
    不识别高亮岛、不翻译、不擦除、不嵌字。
-3. **整页封面**：Photos 可能把整个页面框成一个大选区（红色标记）。
-   这类选区标记为 `page_scale`，不参与 OCR 与嵌字；封面默认原样输出。
-4. **误框**：框了没文字的区域（manga 读空 2 次）会被自动丢弃，不影响结果。
-5. **黑页/无文字页**：全黑页或无文字插图页自动标记跳过，不处理。
-6. **无蓝框页**：某页没有任何蓝框时整页保持原样（PDF 中为该页原图）；
-   若该页实际有文字，说明采集时 Ctrl+A 蓝框提取失败，删除该页
-   `capture/{page}/` 后重跑 stage1。
-7. **窗口布局**：窗口尺寸 = 页面×25%（`--display-scale 25`），并行 6 窗口时上 3 下 3
+3. **蓝框检测双路径**（详见 `BLUEBOX_CAPTURE.md`）：严格蓝色蒙版公式优先
+   （keep×原图+(0,38,67)，容差 12），无结果时 delta 兜底（两帧任一 RGB 通道差>8）。
+4. **整页大框**：覆盖帧面积 >20% 的整页选中框直接丢弃（非正文单位，封面原样输出）。
+5. **误框**：框了没文字的区域（manga 读空 2 次）会被自动丢弃，不影响结果。
+6. **黑页/无文字页**：全黑页或无文字插图页自动标记跳过，不处理。
+7. **待人工审核页**：三次 Ctrl+A 仍无蓝色像素 → 提示待审核、不进 stage2；
+   查看该页截图确认确实无框后，`--confirm-no-boxes <页>` 确认关闭；
+   若其实有文字，删除 `capture/{page}/` 后重跑 stage1。
+8. **窗口布局**：窗口尺寸 = 页面×display-scale%，并行 6 窗口时上 3 下 3
    （下行贴屏幕底部、三列摊满屏宽）；请勿手动移动/遮挡窗口；
    程序会实时锁定窗口位置，被挤跑自动回位。
 
@@ -65,7 +70,9 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
 
 ```
 outputs/oneclick/{书名}/
-├── check/{page}.bluebox_check.png   # 采集核对（人工检查蓝框是否齐全）
+├── capture/{page}/              # 采集帧 + capture.json（每页 base/ocr/selected 三帧）
+├── check/{page}.bluebox_check.png   # 采集核对（原图 + 蓝框叠加）
+├── masked/{page}.bluebox_masked.png # 扩框填黑图（蓝框扩 6px 保留像素，其余填黑）
 ├── typeset/{page}.typeset.png       # 嵌字结果图（逐页人工抽查）
 └── {书名}.pdf                       # 最终 PDF
 ```

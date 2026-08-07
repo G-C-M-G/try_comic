@@ -40,15 +40,21 @@ Photos 并行窗口 (上3下3, 行距=窗口高150%)
 ## 三、stage1 — 采集 (photos_capture.py)
 
 - 并行 6 窗口：上 3 下 3，行距 = 窗口高 × 150%（防止遮挡）
-- **显示固定 25%**：`--display-scale 25` 时每窗尺寸 = 页面 × 25%（宽高比一致），整页完整可见；
+- **显示固定缩放**：`--display-scale <n>` 时每窗尺寸 = 页面 × n%（宽高比一致），整页完整可见；
   原图文件不缩放、分辨率不变，坐标经 fit 变换还原回原图原分辨率；`--display-scale 100` 恢复固定平铺
 - 窗口重锁 `_ensure_window_rect`：每次操作前核对窗口矩形，被挤跑自动回位
-- 蓝框抓取重试：0.4s / 0.8s / 1.2s 三次，仍失败再试整页
+- 蓝框抓取重试：0.4s / 0.8s / 1.2s 三次
 - 黑页静默：`_is_black_page`（dark 占比 >0.90）→ 标记 `black_page`；无文字页（Photos 不出现
   OCR 控件/蒙版）→ 标记 `no_text`；两者 stage2 均跳过
-- 大框细分：面积 > 页面 20% 的蓝框 → `page_scale` 标记；`_text_aware_split` 对大框做文字感知细分
+- **蓝框检测双路径**（`detect_selection_boxes`，详见 `BLUEBOX_CAPTURE.md`）：
+  1. **严格公式优先**（有 base 帧）：`selected == keep×base + (0,38,67)`，
+     keep=174/255，容差 12 + paint-delta>2 守卫（排除页面固有纯蓝）
+  2. **delta 兜底**：`|selected - photos_ocr|` 任一 RGB 通道 > 8
+- 整页大框过滤：连通域面积 > 帧 20% 的整页选中框**直接丢弃**（非原子文字框）
+- **硬规则（人工审核门）**：三次 Ctrl+A 仍无蓝色像素 → `selection_review_required: true`，
+  该页不进 stage2；stage1/2 提示待审核，`--confirm-no-boxes <页>` 确认无框后才可关闭
 - 结果：`capture/{page}/capture.json`（选区 + 元数据）、`check/{page}.bluebox_check.png`
-  （只画蓝框蓝色 + 整页选中红色，**无高亮岛金框**；蓝框按 OCR 实际使用的扩 6px 版本绘制）
+  （**原图直接叠加蓝色框**，无填黑、无高亮岛金框；蓝框按 OCR 实际使用的扩 6px 版本绘制）
 
 ## 四、stage2 — 后台处理 (one_click_translate.py)
 

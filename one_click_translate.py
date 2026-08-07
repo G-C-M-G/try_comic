@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -251,26 +252,39 @@ def blue_boxes_to_lines(
 def run_manga(crops: list[dict], out_root: Path) -> dict:
     """manga-ocr every crop in one subprocess (model loads once)."""
     script = """\
-import json, sys
+import json, sys, time
 sys.stdout.reconfigure(encoding="utf-8")
 from PIL import Image
 from manga_ocr import MangaOcr
 crops = json.load(open(sys.argv[1], encoding="utf-8"))
 mocr = MangaOcr()
 for entry in crops:
-    image = Image.open(entry["source"]).convert("RGB")
-    x1, y1, x2, y2 = entry["bbox"]
-    crop = image.crop((x1, y1, x2, y2))
+    source, bbox = entry["source"], tuple(entry["bbox"])
+    image = None
+    for attempt in range(3):
+        try:
+            image = Image.open(source).convert("RGB")
+            break
+        except OSError as error:
+            if attempt == 2:
+                raise OSError(f"cannot read crop source {source!r}: {error}")
+            time.sleep(0.3)
+    crop = image.crop(bbox)
     text = str(mocr(crop) or "").strip()
     print(json.dumps({"id": entry["id"], "text": text}, ensure_ascii=False))
     sys.stdout.flush()
 """
-    crops_path = out_root / "crops.json"
+    crops_path = out_root / f"crops.{os.getpid()}.json"
     crops_path.write_text(json.dumps(crops, ensure_ascii=False), encoding="utf-8")
     python = ROOT / "venv" / "Scripts" / "python.exe"
     env = dict(__import__("os").environ)
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("TRANSFORMERS_OFFLINE", "1")
+    if not env.get("MANGA_OCR_GPU"):
+        # manga-ocr runs on the CPU by default: the Sakura translation
+        # model owns the GPU, and three parallel OCR subprocesses on CUDA
+        # exhaust its VRAM (llama_decode returns -1 / logits assert).
+        env["CUDA_VISIBLE_DEVICES"] = "-1"
     completed = subprocess.run(
         [str(python), "-c", script, str(crops_path)],
         capture_output=True, text=False, timeout=3600, check=False, env=env,
@@ -444,14 +458,30 @@ def build_page_texts(units, readings, dropped_boxes):
     return page_texts, page_directions
 
 
-def stage2_process(images: Path, out_root: Path, pages: list[str]) -> bool:
-    """Background: blue boxes -> manga -> translate -> typeset -> PDF."""
+def stage2_process(
+    images: Path,
+    out_root: Path,
+    pages: list[str],
+    *,
+    ai_url: str = "https://api.deepseek.com/v1",
+    ai_model: str = "deepseek-chat",
+    ai_api_key: str = "",
+) -> bool:
+    """Background: blue boxes -> manga -> translate -> typeset -> PDF.
+
+    Translation prefers the AI (OpenAI-compatible, e.g. DeepSeek) whole-page
+    batch; islands whose numbered line is missing/malformed fall back to
+    the local Sakura endpoint.  Without an API key everything goes through
+    local Sakura.
+    """
     from island_extract import build_fallback_dataset
     from manga_localizer.island_contract import load_island_dataset
     from manga_localizer.island_translate import (
         IslandTranslateConfig,
         IslandTranslationCache,
+        PageBatchCache,
         translate_island_page,
+        translate_page_batch,
     )
     from manga_localizer.translator import load_glossary
 
@@ -569,23 +599,54 @@ def stage2_process(images: Path, out_root: Path, pages: list[str]) -> bool:
 
     glossary = load_glossary(ROOT / "config" / "glossary.json")
     cache = IslandTranslationCache(out_root / "translation_cache")
+    batch_cache = PageBatchCache(out_root / "translation_batch_cache")
     translations = {}
     for page in active_pages:
         dataset = load_island_dataset(dataset_dir / page / "islands.json")
-        result = translate_island_page(
-            dataset,
-            page_texts[page],
-            IslandTranslateConfig(
-                precision="local",
-                sakura_base_url="http://127.0.0.1:8080/v1",
-                sakura_model="sukinishiro",
-                glossary_path=str(ROOT / "config" / "glossary.json"),
-            ),
-            glossary=glossary,
-            cache=cache,
-        )
-        translations[page] = dict(result.translations)
-        print(f"translate {page}: {len(result.units)} islands")
+        texts = page_texts[page]
+        page_translations: dict[str, str] = {}
+        fallback_texts: dict[str, str] = {}
+        if ai_api_key and texts:
+            try:
+                batch = translate_page_batch(
+                    dataset,
+                    texts,
+                    IslandTranslateConfig(
+                        precision="online",
+                        online_base_url=ai_url,
+                        online_model=ai_model,
+                        online_api_key=ai_api_key,
+                        glossary_path=str(ROOT / "config" / "glossary.json"),
+                    ),
+                    glossary=glossary,
+                    cache=batch_cache,
+                )
+                page_translations.update(batch.translations)
+                fallback_texts = {island_id: texts[island_id] for island_id in batch.failures}
+                if batch.parse_errors:
+                    print(f"  {page}: AI parse errors={len(batch.parse_errors)} fallback={len(batch.failures)}")
+            except Exception as error:  # noqa: BLE001 - AI failure degrades to local
+                print(f"  {page}: AI batch failed ({error}), local fallback")
+                fallback_texts = dict(texts)
+        else:
+            fallback_texts = dict(texts)
+        if fallback_texts:
+            result = translate_island_page(
+                dataset,
+                fallback_texts,
+                IslandTranslateConfig(
+                    precision="local",
+                    sakura_base_url="http://127.0.0.1:8080/v1",
+                    sakura_model="sukinishiro",
+                    glossary_path=str(ROOT / "config" / "glossary.json"),
+                ),
+                glossary=glossary,
+                cache=cache,
+            )
+            for unit in result.units:
+                page_translations[unit.island_id] = unit.translated_text or ""
+        translations[page] = page_translations
+        print(f"translate {page}: {len(page_translations)} islands")
 
     for page in active_pages:
         erase_and_typeset_page_with(
@@ -613,17 +674,23 @@ def stage2_process(images: Path, out_root: Path, pages: list[str]) -> bool:
 
             shutil.copyfile(source, typeset_dir / f"{page}.typeset.png")
 
-    images_out = [
-        Image.open(typeset_dir / f"{page}.typeset.png").convert("RGB")
+    typeset_files = [
+        typeset_dir / f"{page}.typeset.png"
         for page in pages
         if (typeset_dir / f"{page}.typeset.png").is_file()
     ]
-    if not images_out:
+    if not typeset_files:
         print("no pages to assemble into a PDF")
         return True
     pdf_path = out_root / f"{images.name}.pdf"
-    images_out[0].save(pdf_path, save_all=True, append_images=images_out[1:], resolution=100)
-    print(f"-> {pdf_path} ({len(images_out)} pages)")
+    try:
+        import img2pdf
+
+        pdf_path.write_bytes(img2pdf.convert([str(path) for path in typeset_files]))
+    except Exception as error:  # noqa: BLE001 - Pillow PDF save is broken on
+        # this Pillow build (no JPEG encoder); img2pdf is the primary path.
+        raise RuntimeError(f"PDF merge failed: {error}") from error
+    print(f"-> {pdf_path} ({len(typeset_files)} pages)")
     return True
 
 
@@ -642,9 +709,51 @@ def _fallback_pages_for(capture_dir: Path, pages: list[str]) -> set[str]:
     return fallback
 
 
+def _review_required_pages(capture_dir: Path, pages: list[str]) -> list[str]:
+    """Pages whose capture produced no blue pixels after three Ctrl+A
+    attempts.  Hard rule: these pages are NOT processed downstream until
+    the user reviews them and confirms (--confirm-no-boxes) they really
+    have no selection boxes."""
+    review = []
+    for page in pages:
+        manifest_path = capture_dir / page / "capture.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        capture = manifest.get("capture", {})
+        if capture.get("selection_review_required") and not capture.get(
+            "selection_review_confirmed"
+        ):
+            review.append(page)
+    return review
+
+
+def _confirm_no_boxes(capture_dir: Path, pages: list[str]) -> None:
+    """Mark pages as user-reviewed: they genuinely have no blue boxes and
+    may be closed (skipped downstream without further warnings)."""
+    for page in pages:
+        manifest_path = capture_dir / page / "capture.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        capture = manifest.setdefault("capture", {})
+        capture["selection_review_confirmed"] = True
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
 def _skip_pages(capture_dir: Path, pages: list[str]) -> set[str]:
     """Pages with no usable capture (black / no-text / failed) are skipped
-    silently; fallback_manga pages stay active."""
+    silently; fallback_manga pages stay active.  Review-required pages are
+    skipped but listed loudly for the user to audit."""
     skipped = set()
     for page in pages:
         manifest_path = capture_dir / page / "capture.json"
@@ -658,6 +767,11 @@ def _skip_pages(capture_dir: Path, pages: list[str]) -> set[str]:
         if capture.get("fallback_manga"):
             continue
         if not capture.get("complete"):
+            skipped.add(page)
+        elif (
+            capture.get("selection_review_required")
+            and not capture.get("selection_review_confirmed")
+        ):
             skipped.add(page)
     return skipped
 
@@ -813,6 +927,29 @@ def main(argv=None) -> int:
     parser.add_argument("--bluebox-fill", default="0,0,0",
                         help="fill colour outside blue boxes (R,G,B) for the "
                              "masked manga input, default 0,0,0 (black)")
+    parser.add_argument(
+        "--confirm-no-boxes",
+        help="comma-separated pages that the user reviewed and confirmed to "
+             "have no blue boxes (they may be closed/skipped downstream)",
+    )
+    parser.add_argument(
+        "--ai-url",
+        default="https://api.deepseek.com/v1",
+        help="OpenAI-compatible AI base URL for whole-page translation "
+             "(default DeepSeek)",
+    )
+    parser.add_argument(
+        "--ai-model",
+        default="deepseek-chat",
+        help="AI model name (default deepseek-chat)",
+    )
+    parser.add_argument(
+        "--ai-api-key",
+        default="",
+        help="AI API key (or DEEPSEEK_API_KEY env).  When set, translation "
+             "prefers the AI whole-page batch and falls back to local Sakura; "
+             "without it everything goes through local Sakura.",
+    )
     args = parser.parse_args(argv)
     global BLUEBOX_FILL
     try:
@@ -824,6 +961,14 @@ def main(argv=None) -> int:
 
     images = Path(args.images).resolve()
     out_root = ROOT / "outputs" / "oneclick" / images.name
+    if args.confirm_no_boxes:
+        confirmed = sorted(_parse_pages(args.confirm_no_boxes) or set())
+        if not confirmed:
+            print("no pages to confirm", file=sys.stderr)
+            return 2
+        _confirm_no_boxes(out_root / "capture", confirmed)
+        print(f"confirmed no-blue-box pages: {', '.join(confirmed)}")
+        return 0
     pages_set = _parse_pages(args.pages)
     pages = sorted(
         (path.stem for path in images.iterdir()
@@ -845,15 +990,39 @@ def main(argv=None) -> int:
         skipped = _skip_pages(out_root / "capture", pages)
         print(f"capture done: {len(pages)} pages ({len(skipped)} skipped: "
               f"black/no-text/failed) -> {out_root / 'check'}")
+        review = _review_required_pages(out_root / "capture", pages)
+        if review:
+            print("!! " + "=" * 60)
+            print(f"!! 待人工审核（三次采集无蓝色像素）: {', '.join(review)}")
+            print("!! 请查看这些页的截图确认是否真的无蓝色选区框；")
+            print("!! 确认无框后运行:")
+            print(f"!!   python one_click_translate.py --images \"{images}\" "
+                  f"--confirm-no-boxes {','.join(review)}")
+            print("!! " + "=" * 60)
         if not args.auto:
             print("inspect the blue-box check images, then run: "
                   f"python one_click_translate.py --images \"{images}\" --process")
             return 0
+    review = _review_required_pages(out_root / "capture", pages)
+    if review:
+        print("!! " + "=" * 60)
+        print(f"!! 待人工审核页（未确认，已跳过处理）: {', '.join(review)}")
+        print("!! 审核确认无框后运行:")
+        print(f"!!   python one_click_translate.py --images \"{images}\" "
+              f"--confirm-no-boxes {','.join(review)}")
+        print("!! " + "=" * 60)
     active_pages = [p for p in pages if p not in _skip_pages(out_root / "capture", pages)]
     if not active_pages:
         print("no capturable pages (all black)", file=sys.stderr)
         return 2
-    return 0 if stage2_process(images, out_root, active_pages) else 2
+    return 0 if stage2_process(
+        images,
+        out_root,
+        active_pages,
+        ai_url=args.ai_url,
+        ai_model=args.ai_model,
+        ai_api_key=args.ai_api_key or os.environ.get("DEEPSEEK_API_KEY", ""),
+    ) else 2
 
 
 if __name__ == "__main__":

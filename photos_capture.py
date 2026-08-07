@@ -1495,6 +1495,11 @@ def _capture_photos_fast_page(
         "ok" if not selection_error else f"failed: {selection_error}"
     )
     selection_missing = bool(selection_error)
+    # Hard rule: three Ctrl+A attempts produced no blue overlay pixels --
+    # the page must be reviewed by the user before it can be closed.
+    # ``selection_review_required`` gates the page out of downstream
+    # processing until the user confirms the page genuinely has no boxes.
+    selection_review_required = bool(selection_error)
     if selection_error:
         selection_blocks = []
 
@@ -1532,6 +1537,7 @@ def _capture_photos_fast_page(
                 "island_count": len(blocks),
                 "selection_boxes_status": selection_boxes_status,
                 "selection_missing": selection_missing,
+                "selection_review_required": selection_review_required,
                 "selection_blocks": [
                     {
                         "id": f"sel_{index:03d}",
@@ -2573,6 +2579,9 @@ def _capture_one_page(
                         "selection_missing": bool(
                             existing.get("capture", {}).get("selection_missing")
                         ),
+                        "selection_review_required": bool(
+                            existing.get("capture", {}).get("selection_review_required")
+                        ),
                         "manifest": str(manifest_path),
                     },
                     None,
@@ -2625,6 +2634,9 @@ def _capture_one_page(
                     ),
                     "selection_missing": bool(
                         manifest.get("capture", {}).get("selection_missing")
+                    ),
+                    "selection_review_required": bool(
+                        manifest.get("capture", {}).get("selection_review_required")
                     ),
                     "manifest": str(manifest_path),
                 },
@@ -2845,6 +2857,11 @@ def capture_photos_fast_batch(
         if item["status"] in {"captured", "reused"}
         and item.get("selection_boxes", 0) == 0
     ]
+    review_required = [
+        item["page"]
+        for item in results
+        if item.get("selection_review_required")
+    ]
     report = {
         "schema_version": 2,
         "artifact": "windows-photos-fast-capture-batch",
@@ -2857,6 +2874,7 @@ def capture_photos_fast_batch(
         "foreground": foreground,
         "pages": results,
         "no_blue_boxes": no_blue_boxes,
+        "selection_review_required": review_required,
         "complete": bool(results)
         and all(
             item["status"] in {"captured", "reused", "black-page", "no-text"}

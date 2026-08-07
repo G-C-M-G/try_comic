@@ -217,6 +217,20 @@ class PageBatchTest(unittest.TestCase):
         self.assertEqual(failures, ("island_002",))
         self.assertTrue(any("duplicate" in error for error in errors))
 
+    def test_parse_same_line_numbered_entries(self):
+        # DeepSeek often emits every numbered entry space-separated on ONE
+        # line; the parser must not anchor to line boundaries.
+        numbered = {1: "island_001", 2: "island_002", 3: "island_003"}
+        translations, failures, errors = _parse_batch_response(
+            "1: 喂喂 2: 手松开了 3: 差不多了结了吧？", numbered
+        )
+        self.assertEqual(
+            translations,
+            {"island_001": "喂喂", "island_002": "手松开了", "island_003": "差不多了结了吧？"},
+        )
+        self.assertEqual(failures, ())
+        self.assertEqual(errors, ())
+
     def test_batch_translate_and_cache(self):
         cache_dir = Path(__file__).resolve().parent / "tmp_batch_cache"
         cache = PageBatchCache(cache_dir)

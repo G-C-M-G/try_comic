@@ -765,29 +765,36 @@ def _parse_batch_response(
     raw: str,
     numbered: Mapping[int, str],
 ) -> Tuple[Mapping[str, str], Tuple[str, ...], Tuple[str, ...]]:
-    """Parse ``1: 译文`` lines back into island texts.
+    """Parse ``1: 译文`` entries back into island texts.
+
+    The model may emit every numbered entry on its own line OR run them
+    together on one line (space separated), so the entries are split on the
+    ``N: `` markers rather than anchored to line boundaries.
 
     Returns ``(translations, failures, parse_errors)``; islands without a
-    valid numbered line land in *failures* and fall back to local.
+    valid numbered entry land in *failures* and fall back to local.
     """
     import re
 
     translations: dict[str, str] = {}
     seen: set[int] = set()
     errors: list[str] = []
-    for match in re.finditer(r"(?m)^\s*(\d+)\s*[:：]\s*(.+?)\s*$", raw):
+    markers = list(re.finditer(r"(\d+)\s*[:：]\s*", raw))
+    for position, match in enumerate(markers):
         index = int(match.group(1))
-        text = _clean_translation(match.group(2))
+        start = match.end()
+        end = markers[position + 1].start() if position + 1 < len(markers) else len(raw)
+        text = _clean_translation(raw[start:end])
         if not text:
-            errors.append(f"line {index}: empty translation")
+            errors.append(f"entry {index}: empty translation")
             continue
         if index in seen:
-            errors.append(f"line {index}: duplicate")
+            errors.append(f"entry {index}: duplicate")
             continue
         seen.add(index)
         island_id = numbered.get(index)
         if island_id is None:
-            errors.append(f"line {index}: unknown number")
+            errors.append(f"entry {index}: unknown number")
             continue
         translations[island_id] = text
     failures = tuple(
