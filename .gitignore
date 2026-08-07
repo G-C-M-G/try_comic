@@ -30,6 +30,11 @@ __pycache__/
 /backups/
 /var/
 /wechat_ocr/
+/漫画翻译/
+/dist/
+
+# Generated test artifacts
+/tests/ml/tmp_gui_out/
 
 # User/runtime state
 /config/cache_index.json

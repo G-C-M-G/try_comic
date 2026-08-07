@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
-from typing import Dict, Optional, Protocol, Tuple
+from typing import Dict, Mapping, Optional, Protocol, Tuple
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
 from .eraser import (
     ColumnErasureAudit,
@@ -58,7 +58,16 @@ def erase_island_image(
     classifier: Optional[LocalStatisticsStyleClassifier] = None,
     inpainter: Optional[Inpainter] = None,
     min_island_area: float = 0.0,
+    extra_regions: Optional[Mapping[str, Tuple[int, int, int, int]]] = None,
 ) -> IslandErasureResult:
+    """Erase the islands' original glyph ink.
+
+    ``extra_regions`` maps island ids to image-space rectangles that are
+    erased IN ADDITION to the detected glyph ink (e.g. the planned
+    typeset block bbox, so the erasure range equals the typeset range).
+    Every extra region is clipped to its island; islands without a region
+    keep the glyph-ink-only behaviour.
+    """
     from .island_contract import filter_tiny_islands
 
     active_dataset, dropped = filter_tiny_islands(dataset, min_island_area)
@@ -105,6 +114,14 @@ def erase_island_image(
     combined = Image.new("L", source.size, 0)
     for column_mask in erasure_masks.columns:
         clipped = ImageChops.darker(column_mask.image, geometry_by_id[column_mask.audit.column_id])
+        extra = (extra_regions or {}).get(column_mask.audit.column_id)
+        if extra is not None:
+            x1, y1, x2, y2 = extra
+            rect = Image.new("L", source.size, 0)
+            ImageDraw.Draw(rect).rectangle([x1, y1, x2, y2], fill=255)
+            clipped = ImageChops.lighter(
+                clipped, ImageChops.darker(rect, geometry_by_id[column_mask.audit.column_id])
+            )
         if clipped.histogram()[255] > 0:
             clipped_masks.append((column_mask.audit, clipped))
             combined = ImageChops.lighter(combined, clipped)

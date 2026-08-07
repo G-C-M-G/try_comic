@@ -22,13 +22,17 @@ Architecture contract (see docs/ONE_CLICK_ARCHITECTURE.md):
   untouched: no read, no translation, no erasure, no typesetting.
 * Erasure erases only the boxed islands (a dataset subset is passed to
   ``erase_island_image``); unboxed islands keep their original pixels.
-* Typesetting (island_typeset.py): the block must first fit inside the blue
-  box UNION (pad 6), ratio A_text / A_union in [0.6, 1.1] (hard cap 1.2);
-  on failure it falls back to the outer bounding rectangle with A_rect as
-  the ratio base.  Glyph size <= ORIGINAL blue box dimensions: vertical
-  size <= narrowest box width, horizontal size <= shortest box height.
-  Column positions follow the pad-6 blue boxes; the block centre is the
-  group-level bounding rectangle centre.
+  Each boxed island's canonical "one box" (its blue-box group expanded
+  6 px) replaces the island bbox for erasure and typesetting: the whole
+  box is erased, so rendered text never lands on un-erased art.
+* Typesetting (island_typeset.py): single layout path -- a centred block
+  inside the island bbox (the canonical box), ratio A_text / A_island in
+  [0.6, 1.1].  The block must fit entirely inside the box; the font size
+  descends below 28px (down to a 12px absolute floor) instead of being
+  truncated.  Glyph size <= the PADDED box dimensions: vertical size <=
+  narrowest pad-6 box width, horizontal size <= shortest pad-6 box
+  height.  Vertical columns are top-aligned, horizontal rows
+  left-aligned; the block is centred on the island bbox centre.
 * A blue box read empty twice is treated as a false selection and dropped.
 """
 
@@ -52,8 +56,19 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 from PIL import Image, ImageDraw
 
-IMAGES = Path(r"C:\Users\YLP\Desktop\软件\漫画翻译\原文\甲书")
+IMAGES = Path(r"D:\workplace\opencode\try_comic\漫画翻译\原文\甲书")
 BLUEBOX_FILL = (0, 0, 0)  # fill colour outside blue boxes (--bluebox-fill)
+
+
+def _load_api_config() -> dict:
+    """Local API keys/config (config/api_keys.json, git-ignored)."""
+    path = ROOT / "config" / "api_keys.json"
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def _parse_pages(value: str | None) -> set[str] | None:
@@ -72,7 +87,12 @@ def _parse_pages(value: str | None) -> set[str] | None:
     return pages
 
 
-def stage1_capture(images: Path, out_root: Path, pages: set[str] | None, parallel: int, display_scale: int, row_gap_px: int | None, bottom_shift_up: int) -> bool:
+def stage1_capture(
+    images: Path, out_root: Path, pages: set[str] | None, parallel: int,
+    display_scale: int, row_gap_px: int | None, bottom_shift_up: int,
+    layout_region: str = "", box_delta: int = 8, box_tolerance: float = 5.0,
+    box_area_ratio: float = 0.20,
+) -> bool:
     """Parallel frames-only capture + blue-box check images."""
     capture_dir = out_root / "capture"
     check_dir = out_root / "check"
@@ -89,20 +109,43 @@ def stage1_capture(images: Path, out_root: Path, pages: set[str] | None, paralle
         "--parallel", str(parallel),
         "--display-scale", str(display_scale),
         "--resume",
+        "--box-delta", str(box_delta),
+        "--box-tolerance", str(box_tolerance),
+        "--box-area-ratio", str(box_area_ratio),
     ]
     if row_gap_px is not None:
         cmd += ["--layout-row-gap", str(row_gap_px)]
     if bottom_shift_up:
         cmd += ["--layout-bottom-shift-up", str(bottom_shift_up)]
+    if layout_region:
+        cmd += ["--layout-region", layout_region]
     if pages:
         cmd += ["--pages", ",".join(sorted(pages))]
-    completed = subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    from manga_localizer.progress import ProgressFile
+
+    progress = ProgressFile(out_root)
+    progress.set_stage("capture", total=len(pages) if pages else 0)
+    progress.log(f"capturing {len(pages) if pages else 'all'} pages (parallel={parallel})")
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
     )
-    output = (completed.stdout or "") + (completed.stderr or "")
-    print(output[-2000:])
-    if completed.returncode != 0:
+    assert proc.stdout is not None
+    captured = 0
+    for line in proc.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        print(line)
+        progress.log(line)
+        if "capture" in line and "page" in line.lower():
+            captured += 1
+            progress.progress(min(captured, len(pages) or 1), item=line[:60])
+    code = proc.wait()
+    if code != 0:
+        progress.fail(f"photos_capture exited {code}")
         return False
+    progress.progress(len(pages) or 0, item="capture done")
 
     # check images: blue boxes (blue, drawn padded like OCR uses them) +
     # page_scale (red) per page.  No highlight-island detection: only the
@@ -142,6 +185,8 @@ def stage1_capture(images: Path, out_root: Path, pages: set[str] | None, paralle
                       fill="#4363d8")
         image.save(check_dir / f"{page_dir.name}.bluebox_check.png")
     print(f"blue-box check images -> {check_dir}")
+    progress.done(ok=True)
+    return True
 
     # Report pages that will not be processed because no blue boxes (or no
     # usable capture) were found: written to a report file, printed and
@@ -249,8 +294,102 @@ def blue_boxes_to_lines(
     return lines
 
 
-def run_manga(crops: list[dict], out_root: Path) -> dict:
-    """manga-ocr every crop in one subprocess (model loads once)."""
+def _load_readings_cache(out_root: Path) -> dict:
+    """Load the persisted OCR readings cache (``{crop_id: text}``).
+
+    Only non-empty readings are stored, so boxes that read empty are
+    re-OCRed on every run (the two-pass false-selection check keeps its
+    behaviour).  A missing or malformed cache file yields ``{}``.
+    """
+    path = out_root / "ocr_readings.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in payload.items()
+        if isinstance(value, str) and value.strip()
+    }
+
+
+def _store_readings_cache(out_root: Path, readings: dict) -> None:
+    """Merge ``readings`` into the persisted OCR cache (atomic replace).
+
+    The write merges with the on-disk state, so parallel segment
+    processes do not lose each other's entries (the last writer wins only
+    for entries written concurrently between load and store).
+    """
+    merged = _load_readings_cache(out_root)
+    merged.update(
+        {key: text for key, text in readings.items() if str(text or "").strip()}
+    )
+    path = out_root / "ocr_readings.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _select_crop_misses(crops: list[dict], cached: dict) -> list[dict]:
+    """Crops without a cached non-empty reading (these need OCR)."""
+    return [
+        crop for crop in crops
+        if not str((cached.get(crop["id"]) or "")).strip()
+    ]
+
+
+def run_manga(
+    crops: list[dict],
+    out_root: Path,
+    progress: "ProgressFile | None" = None,
+    *,
+    ai_ocr_url: str = "",
+    ai_ocr_model: str = "",
+    ai_ocr_api_key: str = "",
+) -> dict:
+    """OCR every crop: AI vision model when configured, else manga-ocr.
+
+    The AI path (OpenAI-compatible vision, e.g. GLM-4V / Qwen-VL) posts
+    each crop as an image message; without a configured vision endpoint
+    manga-ocr runs in one subprocess (model loads once).
+
+    OCR readings are persisted to ``out_root/ocr_readings.json`` (non-empty
+    only): crops with a cached reading skip the OCR pass entirely, so
+    re-running stage 2 (re-grouping, re-typesetting, PDF merge) costs no
+    re-recognition.  Boxes that read empty are never cached and are OCRed
+    again on every run (the two-pass false-selection check).
+    """
+    cached = _load_readings_cache(out_root)
+    misses = _select_crop_misses(crops, cached)
+    if misses and (ai_ocr_url and ai_ocr_model and ai_ocr_api_key):
+        from manga_localizer.ai_ocr import ai_ocr_readings
+
+        readings = ai_ocr_readings(
+            misses, ai_ocr_url, ai_ocr_model, ai_ocr_api_key,
+            progress=progress,
+        )
+    elif misses:
+        readings = _run_manga_subprocess(misses, out_root, progress)
+    else:
+        readings = {}
+    _store_readings_cache(out_root, readings)
+    result = {}
+    for crop in crops:
+        result[crop["id"]] = str(
+            readings.get(crop["id"]) or cached.get(crop["id"]) or ""
+        )
+    return result
+
+
+def _run_manga_subprocess(
+    crops: list[dict],
+    out_root: Path,
+    progress: "ProgressFile | None" = None,
+) -> dict:
     script = """\
 import json, sys, time
 sys.stdout.reconfigure(encoding="utf-8")
@@ -285,16 +424,16 @@ for entry in crops:
         # model owns the GPU, and three parallel OCR subprocesses on CUDA
         # exhaust its VRAM (llama_decode returns -1 / logits assert).
         env["CUDA_VISIBLE_DEVICES"] = "-1"
-    completed = subprocess.run(
+    proc = subprocess.Popen(
         [str(python), "-c", script, str(crops_path)],
-        capture_output=True, text=False, timeout=3600, check=False, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=False, env=env,
     )
-    if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", errors="replace")[-1500:]
-        raise RuntimeError(f"manga-ocr failed: {detail}")
-    readings = {}
-    for line in completed.stdout.decode("utf-8", errors="replace").splitlines():
-        line = line.strip()
+    assert proc.stdout is not None
+    readings: dict[str, str] = {}
+    done = 0
+    for raw in proc.stdout:
+        line = raw.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
@@ -302,6 +441,14 @@ for entry in crops:
         except json.JSONDecodeError:
             continue
         readings[payload["id"]] = str(payload.get("text") or "")
+        done += 1
+        if progress is not None:
+            progress.sub_progress(done, len(crops), payload["id"])
+    stderr = proc.stderr.read() if proc.stderr is not None else b""
+    code = proc.wait(timeout=3600)
+    if code != 0:
+        detail = stderr.decode("utf-8", errors="replace")[-1500:]
+        raise RuntimeError(f"manga-ocr failed: {detail}")
     return readings
 
 
@@ -313,33 +460,139 @@ def _source_image_for(images: Path, page: str) -> Path | None:
     return None
 
 
+def _group_boxes_by_overlap(
+    boxes: Sequence[dict],
+    *,
+    pad: int = 6,
+    gap_ratio: float = 0.20,
+    overlap_ratio: float = 0.40,
+) -> list[tuple[tuple[int, int, int, int], list[str]]]:
+    """Group blue boxes (image-space) into OCR recognition units.
+
+    A box is vertical when its height >= width, horizontal otherwise.
+    Boxes NEVER merge along the reading direction (Photos' blue boxes are
+    the trusted atomic units); they only merge side-by-side on the
+    PERPENDICULAR axis when they are close AND aligned.  All distances
+    are measured on the PADDED boxes (each blue box expanded by *pad* px,
+    the same expansion the canonical "one box" uses):
+
+    * two VERTICAL boxes merge when the padded horizontal gap is below
+      20% of the smaller padded box's width AND their padded vertical
+      ranges overlap by more than 40% of the LARGER padded box's height;
+    * two HORIZONTAL boxes merge when the padded vertical gap is below
+      20% of the smaller padded box's height AND their padded horizontal
+      ranges overlap by more than 40% of the LARGER padded box's width;
+    * mixed-orientation pairs never merge.
+
+    Returns ``[(group_bbox, [member_ids])]`` sorted top-to-bottom,
+    right-to-left.  ``boxes`` must carry ``id`` and ``image_bbox``.
+    """
+    atomic = [
+        box for box in boxes
+        if box.get("id") and not box.get("page_scale")
+        and isinstance(box.get("image_bbox"), (list, tuple)) and len(box["image_bbox"]) == 4
+    ]
+    ordered = sorted(
+        atomic, key=lambda box: (box["image_bbox"][1], -box["image_bbox"][2])
+    )
+    parent = list(range(len(ordered)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    padded: dict[int, tuple[int, int, int, int]] = {}
+    for index, box in enumerate(ordered):
+        x1, y1, x2, y2 = box["image_bbox"]
+        padded[index] = (x1 - pad, y1 - pad, x2 + pad, y2 + pad)
+
+    for i in range(len(ordered)):
+        a = ordered[i]
+        ax1, ay1, ax2, ay2 = a["image_bbox"]
+        a_vertical = (ay2 - ay1) >= (ax2 - ax1)
+        pa = padded[i]
+        for j in range(i + 1, len(ordered)):
+            b = ordered[j]
+            bx1, by1, bx2, by2 = b["image_bbox"]
+            b_vertical = (by2 - by1) >= (bx2 - bx1)
+            if a_vertical != b_vertical:
+                continue
+            pb = padded[j]
+            min_pw = min(pa[2] - pa[0], pb[2] - pb[0])
+            min_ph = min(pa[3] - pa[1], pb[3] - pb[1])
+            if min_pw <= 0 or min_ph <= 0:
+                continue
+            x_gap = max(pa[0], pb[0]) - min(pa[2], pb[2])
+            y_gap = max(pa[1], pb[1]) - min(pa[3], pb[3])
+            x_overlap = min(pa[2], pb[2]) - max(pa[0], pb[0])
+            y_overlap = min(pa[3], pb[3]) - max(pa[1], pb[1])
+            if a_vertical:
+                if x_gap < gap_ratio * min_pw and y_overlap > overlap_ratio * max(
+                    pa[3] - pa[1], pb[3] - pb[1]
+                ):
+                    union(i, j)
+            else:
+                if y_gap < gap_ratio * min_ph and x_overlap > overlap_ratio * max(
+                    pa[2] - pa[0], pb[2] - pb[0]
+                ):
+                    union(i, j)
+
+    members_by_root: dict[int, list[str]] = {}
+    for index, box in enumerate(ordered):
+        members_by_root.setdefault(find(index), []).append(box["id"])
+    result = []
+    for root, member_ids in members_by_root.items():
+        members = [ordered[i] for i in range(len(ordered)) if find(i) == root]
+        x1 = min(box["image_bbox"][0] for box in members)
+        y1 = min(box["image_bbox"][1] for box in members)
+        x2 = max(box["image_bbox"][2] for box in members)
+        y2 = max(box["image_bbox"][3] for box in members)
+        result.append(((x1, y1, x2, y2), member_ids))
+    return sorted(result, key=lambda item: (item[0][1], -item[0][2]))
+
+
 def build_bluebox_dataset(
     manifest_path, page_dir, source_path, min_island_area: float = 800.0, pad: int = 2
 ) -> list[dict]:
     """islands.json purely from the Photos blue boxes (original image space).
 
-    No highlight-island detection: every island is one selection group (the
-    atomic blue boxes Photos produced), padded ``pad`` px.  Raises
-    ValueError when the page has no usable blue boxes -- the caller keeps
-    the page untouched then.  Also writes selection_blocks.json (typeset
-    column positions) and a copy of the original image.
+    No highlight-island detection: the atomic blue boxes are re-grouped by
+    the TWO-AXIS 60% overlap rule (``_group_boxes_by_overlap``) -- every
+    group is one island, padded ``pad`` px, and its own independent bbox.
+    Raises ValueError when the page has no usable blue boxes -- the caller
+    keeps the page untouched then.  Also writes selection_blocks.json
+    (typeset column positions + the re-grouped groups) and a copy of the
+    original image.
     """
     import shutil
 
     payload = json.loads(Path(manifest_path).read_text(encoding="utf-8-sig"))
     capture = payload.get("capture", {})
     blocks = capture.get("selection_blocks") or []
-    groups = capture.get("selection_groups") or []
     source = payload.get("source", {})
     image_w = int(source["width"])
     image_h = int(source["height"])
     atomic_ids = {item["id"] for item in blocks if not item.get("page_scale")}
+    grouped = _group_boxes_by_overlap(blocks)
+    groups = [
+        {
+            "id": f"selg_{index:03d}",
+            "image_bbox": [int(value) for value in bbox],
+            "members": member_ids,
+        }
+        for index, (bbox, member_ids) in enumerate(grouped, 1)
+        if member_ids
+    ]
     islands: list[dict] = []
     for group in groups:
-        members = [
-            member for member in group.get("members", [])
-            if member in atomic_ids
-        ]
+        members = [member for member in group["members"] if member in atomic_ids]
         if not members:
             continue
         box = group.get("image_bbox")
@@ -466,13 +719,32 @@ def stage2_process(
     ai_url: str = "https://api.deepseek.com/v1",
     ai_model: str = "deepseek-chat",
     ai_api_key: str = "",
+    ai_ocr_url: str = "",
+    ai_ocr_model: str = "",
+    ai_ocr_api_key: str = "",
+    resume: bool = False,
+    no_pdf: bool = False,
+    min_font_size: int | None = None,
+    font_name: str = "",
+    stroke_divisor: int | None = None,
+    row_gap_divisor: int | None = None,
+    column_gap_divisor: int | None = None,
+    tracking_divisor: int | None = None,
+    text_color: str = "",
+    stroke_color: str = "",
+    background_color: str = "",
+    max_workers: int = 1,
+    progress: "ProgressFile | None" = None,
 ) -> bool:
     """Background: blue boxes -> manga -> translate -> typeset -> PDF.
 
     Translation prefers the AI (OpenAI-compatible, e.g. DeepSeek) whole-page
     batch; islands whose numbered line is missing/malformed fall back to
     the local Sakura endpoint.  Without an API key everything goes through
-    local Sakura.
+    local Sakura.  ``ai_ocr_*`` enable an OpenAI-compatible vision model to
+    read the blue-box crops instead of manga-ocr.  ``resume`` skips pages
+    whose typeset output already exists.  ``no_pdf`` skips the final PDF
+    merge (typeset images only).  ``progress`` publishes run.json.
     """
     from island_extract import build_fallback_dataset
     from manga_localizer.island_contract import load_island_dataset
@@ -485,6 +757,11 @@ def stage2_process(
     )
     from manga_localizer.translator import load_glossary
 
+    if progress is None:
+        from manga_localizer.progress import ProgressFile
+
+        progress = ProgressFile(out_root)
+
     capture_dir = out_root / "capture"
     dataset_dir = out_root / "dataset"
     typeset_dir = out_root / "typeset"
@@ -493,7 +770,9 @@ def stage2_process(
     fallback = _fallback_pages_for(capture_dir, pages)
     # Islands come ONLY from the Photos blue boxes (no highlight-island
     # detection): one island per selection group, original image space.
-    for page in pages:
+    progress.set_stage("dataset", total=len(pages))
+    for index, page in enumerate(pages):
+        progress.progress(index, item=f"page {page}")
         page_dir = dataset_dir / page
         if (page_dir / "islands.json").is_file():
             continue
@@ -565,7 +844,13 @@ def stage2_process(
         # invite manga-ocr hallucinations.
         units[page] = {"islands": {i["id"]: i for i in islands["islands"]},
                        "blocks": box_by_id, "groups": {g["id"]: g for g in groups}}
-    readings = run_manga(crops, out_root)
+    progress.set_stage("ocr", total=len(crops))
+    progress.sub_progress(0, len(crops), "manga-ocr")
+    readings = run_manga(
+        crops, out_root, progress=progress,
+        ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
+        ai_ocr_api_key=ai_ocr_api_key,
+    )
 
     # Second pass: reread the boxes manga-ocr read empty once.  A box that
     # stays empty is a false selection -- dropped everywhere (never joined
@@ -584,7 +869,12 @@ def stage2_process(
             }
         )
     if rereads:
-        reread_readings = run_manga(rereads, out_root)
+        progress.log(f"rereading {len(rereads)} empty boxes")
+        reread_readings = run_manga(
+            rereads, out_root, progress=progress,
+            ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
+            ai_ocr_api_key=ai_ocr_api_key,
+        )
         for crop in rereads:
             page, _, rest = crop["id"].partition(":box:")
             box_id = rest.removesuffix(":reread")
@@ -600,8 +890,12 @@ def stage2_process(
     glossary = load_glossary(ROOT / "config" / "glossary.json")
     cache = IslandTranslationCache(out_root / "translation_cache")
     batch_cache = PageBatchCache(out_root / "translation_batch_cache")
-    translations = {}
-    for page in active_pages:
+    parsed_text = _parse_color(text_color)
+    parsed_stroke = _parse_color(stroke_color)
+    parsed_background = _parse_color(background_color)
+
+    def _translate_one_page(page: str) -> dict[str, str]:
+        """Whole-page translate: AI batch preferred, local Sakura fallback."""
         dataset = load_island_dataset(dataset_dir / page / "islands.json")
         texts = page_texts[page]
         page_translations: dict[str, str] = {}
@@ -645,15 +939,72 @@ def stage2_process(
             )
             for unit in result.units:
                 page_translations[unit.island_id] = unit.translated_text or ""
-        translations[page] = page_translations
-        print(f"translate {page}: {len(page_translations)} islands")
+        return page_translations
 
-    for page in active_pages:
-        erase_and_typeset_page_with(
-            dataset_dir, typeset_dir, page, translations[page],
-            page_directions.get(page), dropped_boxes.get(page, set()),
-        )
+    def _worker(page: str) -> bool:
+        """One page: translate then typeset.  Returns True on failure."""
+        try:
+            translations_page = _translate_one_page(page)
+        except Exception as error:  # noqa: BLE001 - per-page isolation
+            print(f"!! translate {page} FAILED: {error}")
+            progress.log(f"translate {page} failed: {error}")
+            return True
+        out_png = typeset_dir / f"{page}.typeset.png"
+        if resume and out_png.is_file():
+            progress.log(f"resume: skip {page} (typeset exists)")
+            return False
+        try:
+            erase_and_typeset_page_with(
+                dataset_dir, typeset_dir, page, translations_page,
+                page_directions.get(page), dropped_boxes.get(page, set()),
+                min_font_size=min_font_size, font_name=font_name,
+                stroke_divisor=stroke_divisor, row_gap_divisor=row_gap_divisor,
+                column_gap_divisor=column_gap_divisor,
+                tracking_divisor=tracking_divisor,
+                text_color=parsed_text, stroke_color=parsed_stroke,
+                background_color=parsed_background,
+            )
+        except Exception as error:  # noqa: BLE001 - one bad page must not
+            # kill the batch; the page keeps its original in the PDF.
+            print(f"!! typeset {page} FAILED: {error}")
+            progress.log(f"typeset {page} failed: {error}")
+            return True
         print(f"typeset {page} -> {typeset_dir / f'{page}.typeset.png'}")
+        return False
+
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    progress.set_stage("typeset", total=len(active_pages))
+    failed_pages: list[str] = []
+    state_lock = threading.Lock()
+    done_count = 0
+
+    def _on_page_done(page: str, failed: bool) -> None:
+        nonlocal done_count
+        with state_lock:
+            done_count += 1
+            if failed:
+                failed_pages.append(page)
+        progress.progress(done_count, item=f"page {page}")
+
+    workers = max(1, int(max_workers))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_worker, page): page for page in active_pages
+            }
+            for future in futures:
+                page = futures[future]
+                try:
+                    failed = future.result()
+                except Exception as error:  # noqa: BLE001
+                    failed = True
+                    print(f"!! page {page} worker error: {error}")
+                _on_page_done(page, failed)
+    else:
+        for page in active_pages:
+            _on_page_done(page, _worker(page))
 
     # Pages without blue boxes stay untouched: the PDF keeps them as the
     # original image.
@@ -681,7 +1032,16 @@ def stage2_process(
     ]
     if not typeset_files:
         print("no pages to assemble into a PDF")
+        progress.done(ok=not failed_pages)
         return True
+    if no_pdf:
+        print(f"--no-pdf: typeset images only ({len(typeset_files)} pages, PDF skipped)")
+        if failed_pages:
+            print(f"!! 失败页（嵌字图缺失）: {', '.join(failed_pages)}")
+        progress.done(ok=not failed_pages)
+        return True
+    progress.set_stage("pdf", total=1)
+    progress.progress(0, item="merge PDF")
     pdf_path = out_root / f"{images.name}.pdf"
     try:
         import img2pdf
@@ -689,8 +1049,13 @@ def stage2_process(
         pdf_path.write_bytes(img2pdf.convert([str(path) for path in typeset_files]))
     except Exception as error:  # noqa: BLE001 - Pillow PDF save is broken on
         # this Pillow build (no JPEG encoder); img2pdf is the primary path.
+        progress.fail(f"PDF merge failed: {error}")
         raise RuntimeError(f"PDF merge failed: {error}") from error
+    progress.progress(1, item=str(pdf_path))
     print(f"-> {pdf_path} ({len(typeset_files)} pages)")
+    if failed_pages:
+        print(f"!! 失败页（PDF 中保持原图）: {', '.join(failed_pages)}")
+    progress.done(ok=not failed_pages)
     return True
 
 
@@ -784,6 +1149,9 @@ def build_union_overrides(dataset, boxes, pad: int = 6) -> dict:
     size caps follow the PADDED box dimensions: vertical font size
     (glyph width) <= narrowest padded box width, horizontal font size
     (glyph height) <= shortest padded box height.
+
+    ``bbox`` is the island's canonical "one box": the union of its blue
+    boxes expanded by *pad* px per side, in IMAGE coordinates, unclamped.
     """
     union_overrides = {}
     for island in dataset.islands:
@@ -809,17 +1177,52 @@ def build_union_overrides(dataset, boxes, pad: int = 6) -> dict:
         mask = np.zeros((iy2 - iy1, ix2 - ix1), dtype=np.uint8)
         for px1, py1, px2, py2 in local_boxes:
             mask[py1:py2, px1:px2] = 255
+        raw = [
+            (b["image_bbox"][0] - pad, b["image_bbox"][1] - pad,
+             b["image_bbox"][2] + pad, b["image_bbox"][3] + pad)
+            for b in boxes
+            if ix1 <= (b["image_bbox"][0] + b["image_bbox"][2]) // 2 <= ix2
+            and iy1 <= (b["image_bbox"][1] + b["image_bbox"][3]) // 2 <= iy2
+        ]
         union_overrides[island.id] = {
             "mask": mask,
             "area": float(np.count_nonzero(mask)),
+            "bbox": (
+                min(item[0] for item in raw),
+                min(item[1] for item in raw),
+                max(item[2] for item in raw),
+                max(item[3] for item in raw),
+            ),
             "glyph_width_limit": float(min_w),
             "glyph_height_limit": float(min_h),
         }
     return union_overrides
 
 
+def _parse_color(value: str) -> tuple[int, int, int] | None:
+    """Parse 'R,G,B' into a tuple, or None for 'none'/empty."""
+    if not value or value.strip().lower() in ("none", "null"):
+        return None
+    try:
+        parts = [int(part.strip()) for part in value.split(",")]
+    except ValueError:
+        raise ValueError(f"invalid colour {value!r} (expected R,G,B or none)") from None
+    if len(parts) != 3 or not all(0 <= v <= 255 for v in parts):
+        raise ValueError(f"invalid colour {value!r} (expected R,G,B or none)")
+    return tuple(parts)  # type: ignore[return-value]
+
+
 def erase_and_typeset_page_with(
-    dataset_dir, typeset_dir, page, translations, directions, dropped_boxes=None
+    dataset_dir, typeset_dir, page, translations, directions, dropped_boxes=None,
+    min_font_size: int | None = None,
+    font_name: str | None = None,
+    stroke_divisor: int | None = None,
+    row_gap_divisor: int | None = None,
+    column_gap_divisor: int | None = None,
+    tracking_divisor: int | None = None,
+    text_color: tuple[int, int, int] | None = None,
+    stroke_color: tuple[int, int, int] | None = None,
+    background_color: tuple[int, int, int] | None = None,
 ):
     import dataclasses
 
@@ -866,23 +1269,60 @@ def erase_and_typeset_page_with(
         with Image.open(dataset_dir / page / "original.jpg") as image:
             image.convert("RGB").save(typeset_dir / f"{page}.typeset.png")
         return None
-    active_dataset = dataclasses.replace(
-        dataset,
-        islands=tuple(
-            island for island in dataset.islands if island.id in erase_ids
-        ),
-    )
     with Image.open(dataset_dir / page / "original.jpg") as image:
-        erased = erase_island_image(
-            image, active_dataset, config=ErasureConfig(), min_island_area=800.0
-        ).image
+        source = image.convert("RGB").copy()
     # union masks: each island's blue boxes (pad 6) union, island-local
     # coords; glyph size caps follow the PADDED box dimensions (vertical:
     # font width <= narrowest padded box width; horizontal: font height <=
     # shortest padded box height)
     union_overrides = build_union_overrides(dataset, boxes, pad=6) if boxes else {}
+    config = TypesetConfig(
+        min_font_size=min_font_size if min_font_size else TypesetConfig.min_font_size,
+        font_name=font_name or TypesetConfig.font_name,
+        stroke_divisor=stroke_divisor or TypesetConfig.stroke_divisor,
+        row_gap_divisor=row_gap_divisor or TypesetConfig.row_gap_divisor,
+        column_gap_divisor=column_gap_divisor or TypesetConfig.column_gap_divisor,
+        tracking_divisor=tracking_divisor or TypesetConfig.tracking_divisor,
+        text_color=text_color or TypesetConfig.text_color,
+        stroke_color=stroke_color or TypesetConfig.stroke_color,
+        background_color=background_color,
+    )
+    # Canonical "one box": each boxed island's blue-box union expanded
+    # 6 px becomes its island bbox for erasure and typesetting -- the
+    # erasure range, the layout bounds and the reported block bbox all
+    # refer to the same box, so text never lands on un-erased art.
+    canonical = {}
+    for island in dataset.islands:
+        box = (union_overrides.get(island.id) or {}).get("bbox")
+        if box is not None:
+            canonical[island.id] = tuple(int(value) for value in box)
+    canonical_dataset = dataclasses.replace(
+        dataset,
+        islands=tuple(
+            dataclasses.replace(island, image_bbox=canonical.get(island.id, island.image_bbox))
+            for island in dataset.islands
+        ),
+    )
+    active_dataset = dataclasses.replace(
+        canonical_dataset,
+        islands=tuple(
+            island for island in canonical_dataset.islands if island.id in erase_ids
+        ),
+    )
+    # Erase the WHOLE canonical box of every erasure-worthy island (plus
+    # the detected glyph ink): whatever the typesetter draws inside the
+    # box is always on erased art.
+    extra_regions = {
+        island_id: canonical[island_id]
+        for island_id in erase_ids
+        if island_id in canonical
+    }
+    erased = erase_island_image(
+        source, active_dataset, config=ErasureConfig(), min_island_area=800.0,
+        extra_regions=extra_regions,
+    ).image
     result = typeset_island_page(
-        erased, dataset, translations, blue_lines, config=TypesetConfig(),
+        erased, canonical_dataset, translations, blue_lines, config=config,
         direction_overrides=directions,
         union_overrides=union_overrides,
     )
@@ -950,6 +1390,113 @@ def main(argv=None) -> int:
              "prefers the AI whole-page batch and falls back to local Sakura; "
              "without it everything goes through local Sakura.",
     )
+    parser.add_argument(
+        "--ai-ocr-url",
+        default="",
+        help="OpenAI-compatible vision base URL for AI OCR (e.g. GLM-4V / "
+             "Qwen-VL); empty = local manga-ocr",
+    )
+    parser.add_argument(
+        "--ai-ocr-model",
+        default="",
+        help="AI OCR vision model name",
+    )
+    parser.add_argument(
+        "--ai-ocr-api-key",
+        default="",
+        help="AI OCR API key (or AI_OCR_API_KEY env)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="stage2: skip pages whose typeset output already exists",
+    )
+    parser.add_argument(
+        "--no-pdf",
+        action="store_true",
+        help="stage2: skip the final PDF merge (typeset images only)",
+    )
+    parser.add_argument(
+        "--layout-region",
+        default="",
+        help="constrain capture window layout to WxH px (e.g. 2400x1400); "
+             "empty = full virtual screen",
+    )
+    parser.add_argument(
+        "--box-delta",
+        type=int,
+        default=8,
+        help="delta fallback: per-channel RGB change threshold (default 8)",
+    )
+    parser.add_argument(
+        "--box-tolerance",
+        type=float,
+        default=5.0,
+        help="strict overlay formula match slack (default 5)",
+    )
+    parser.add_argument(
+        "--box-area-ratio",
+        type=float,
+        default=0.20,
+        help="whole-page drop: frame-area fraction (default 0.20)",
+    )
+    parser.add_argument(
+        "--min-font-size",
+        type=int,
+        default=28,
+        help="typeset font floor in px (default 28)",
+    )
+    parser.add_argument(
+        "--font",
+        default="msyh.ttc",
+        help="typeset font file name (msyh.ttc / simhei.ttf / simkai.ttf / "
+             "simfang.ttf / simsun.ttc)",
+    )
+    parser.add_argument(
+        "--stroke-divisor",
+        type=int,
+        default=10,
+        help="stroke width = font_size // N (default 10; larger = thinner)",
+    )
+    parser.add_argument(
+        "--row-gap-divisor",
+        type=int,
+        default=4,
+        help="horizontal row gap = font_size // N (default 4)",
+    )
+    parser.add_argument(
+        "--column-gap-divisor",
+        type=int,
+        default=4,
+        help="vertical column gap = font_size // N (default 4)",
+    )
+    parser.add_argument(
+        "--tracking-divisor",
+        type=int,
+        default=16,
+        help="character tracking = font_size // N (default 16)",
+    )
+    parser.add_argument(
+        "--text-color",
+        default="",
+        help="typeset text colour R,G,B (default 0,0,0 black)",
+    )
+    parser.add_argument(
+        "--stroke-color",
+        default="",
+        help="typeset stroke colour R,G,B (default 255,255,255 white)",
+    )
+    parser.add_argument(
+        "--background-color",
+        default="",
+        help="per-glyph background colour R,G,B or 'none' (default none)",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="parallel translate+typeset page workers (default 1; max 3)",
+    )
     args = parser.parse_args(argv)
     global BLUEBOX_FILL
     try:
@@ -983,7 +1530,11 @@ def main(argv=None) -> int:
     if not args.process:
         ok = stage1_capture(images, out_root, pages_set, args.parallel,
                             args.display_scale, args.layout_row_gap,
-                            args.layout_bottom_shift_up)
+                            args.layout_bottom_shift_up,
+                            layout_region=args.layout_region,
+                            box_delta=args.box_delta,
+                            box_tolerance=args.box_tolerance,
+                            box_area_ratio=args.box_area_ratio)
         if not ok:
             print("capture failed", file=sys.stderr)
             return 2
@@ -1015,13 +1566,33 @@ def main(argv=None) -> int:
     if not active_pages:
         print("no capturable pages (all black)", file=sys.stderr)
         return 2
+    _config = _load_api_config()
     return 0 if stage2_process(
         images,
         out_root,
         active_pages,
         ai_url=args.ai_url,
         ai_model=args.ai_model,
-        ai_api_key=args.ai_api_key or os.environ.get("DEEPSEEK_API_KEY", ""),
+        ai_api_key=args.ai_api_key
+        or os.environ.get("DEEPSEEK_API_KEY", "")
+        or _config.get("deepseek_api_key", ""),
+        ai_ocr_url=args.ai_ocr_url or _config.get("ai_ocr_url", ""),
+        ai_ocr_model=args.ai_ocr_model or _config.get("ai_ocr_model", ""),
+        ai_ocr_api_key=args.ai_ocr_api_key
+        or os.environ.get("AI_OCR_API_KEY", "")
+        or _config.get("ai_ocr_api_key", ""),
+        resume=args.resume,
+        no_pdf=args.no_pdf,
+        min_font_size=args.min_font_size,
+        font_name=args.font,
+        stroke_divisor=args.stroke_divisor,
+        row_gap_divisor=args.row_gap_divisor,
+        column_gap_divisor=args.column_gap_divisor,
+        tracking_divisor=args.tracking_divisor,
+        text_color=args.text_color,
+        stroke_color=args.stroke_color,
+        background_color=args.background_color,
+        max_workers=max(1, min(3, args.max_workers)),
     ) else 2
 
 

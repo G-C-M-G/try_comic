@@ -85,11 +85,11 @@ class HorizontalTypesetTests(unittest.TestCase):
             audit = result.audits[0]
             self.assertIn(audit.status, ("typeset", "typeset_pending_review"))
             self.assertGreaterEqual(audit.font_size, 30)
-            # Hard cap: the block stays within the 150% envelope of the
-            # group bbox (here the island bbox: 400x120 -> 600x180).
+            # Canonical "one box" contract: the block stays inside the
+            # island bbox (here 400x120).
             x1, y1, x2, y2 = audit.block_bbox
-            self.assertLessEqual(x2 - x1, 600)
-            self.assertLessEqual(y2 - y1, 180)
+            self.assertLessEqual(x2 - x1, 400)
+            self.assertLessEqual(y2 - y1, 120)
 
     def test_horizontal_block_is_wider_than_tall(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,10 +126,9 @@ class HorizontalTypesetTests(unittest.TestCase):
             self.assertGreater(height, width)
 
     def test_long_horizontal_text_never_renders_outside_island(self):
-        # A long translation in a small island: the block must respect the
-        # hard 150% envelope of the group bbox (island 320x160 -> 480x240);
-        # anything beyond is clipped by the caller, never rendered as a
-        # full out-of-bounds block.
+        # A long translation in a small island: the block must fit inside
+        # the island bbox (the canonical box, here 320x160) -- the font
+        # shrinks below the 28px preferred floor if needed.
         with tempfile.TemporaryDirectory() as tmp:
             dataset = _dataset([("island_001", (100, 100, 420, 260))], tmp)
             erased = Image.new("RGB", dataset.image_size, (250, 250, 250))
@@ -144,8 +143,8 @@ class HorizontalTypesetTests(unittest.TestCase):
             )
             audit = result.audits[0]
             x1, y1, x2, y2 = audit.block_bbox
-            self.assertLessEqual(x2 - x1, 480)
-            self.assertLessEqual(y2 - y1, 240)
+            self.assertLessEqual(x2 - x1, 320)
+            self.assertLessEqual(y2 - y1, 160)
 
     def test_horizontal_ratio_uses_uniform_floor(self):
         # Horizontal uses the same 0.6 area-ratio floor as vertical.
@@ -184,11 +183,11 @@ class HorizontalTypesetTests(unittest.TestCase):
             )
             audit = result.audits[0]
             self.assertIn(audit.status, ("typeset", "typeset_pending_review"))
-            # The block stays within the 150% envelope (island 400x300 ->
-            # 600x450); a single oversized glyph is clipped to the island.
+            # The block stays inside the island bbox (the canonical box,
+            # here 400x300); a single oversized glyph is clipped there.
             x1, y1, x2, y2 = audit.block_bbox
-            self.assertLessEqual(x2 - x1, 600)
-            self.assertLessEqual(y2 - y1, 450)
+            self.assertLessEqual(x2 - x1, 400)
+            self.assertLessEqual(y2 - y1, 300)
 
 
 if __name__ == "__main__":

@@ -76,8 +76,8 @@ class MinRatioTest(unittest.TestCase):
     def test_min_ratio_configurable(self):
         self.assertEqual(TypesetConfig(min_ratio=0.5).min_ratio, 0.5)
 
-    def test_min_font_size_floor_is_30(self):
-        self.assertEqual(TypesetConfig().min_font_size, 30)
+    def test_min_font_size_floor_is_28(self):
+        self.assertEqual(TypesetConfig().min_font_size, 28)
 
 
 class AlignmentRulesTest(unittest.TestCase):
@@ -138,15 +138,28 @@ class TypesetPageTest(unittest.TestCase):
             image, dataset, translations, paddle, config=TypesetConfig()
         )
         audits = {item.island_id: item for item in result.audits}
+        # Both texts fit entirely inside their island bboxes (the
+        # canonical "one box") -> clean typeset.
         self.assertEqual(audits["island_001"].status, "typeset")
-        # island_002's short text under-fills the island at the 22px font
-        # floor -> area ratio below the 0.6 target -> pending_review (still
-        # rendered, never blank).
-        self.assertEqual(audits["island_002"].status, "typeset_pending_review")
-        self.assertTrue(audits["island_001"].area_ratio >= 0.6)
+        self.assertEqual(audits["island_002"].status, "typeset")
+        self.assertFalse(any("soft cap" in reason for reason in audits["island_001"].reasons))
+        self.assertGreaterEqual(audits["island_001"].area_ratio, 0.6)
         self.assertLessEqual(audits["island_001"].area_ratio, 1.1)
         self.assertLessEqual(audits["island_002"].center_offset, audits["island_002"].center_tolerance)
         self.assertGreater(audits["island_001"].font_size, 0)
+        # Canonical "one box" contract: the block never leaves the island
+        # bbox (the erasure range covers the whole island).
+        for audit in audits.values():
+            bb = audit.block_bbox
+            if bb is None:
+                continue
+            ix1, iy1, ix2, iy2 = next(
+                i.image_bbox for i in dataset.islands if i.id == audit.island_id
+            )
+            self.assertGreaterEqual(bb[0], ix1)
+            self.assertGreaterEqual(bb[1], iy1)
+            self.assertLessEqual(bb[2], ix2)
+            self.assertLessEqual(bb[3], iy2)
 
     def test_missing_translation_skipped(self):
         dataset = self._page()
@@ -162,11 +175,11 @@ class TypesetPageTest(unittest.TestCase):
         image = Image.new("RGB", (300, 400), (255, 255, 255))
         translations = {"island_001": "这是一段非常长的测试文字"}
         result = typeset_island_page(image, dataset, translations, [], config=TypesetConfig())
-        # The text cannot fit at the 30px font floor, but it is still
-        # rendered (clipped to the island) so the island is never blank:
-        # the status is pending_review, not translation_failed.
+        # The text cannot fit even at the absolute floor (12px), but it is
+        # still rendered (clipped to the island) so the island is never
+        # blank: the status is pending_review, not translation_failed.
         self.assertEqual(result.audits[0].status, "typeset_pending_review")
-        self.assertEqual(result.audits[0].font_size, 30)
+        self.assertEqual(result.audits[0].font_size, 12)
 
 
 if __name__ == "__main__":

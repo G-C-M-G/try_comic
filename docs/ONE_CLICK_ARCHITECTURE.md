@@ -100,45 +100,66 @@ masked = 全页填充色 (BLUEBOX_FILL)
 ### 4.6 擦字 (erase_and_typeset_page_with)
 - `dataclasses.replace` 构造**只含有框岛的 dataset 子集** → `erase_island_image` 只擦有框岛
 - 无框岛像素**保留原样**（原始内容不动）
+- 每岛先求**统一框 B**（该岛蓝框组并集 ±6px，`build_union_overrides["bbox"]`）；擦字 dataset 的岛 bbox 替换为 B，`extra_regions` 传整框 → **擦字范围 = 整个 B**（原文墨水 ∪ 全框矩形），擦除/合成/审计都以 B 为几何
 
 ### 4.7 嵌字 (island_typeset.py)
 见下一节。
 
-### 4.8 输出
+### 4.8 OCR 读数缓存 (ocr_readings.json)
+- **为什么**：manga-ocr 无检测、每框一次推理；历史版本每次 `--process` 都全量重识别（全书 ~40 分钟）
+- **机制**（`run_manga` / `_load_readings_cache` / `_store_readings_cache` / `_select_crop_misses`）：
+  - 缓存文件 `outputs/oneclick/{书名}/ocr_readings.json`：`{"{page}:box:{box_id}": "识别文本"}`
+  - 每次 OCR 前加载缓存，**只对缺失框跑 OCR**（manga-ocr 子进程 / AI-OCR 同一逻辑），结果合并后**原子写回**（tmp + replace；并行段之间 merge-on-store 不互丢）
+  - **只缓存非空读数**：读空的框不入缓存 → 二次复读判误选逻辑完全保留
+  - 缓存损坏/缺失 → 忽略并重建；重新采集（框变）→ 旧键自然失效
+- **收益**：改分组/改嵌字/重合并 PDF 等任何重跑，OCR 阶段 ≈ 0 秒
+
+### 4.9 输出
 - `typeset/{page}.typeset.png`、合并 PDF `outputs/oneclick/{书名}/{书名}.pdf`
+
+### 4.10 备份与恢复
+- **代码/规则版本**：git 提交即备份（分组规则、嵌字规则、文档都随代码版本化）
+- **书级产物**：`outputs/oneclick/{书名}/` 可整体复制/压缩即完整备份（含 capture、dataset、两套翻译缓存、OCR 读数缓存、typeset、PDF）；重新铺到同样路径即可恢复/继续
+- **恢复重跑**：删除 `dataset/*/islands.json` → 用新分组规则重建；翻译/OCR 缓存命中则零重算；`--resume` 跳过已有 typeset 页
 
 ## 五、嵌字标准（定稿）
 
-### 5.1 布局边界（唯一，`_fit_size`）
-- **直接使用组 bbox（外接矩形）**：译文块以组 bbox 为布局边界，块中心 = 组 bbox 中心
-- 无蓝框几何（无线/无几何覆盖）时组 bbox 退化为岛 bbox
+### 5.0 蓝框分组（`_group_boxes_by_overlap`，全部按扩框 ±6px 判定）
+- 竖排框对合并 **当且仅当**：**扩框横向间距 < 20% × 较小扩框宽** 且 **扩框纵向重叠 > 40% × 较大扩框高**
+- 横排框对合并 **当且仅当**：**扩框纵向间距 < 20% × 较小扩框高** 且 **扩框横向重叠 > 40% × 较大扩框宽**
+- 混合方向对**永不合并**；沿阅读方向堆叠（同列竖排堆叠 / 同行横排并排）**永不合并**（蓝框是可信原子单位）
+- 重叠基准取**较大**扩框维度：避免"矮框只搭住高框一小截"也被合并（较小基准在顶端对齐时恒满足，形同虚设）
+- 每组 → 独立岛，岛 bbox = 组外接矩形；**每组的翻译嵌字只在组内进行**
+
+### 5.1 统一框与布局边界（唯一，`_fit_size`）
+- 每岛 **统一框 B = 蓝框组并集 ±6px**（`build_union_overrides["bbox"]`，image 坐标、不夹紧）；无蓝框岛 B = 岛 bbox
+- 擦字范围、布局边界、合成裁剪、面积比基准**全部 = B**（overlay 中一个框）
+- 译文块以 B 为布局边界，块中心 = B 中心
 
 ### 5.2 面积比（唯一算法）
-- `ratio = A_text / A_group_bbox`（**唯一基准 = 组 bbox 面积**），目标 **60% – 110%**
-- 达标 → `typeset`；不达标 → `typeset_pending_review`（仅质量信号，不再有 120% 面积硬上限）
-- 字号从大到小搜索，取首个"包络内 + 比例达标"的字号；无达标字号取包络内比例最大者
+- `ratio = A_text / A_B`（**唯一基准 = 统一框 B 面积**），目标 **60% – 110%**
+- 达标 → `typeset`；不达标 → `typeset_pending_review`（仅质量信号）
+- 字号从大到小搜索，取首个"块 ⊆ B + 比例达标"的字号；无达标字号取比例最大者
 
-### 5.3 硬上限（150% 包络）
-- 块宽 ≤ 组 bbox 宽 × **150%** 且 块高 ≤ 组 bbox 高 × **150%**（每边各允许超出 50%）
-- 超出包络的字号一律不选；下限字号仍放不下 → 以下限渲染并**裁剪到岛内**（绝不把擦掉的岛留白）
+### 5.3 硬上限（块必须完整在 B 内）
+- 块宽/高 **≤ B 宽/高** 且块四边必须在 B 内，否则该字号不选 —— 文字永远完整显示，不截断
+- 字号可降到 **12px 绝对下限**（`MIN_FONT_SIZE_MIN`）以适配 B；仍放不下 → 12px 渲染，允许超出到 **150% 包络**（`MAX_GROUP_BBOX_OVERFLOW_RATIO=0.5`，标记 pending_review），再不行则渲染并裁剪（绝不把擦掉的岛留白）
 - **列间距/行距永不为 0**（`max(1, 字号//4)`），不靠压扁间距硬塞
 
 ### 5.4 字号约束（glyph 限制，扩框版）
-- **字号下限 30px**：字号搜索不降到 30 以下
-- **竖排**：字号（=字宽）≤ 蓝框**扩 6px 后**的最窄宽（`glyph_width_limit` = min 扩框宽，夹紧到岛边界）
-- **横排**：字号（=字高）≤ 蓝框**扩 6px 后**的最矮高（`glyph_height_limit` = min 扩框高，夹紧到岛边界）
-- 扩框版 = 原始蓝框尺寸 + 12px，字号上限更宽松
+- **首选下限 28px**：优先使用 ≥28px；28px 放不下时继续降到 12px 绝对下限
+- **竖排**：字号（=字宽）≤ 蓝框**扩 6px 后**的最窄宽（`glyph_width_limit` = min 扩框宽）
+- **横排**：字号（=字高）≤ 蓝框**扩 6px 后**的最矮高（`glyph_height_limit` = min 扩框高）
 
 ### 5.5 对齐与列位
-- **竖排**：列内字自上而下，**同一句（同一岛内）各列顶端对齐**（共享顶边）
-- **横排**：行内字自左而右，**各行左对齐**（短行不居中偏移），块整体以组中心水平居中
-- 列位 = 蓝框扩 6px（`blue_boxes_to_lines pad=6`），列 x 中心 = 蓝框中心
-- 中心容差：横向偏移 ≤ 组 bbox 对角线 5%（竖排只查横向，因列已顶端对齐）
+- **竖排**：列内字自上而下，**同一句（同一岛内）各列顶端对齐**（共享顶边）；列从右到左、以 B 中心整组居中均分（**不跟随各蓝框位置**）
+- **横排**：行内字自左而右，**各行左对齐**（短行不居中偏移），块整体以 B 中心水平居中
+- 中心容差：横向偏移 ≤ B 对角线 5%（竖排只查横向，因列已顶端对齐）
 
 ### 5.6 样式（TypesetConfig）
 - 黑字白描边：stroke = max(1, 字号//10)
 - 字距 = 字号//16；列距/行距 = 字号//4
-- 字体 msyh.ttc
+- 字体 msyh.ttc；可选 `background_color`（每字后画纯色底块）
 
 ## 六、数据契约
 
@@ -147,11 +168,13 @@ outputs/oneclick/{书名}/
 ├── capture/{page}/capture.json          # 选区 + 元数据 (bluebox_masked 前身)
 ├── check/{page}.bluebox_check.png       # 采集核对图
 ├── dataset/{page}/
-│   ├── islands.json                     # 轮廓岛 (含组聚合)
+│   ├── islands.json                     # 岛（蓝框分组聚合；删除即按新规则重建）
 │   ├── selection_blocks.json            # 蓝框 + 组
 │   ├── original.jpg                     # 原图
 │   └── bluebox_masked.png               # 填黑图 (OCR 输入)
-├── translation_cache/                   # 翻译缓存 (signature 校验)
+├── translation_cache/                   # 本地翻译缓存 (signature 校验)
+├── translation_batch_cache/             # AI 整页批量翻译缓存
+├── ocr_readings.json                    # OCR 读数缓存（非空读数；重跑免 OCR）
 ├── typeset/{page}.typeset.png           # 嵌字图
 └── {书名}.pdf                           # 最终产物
 ```

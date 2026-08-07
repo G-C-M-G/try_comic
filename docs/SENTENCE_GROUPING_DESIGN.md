@@ -4,6 +4,13 @@
 适用项目：manga_localizer（高亮岛内翻译嵌字，几何权威 = `islands.json`）
 上游数据：`D:\workplace\opencode\try_comic\outputs\exam\dataset33\` 等，只读输入。
 
+> **状态标注（2026-08-07）**：本文档描述的是旧"高亮岛 + Paddle 行"流水线（M1-M4）。
+> 现行 one-click 流水线的分组合并/嵌字规则见
+> [`ONE_CLICK_ARCHITECTURE.md` §4.6–§5.6](ONE_CLICK_ARCHITECTURE.md)：
+> 蓝框分组 = 扩框(±6px)间距 < 20%×较小扩框宽/高 且 重叠 > 40%×较大扩框高/宽；
+> 嵌字统一框 B = 蓝框组并集 ±6px；面积比基准 = A_B；块必须完整在 B 内
+> （字号可缩至 12px 绝对下限）。本文下述 120% 面积硬上限等旧规则不再生效。
+
 ## 0. 目的
 
 给定高亮岛数据集 + 行级 OCR 结果，确定：

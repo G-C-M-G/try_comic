@@ -415,14 +415,19 @@ BLUE_OVERLAY_KEEP = 174.0 / 255.0
 BLUE_OVERLAY_OFFSET_G = 38.0
 BLUE_OVERLAY_OFFSET_B = 67.0
 # Match slack for the overlay formula.  Measured residuals at real box
-# pixels are <= 3 per channel, so 12 is safe; tightening it (e.g. to 2)
-# fragments boxes and drops the stored-box hit rate (97.2% -> 95.8%).
-BLUE_OVERLAY_TOLERANCE = 12.0
+# pixels are <= 3 per channel, so 5 is safe and tighter than the old 12;
+# tightening below ~2 fragments boxes and drops the stored-box hit rate.
+BLUE_OVERLAY_TOLERANCE = 5.0
 # A pixel must have been repainted by more than this to count as part of
 # the overlay (untouched pure-blue artwork satisfies the formula ~by
 # identity and must not become a box).  Tolerance 2 is permissive; the
 # formula gate above is the real discriminator.
 BLUE_OVERLAY_PAINT_DELTA = 2.0
+
+# Whole-page selection threshold: a connected blue region covering more
+# than this fraction of the frame is a whole-page misselection and is
+# dropped (not an atomic text box).
+WHOLE_PAGE_AREA_RATIO = 0.20
 
 
 def blue_overlay_image(base: np.ndarray) -> np.ndarray:
@@ -444,6 +449,9 @@ def detect_selection_boxes(
     *,
     base: np.ndarray | None = None,
     island_blocks: Sequence[OverlayBlock] | None = None,
+    tolerance: float = BLUE_OVERLAY_TOLERANCE,
+    delta_min: int = _MASK_DELTA_MIN,
+    whole_page_ratio: float = WHOLE_PAGE_AREA_RATIO,
 ) -> list[OverlayBlock]:
     """Find the blue selection rectangles Photos draws over recognized text.
 
@@ -454,15 +462,17 @@ def detect_selection_boxes(
     Primary detection (``base`` given): the selection overlay is Photos'
     blue RGB(0, 120, 211) blended at 31.76% over the ORIGINAL pixel, i.e.
     ``selected == blue_overlay_image(base)``.  Pixels that match the
-    formula but were NOT repainted (blue artwork whose overlay is ~the
-    identity) are excluded by the paint-delta guard, so only genuine
-    selection boxes survive.
+    formula within ``tolerance`` but were NOT repainted (blue artwork whose
+    overlay is ~the identity) are excluded by the paint-delta guard, so
+    only genuine selection boxes survive.
 
     Fallback (no ``base`` or the formula found nothing): a pixel belongs
     to the selection overlay when ANY single RGB channel differs by more
-    than ``_MASK_DELTA_MIN`` between the scan-text frame (``active``) and
-    the all-selected frame (``selected``).  ``island_blocks`` is accepted
-    for call-site compatibility but plays no role in the detection.
+    than ``delta_min`` between the scan-text frame (``active``) and the
+    all-selected frame (``selected``).  ``island_blocks`` is accepted for
+    call-site compatibility but plays no role in the detection.
+    ``whole_page_ratio`` drops connected regions covering more than that
+    fraction of the frame.
     """
     if active.shape != selected.shape:
         active, selected = _align_frames(active, selected)
@@ -471,37 +481,42 @@ def detect_selection_boxes(
         if base.shape != selected.shape:
             base, selected = _align_frames(base, selected)
         expected = blue_overlay_image(base)
-        formula = np.abs(selected.astype(np.float64) - expected).max(axis=2) <= BLUE_OVERLAY_TOLERANCE
+        formula = np.abs(selected.astype(np.float64) - expected).max(axis=2) <= tolerance
         painted = np.abs(selected.astype(np.float64) - base.astype(np.float64)).max(axis=2) > BLUE_OVERLAY_PAINT_DELTA
         mask = cv2.morphologyEx(
             (formula & painted).astype(np.uint8) * 255,
             cv2.MORPH_OPEN,
             cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
         )
-        values = _selection_boxes_from_mask(mask, gray_once, active.shape)
+        values = _selection_boxes_from_mask(
+            mask, gray_once, active.shape, whole_page_ratio=whole_page_ratio
+        )
         if values:
             return sorted(values, key=lambda item: (item.y, -item.x))
     active_f = active.astype(np.int16)
     selected_f = selected.astype(np.int16)
-    changed = (np.abs(selected_f - active_f) > _MASK_DELTA_MIN).any(axis=2)
+    changed = (np.abs(selected_f - active_f) > delta_min).any(axis=2)
     mask = cv2.morphologyEx(
         changed.astype(np.uint8) * 255,
         cv2.MORPH_OPEN,
         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
     )
-    values = _selection_boxes_from_mask(mask, gray_once, active.shape)
+    values = _selection_boxes_from_mask(
+        mask, gray_once, active.shape, whole_page_ratio=whole_page_ratio
+    )
     return sorted(values, key=lambda item: (item.y, -item.x))
 
 
 def _selection_boxes_from_mask(
-    mask: np.ndarray, gray: np.ndarray, shape
+    mask: np.ndarray, gray: np.ndarray, shape,
+    whole_page_ratio: float = WHOLE_PAGE_AREA_RATIO,
 ) -> list[OverlayBlock]:
     """Connected-component box extraction from a blue-selection mask.
 
     Despeckled components become atomic boxes; components covering more
-    than 20% of the frame (Photos treating a whole page as one OCR block)
-    are dropped -- a whole-page selection is not an atomic text box.
-    Big components are split by x projection and text-aware gaps.
+    than ``whole_page_ratio`` of the frame (Photos treating a whole page as
+    one OCR block) are dropped -- a whole-page selection is not an atomic
+    text box.  Big components are split by x projection and text-aware gaps.
     """
     _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
     values = []
@@ -509,7 +524,7 @@ def _selection_boxes_from_mask(
         if area < 60 or width < 6 or height < 8:
             continue
         # Whole-page selections are not atomic text boxes: drop them.
-        if (width * height) > shape[0] * shape[1] * 0.20:
+        if (width * height) > shape[0] * shape[1] * whole_page_ratio:
             continue
         # Split a component at empty x columns: Photos may fuse a few boxes
         # that touch, but columns leave measurable gaps between the boxes.
@@ -626,6 +641,9 @@ def _capture_selection_boxes(
     debug_dir: str | None = None,
     island_blocks: Sequence[OverlayBlock] | None = None,
     base: np.ndarray | None = None,
+    box_delta: int = 8,
+    box_tolerance: float = 5.0,
+    box_area_ratio: float = 0.20,
 ) -> tuple[list[OverlayBlock], np.ndarray | None, str | None]:
     """Ctrl+A all scan-text ranges and grab the blue selection overlay.
 
@@ -650,7 +668,9 @@ def _capture_selection_boxes(
                 time.sleep(wait)
                 selected = _capture_control_region(window, active_control)
                 blocks = detect_selection_boxes(
-                    active, selected, base=base, island_blocks=island_blocks
+                    active, selected, base=base, island_blocks=island_blocks,
+                    tolerance=box_tolerance, delta_min=box_delta,
+                    whole_page_ratio=box_area_ratio,
                 )
             if blocks:
                 if debug_dir:
@@ -1430,6 +1450,9 @@ def _capture_photos_fast_page(
     frames_only: bool = False,
     fixed_window_rect: tuple[int, int, int, int] | None = None,
     display_scale: int = 100,
+    box_delta: int = 8,
+    box_tolerance: float = 5.0,
+    box_area_ratio: float = 0.20,
 ) -> tuple[dict, object]:
     """One fast-mask page capture; returns ``(manifest, window)`` for reuse.
 
@@ -1488,7 +1511,9 @@ def _capture_photos_fast_page(
     if fixed_window_rect is not None:
         _ensure_window_rect(window, fixed_window_rect)
     selection_blocks, selected_frame, selection_error = _capture_selection_boxes(
-        window, active_control, active, debug_dir, island_blocks=blocks, base=base
+        window, active_control, active, debug_dir, island_blocks=blocks, base=base,
+        box_delta=box_delta, box_tolerance=box_tolerance,
+        box_area_ratio=box_area_ratio,
     )
     _tick("selection_boxes")
     selection_boxes_status = (
@@ -2531,6 +2556,9 @@ def _capture_one_page(
     frames_only: bool,
     fixed_rect: tuple[int, int, int, int] | None,
     display_scale: int = 100,
+    box_delta: int = 8,
+    box_tolerance: float = 5.0,
+    box_area_ratio: float = 0.20,
 ) -> tuple[dict, float | None]:
     """Capture one page with per-page retries.
 
@@ -2611,6 +2639,9 @@ def _capture_one_page(
                 frames_only=frames_only,
                 fixed_window_rect=fixed_rect,
                 display_scale=display_scale,
+                box_delta=box_delta,
+                box_tolerance=box_tolerance,
+                box_area_ratio=box_area_ratio,
             )
             manifest["source"]["sha256"] = _sha256(image_path)
             capture = manifest.setdefault("capture", {})
@@ -2747,6 +2778,10 @@ def capture_photos_fast_batch(
     display_scale: int = 100,
     row_gap_px: int | None = None,
     bottom_shift_up: int = 0,
+    layout_region: str = "",
+    box_delta: int = 8,
+    box_tolerance: float = 5.0,
+    box_area_ratio: float = 0.20,
 ) -> dict:
     """Batch fast capture: one Photos window per page, retried up to
     ``max_attempts`` times (a fresh window each attempt; first success
@@ -2787,6 +2822,17 @@ def capture_photos_fast_batch(
     count = requested
     scale_rects = None
     if display_scale != 100:
+        region_bounds = None
+        if layout_region:
+            try:
+                region_w, region_h = (
+                    int(part.strip()) for part in layout_region.lower().split("x")
+                )
+                region_bounds = (0, 0, region_w, region_h)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"invalid --layout-region {layout_region!r} (expected WxH, e.g. 2400x1400)"
+                ) from None
         scale_rects, count = _page_display_rects(
             image_paths,
             display_scale,
@@ -2794,6 +2840,7 @@ def capture_photos_fast_batch(
             right_limit=DISPLAY_RIGHT_LIMIT or None,
             row_gap_px=row_gap_px,
             bottom_shift_up=bottom_shift_up,
+            screen_bounds=region_bounds,
         )
     tiles = (
         _tile_rects(parallel)
@@ -2817,6 +2864,9 @@ def capture_photos_fast_batch(
                 frames_only,
                 rect,
                 display_scale,
+                box_delta=box_delta,
+                box_tolerance=box_tolerance,
+                box_area_ratio=box_area_ratio,
             )
             with lock:
                 results.append(result)
@@ -3325,6 +3375,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                  "edge in --display-scale layout (default 0)",
         )
         parser.add_argument(
+            "--layout-region",
+            default="",
+            help="constrain the window layout to WxH px (e.g. 2400x1400 on a "
+                 "2560x1600 screen keeps right/bottom margins); empty = full "
+                 "virtual screen",
+        )
+        parser.add_argument(
+            "--box-delta",
+            type=int,
+            default=8,
+            help="delta fallback: per-channel RGB change threshold between "
+                 "the two frames (default 8)",
+        )
+        parser.add_argument(
+            "--box-tolerance",
+            type=float,
+            default=5.0,
+            help="strict overlay formula: per-channel match slack (default 5)",
+        )
+        parser.add_argument(
+            "--box-area-ratio",
+            type=float,
+            default=0.20,
+            help="whole-page drop: connected region area fraction of the "
+                 "frame above which the box is discarded (default 0.20)",
+        )
+        parser.add_argument(
             "--no-fixed-window",
             action="store_true",
             help="do not pin Photos windows to fixed screen tiles",
@@ -3346,6 +3423,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 display_scale=args.display_scale,
                 row_gap_px=args.layout_row_gap,
                 bottom_shift_up=args.layout_bottom_shift_up,
+                layout_region=args.layout_region,
+                box_delta=args.box_delta,
+                box_tolerance=args.box_tolerance,
+                box_area_ratio=args.box_area_ratio,
             )
         else:
             result = capture_photos_batch(

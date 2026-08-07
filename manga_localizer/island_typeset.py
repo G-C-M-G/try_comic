@@ -10,19 +10,22 @@ every island is decided by the caller through ``direction_overrides``
 horizontal).
 
 Single layout path: the translated block is a centred block laid out
-inside the GROUP bbox (the outer rectangle of the island's blue boxes /
-Paddle lines).  The group bbox is both the layout bounds and the single
-area-ratio base: r = A_text / A_group_bbox with target [0.6, 1.1]; an
-off-target ratio is a quality signal only (pending_review), the hard
-layout cap is the group bbox inflated by 50% per side (a 150% envelope).
+inside the ISLAND bbox -- the canonical "one box" (the blue-box group
+expanded 6 px).  The island bbox is the layout bounds, the containment
+boundary, the centre, and the single area-ratio base:
+r = A_text / A_island with target [0.6, 1.1]; an off-target ratio is a
+quality signal only (pending_review).  The block must fit ENTIRELY inside
+the island bbox; the font search descends below ``min_font_size`` (28px)
+down to the absolute floor ``MIN_FONT_SIZE_MIN`` (12px) so the text is
+always fully visible inside the box.  Only when nothing fits even at the
+absolute floor may the block exceed the island bbox up to the 150%
+envelope (soft cap, pending_review); beyond that the text is rendered at
+the floor and clipped -- an erased island is never left blank.
 Glyph size is additionally capped by the PADDED box dimensions: vertical
 size <= narrowest 6px-padded box width, horizontal size <= shortest padded
-box height.  The font search never goes below ``min_font_size`` (25px);
-when nothing fits even at the floor the text is still rendered at the
-floor and clipped to the island -- an erased island is never left blank.
-The column gap is never compressed to zero.  ``union_overrides`` carries
-per-island glyph caps (``glyph_width_limit`` / ``glyph_height_limit``);
-the blue-box union masks themselves are no longer used for layout.
+box height.  The column gap is never compressed to zero.
+``union_overrides`` carries per-island glyph caps
+(``glyph_width_limit`` / ``glyph_height_limit``).
 
 Hard boundary: island image_bbox (no silent cropping beyond it), white
 stroke on every glyph (stroke_width = max(1, size // 10), colour
@@ -44,7 +47,7 @@ from .errors import ErasureError, TypesettingError
 from .island_contract import IslandDataset, IslandInfo
 from .island_dry_run import OcrLine
 from .ocr_contract import BBox
-from .sentence_splitter import ColumnGroup, _column_key, cluster_lines_into_columns
+from .sentence_splitter import ColumnGroup, _column_key
 
 MIN_RATIO = 0.6
 MAX_RATIO = 1.1
@@ -53,13 +56,18 @@ CENTER_TOLERANCE_FRACTION = 0.05
 STROKE_DIVISOR = 10
 TRACKING_DIVISOR = 16
 COLUMN_GAP_DIVISOR = 4
-# Readability floor: the font search never goes below this, and if nothing
-# fits the group bbox at this size the text is still rendered (clipped to
-# the island) instead of leaving an erased island blank.
-MIN_FONT_SIZE = 30
-# Hard layout cap: the block may exceed the group bbox by up to this
-# fraction of the group's size per side (a 150% envelope).  The column gap
-# is never compressed to zero to force a fit.
+# Preferred readability floor: the font search prefers sizes at or above
+# this, but keeps descending below it (down to ``MIN_FONT_SIZE_MIN``) so
+# the text always fits inside the island box instead of being truncated.
+MIN_FONT_SIZE = 28
+# Absolute floor: below this the text is never legible anyway; if even
+# this does not fit, the block may exceed the island up to the 150%
+# envelope (soft cap) or is rendered and clipped -- never left blank.
+MIN_FONT_SIZE_MIN = 12
+# Last-resort layout cap: only when nothing fits even at the absolute
+# floor may the block exceed the island bbox by up to this fraction of
+# the island's size per side (a 150% envelope).  The column gap is never
+# compressed to zero to force a fit.
 MAX_GROUP_BBOX_OVERFLOW_RATIO = 0.5
 
 
@@ -106,6 +114,7 @@ class TypesetConfig:
     font_name: str = "msyh.ttc"
     stroke_color: Tuple[int, int, int] = (255, 255, 255)
     text_color: Tuple[int, int, int] = (0, 0, 0)
+    background_color: Optional[Tuple[int, int, int]] = None
     min_ratio: float = MIN_RATIO
     max_ratio: float = MAX_RATIO
     hard_ratio_cap: float = HARD_RATIO_CAP
@@ -113,6 +122,7 @@ class TypesetConfig:
     stroke_divisor: int = STROKE_DIVISOR
     tracking_divisor: int = TRACKING_DIVISOR
     column_gap_divisor: int = COLUMN_GAP_DIVISOR
+    row_gap_divisor: int = COLUMN_GAP_DIVISOR
     min_font_size: int = MIN_FONT_SIZE
     padding: int = 0
 
@@ -122,47 +132,22 @@ class TypesetConfig:
     def column_gap(self, size: int) -> int:
         return max(1, size // self.column_gap_divisor)
 
+    def row_gap(self, size: int) -> int:
+        return max(1, size // self.row_gap_divisor)
+
     def stroke(self, size: int) -> int:
         return max(1, size // self.stroke_divisor)
-
-
-def _in_bbox(line: OcrLine, bbox: BBox, tolerance: float = 2.0) -> bool:
-    xs = [p[0] for p in line.polygon]
-    ys = [p[1] for p in line.polygon]
-    cx, cy = (sum(xs) / len(xs), sum(ys) / len(ys))
-    x1, y1, x2, y2 = bbox
-    return x1 - tolerance <= cx <= x2 + tolerance and y1 - tolerance <= cy <= y2 + tolerance
-
-
-def _island_geometry(
-    island: IslandInfo,
-    paddle_lines: Sequence[OcrLine],
-) -> Tuple[Optional[float], Optional[float], Optional[Tuple[float, float]], bool, Sequence[ColumnGroup]]:
-    """(union_area, rect_area, centre, has_geometry, columns)."""
-    lines = [line for line in paddle_lines if _in_bbox(line, island.image_bbox)]
-    if not lines:
-        return None, None, None, False, ()
-    x1, y1, x2, y2 = island.image_bbox
-    mask = Image.new("L", (max(1, x2 - x1), max(1, y2 - y1)), 0)
-    draw = ImageDraw.Draw(mask)
-    for line in lines:
-        draw.polygon([(p[0] - x1, p[1] - y1) for p in line.polygon], fill=255)
-    union_area = float(mask.histogram()[255])
-    xs = [p[0] for line in lines for p in line.polygon]
-    ys = [p[1] for line in lines for p in line.polygon]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    rect_area = float((max_x - min_x) * (max_y - min_y))
-    centre = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
-    columns = cluster_lines_into_columns(lines, vertical=True)
-    return union_area, rect_area, centre, True, columns
 
 
 def _char_step(config: TypesetConfig, size: int) -> int:
     return size + config.tracking(size)
 
 
-def _pitch(config: TypesetConfig, size: int) -> int:
+def _pitch(config: TypesetConfig, size: int, *, horizontal: bool = False) -> int:
+    # Vertical layout: pitch = glyph + column gap.  Horizontal layout:
+    # pitch = glyph + row gap (independent control via ``row_gap_divisor``).
+    if horizontal:
+        return size + config.row_gap(size)
     return size + config.column_gap(size)
 
 
@@ -299,10 +284,10 @@ def _row_layout(
     usable_w = max(1, (x2 - x1) - 2 * config.padding)
     usable_h = max(1, (y2 - y1) - 2 * config.padding)
     step = _char_step(config, size)
-    row_pitch = _pitch(config, size)
+    row_pitch = _pitch(config, size, horizontal=True)
     chars_per_row = max(1, usable_w // step)
     row_count = max(1, math.ceil(len(text) / chars_per_row))
-    while row_count * row_pitch - config.column_gap(size) > usable_h and row_count > 1:
+    while row_count * row_pitch - config.row_gap(size) > usable_h and row_count > 1:
         row_count -= 1
     # After shrinking the row count, the remaining rows must still hold
     # every character: recompute chars_per_row so the last row never
@@ -332,7 +317,7 @@ def _slots_horizontal(
     chars_per_row, row_count, block_width, block_height, last_count = _row_layout(
         text, size, island, config, layout_bbox=layout_bbox
     )
-    row_pitch = _pitch(config, size)
+    row_pitch = _pitch(config, size, horizontal=True)
     step = _char_step(config, size)
     top = centre[1] - block_height / 2.0
     left = centre[0] - block_width / 2.0
@@ -350,16 +335,23 @@ def _block_metrics_horizontal(
     size: int,
     config: TypesetConfig,
 ) -> Tuple[BBox, Tuple[float, float]]:
-    """Metrics for horizontal row slots (row width = count * step)."""
+    """Metrics for horizontal row slots (row width = count * step).
+
+    The drawn extent of a row is ``[x_center - (count-1)*step/2,
+    x_center - (count-1)*step/2 + (count-1)*step + size]`` -- the same
+    formula ``_draw_slots`` uses -- so the block bbox always equals what
+    is actually rendered (the naive ``x_center +/- width/2`` would
+    understate the right edge by ``size/2``).
+    """
     step = _char_step(config, size)
     row_pitch = _pitch(config, size)
-    widths = [(slot.char_count - 1) * step + size for slot in slots]
     xs = [
-        slot.x_center - width / 2.0
-        for slot, width in zip(slots, widths)
+        slot.x_center - (slot.char_count - 1) * step / 2.0
+        for slot in slots
     ] + [
-        slot.x_center + width / 2.0
-        for slot, width in zip(slots, widths)
+        slot.x_center - (slot.char_count - 1) * step / 2.0
+        + (slot.char_count - 1) * step + size
+        for slot in slots
     ]
     ys = [
         s.y_center - size / 2.0 for s in slots
@@ -412,6 +404,16 @@ def _draw_slots(
     stroke = config.stroke(size)
     step = _char_step(config, size)
     index = 0
+
+    def _background_box(x: float, y: float) -> None:
+        if config.background_color is None:
+            return
+        pad = stroke + 2
+        draw.rectangle(
+            [x - pad, y - pad, x + size + pad, y + size + pad],
+            fill=config.background_color,
+        )
+
     if direction == "horizontal":
         # row slots: characters left to right inside each row
         for slot in slots:
@@ -421,8 +423,11 @@ def _draw_slots(
                     break
                 char = text[index]
                 index += 1
+                x = left + j * step
+                y = slot.y_center - size / 2.0
+                _background_box(x, y)
                 draw.text(
-                    (left + j * step, slot.y_center - size / 2.0),
+                    (x, y),
                     char,
                     font=font,
                     fill=config.text_color,
@@ -437,8 +442,11 @@ def _draw_slots(
                 break
             char = text[index]
             index += 1
+            x = slot.x_center - size / 2.0
+            y = top + j * step
+            _background_box(x, y)
             draw.text(
-                (slot.x_center - size / 2.0, top + j * step),
+                (x, y),
                 char,
                 font=font,
                 fill=config.text_color,
@@ -448,60 +456,46 @@ def _draw_slots(
     return font
 
 
-def _columns_bbox(columns: Sequence[ColumnGroup]) -> Optional[BBox]:
-    """Bounding rectangle of the island's blue-box columns (the group bbox)."""
-    xs = [p for column in columns for p in (column.bbox[0], column.bbox[2])]
-    ys = [p for column in columns for p in (column.bbox[1], column.bbox[3])]
-    if not xs:
-        return None
-    return (min(xs), min(ys), max(xs), max(ys))
-
-
 def _fit_size(
     text: str,
     island: IslandInfo,
-    area_rect: Optional[float],
+    area_rect: float,
     centre: Tuple[float, float],
     config: TypesetConfig,
     direction: str = "vertical",
-    group_bbox: Optional[BBox] = None,
     glyph_width_limit: Optional[float] = None,
     glyph_height_limit: Optional[float] = None,
 ) -> Tuple[int, Sequence[TypesetColumnSlot], Optional[float], Tuple[str, ...]]:
-    """Single-path fit: a centred block laid out inside the GROUP bbox.
+    """Single-path fit: a centred block laid out inside the ISLAND bbox.
 
-    The group bbox (the outer rectangle of the island's blue boxes) is both
-    the layout bounds and the single area-ratio base:
-    * the block is centred on the group centre -- vertical columns are
-      top-aligned, horizontal rows left-aligned;
-    * the hard layout cap is the group bbox inflated by 50% per side (a
-      150% envelope); the column gap is never compressed to zero;
-    * the area ratio is A_text / A_group_bbox with target
-      [min_ratio, max_ratio]; off-target ratios are quality signals only
-      (the caller marks pending_review);
-    * if nothing fits even at the font floor, the text is still rendered at
-      the floor and clipped by the caller -- an erased island is never left
-      blank.
+    The island bbox is the canonical "one box" (the blue-box group
+    expanded 6 px): it is the layout bounds, the containment boundary and
+    the area-ratio base A_text / A_island with target
+    [min_ratio, max_ratio]:
+    * the block must fit ENTIRELY inside the island bbox -- the font size
+      descends below ``config.min_font_size`` (down to the absolute floor
+      ``MIN_FONT_SIZE_MIN``) if needed, so the text is always fully
+      visible inside the box (never truncated);
+    * only when nothing fits even at the absolute floor may the block
+      exceed the island bbox, up to the 150% envelope (soft cap, flagged
+      pending_review); beyond that the text is rendered at the floor and
+      clipped -- an erased island is never left blank;
+    * off-target area ratios are quality signals only (pending_review);
+    * the column gap is never compressed to zero.
     """
-    bounds = group_bbox if group_bbox is not None else island.image_bbox
-    x1, y1, x2, y2 = bounds
+    x1, y1, x2, y2 = island.image_bbox
+    bounds = island.image_bbox
     usable_w = max(1, (x2 - x1) - 2 * config.padding)
     usable_h = max(1, (y2 - y1) - 2 * config.padding)
-    max_size = max(config.min_font_size, int(max(1, min(usable_w, usable_h))))
+    max_size = max(MIN_FONT_SIZE_MIN, int(max(1, min(usable_w, usable_h))))
     if direction == "vertical" and glyph_width_limit is not None and glyph_width_limit > 0:
-        max_size = max(config.min_font_size, min(max_size, int(glyph_width_limit)))
+        max_size = max(MIN_FONT_SIZE_MIN, min(max_size, int(glyph_width_limit)))
     if direction == "horizontal" and glyph_height_limit is not None and glyph_height_limit > 0:
-        max_size = max(config.min_font_size, min(max_size, int(glyph_height_limit)))
+        max_size = max(MIN_FONT_SIZE_MIN, min(max_size, int(glyph_height_limit)))
 
-    # Hard layout cap: the block may exceed the group bbox by up to 50% of
-    # its size per side (a 150% envelope) -- enforced on the block SIZE so
-    # a layout cannot blow up to a single over-wide row.
     gw = max(1, x2 - x1)
     gh = max(1, y2 - y1)
-    allow_x1 = x1 - MAX_GROUP_BBOX_OVERFLOW_RATIO * gw
-    allow_x2 = x2 + MAX_GROUP_BBOX_OVERFLOW_RATIO * gw
-    allow_y1 = y1 - MAX_GROUP_BBOX_OVERFLOW_RATIO * gh
-    allow_y2 = y2 + MAX_GROUP_BBOX_OVERFLOW_RATIO * gh
+    preferred_floor = max(MIN_FONT_SIZE_MIN, config.min_font_size)
 
     def _slots_for(size_, centre_):
         if direction == "horizontal":
@@ -515,39 +509,191 @@ def _fit_size(
             return _block_metrics_horizontal(slots_, size_, config)
         return _block_metrics(slots_, size_, config)
 
-    best: Optional[Tuple[int, Sequence[TypesetColumnSlot], Optional[float]]] = None
-    for size in range(max_size, config.min_font_size - 1, -1):
+    def _block_size(slots_, size_):
+        bbox, _ = _metrics_for(slots_, size_)
+        return bbox, bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    def _fits_island(bbox) -> bool:
+        return (
+            bbox[0] >= x1 and bbox[1] >= y1
+            and bbox[2] <= x2 and bbox[3] <= y2
+        )
+
+    def _ratio(bbox) -> float:
+        return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / area_rect
+
+    best: Optional[Tuple[int, Sequence[TypesetColumnSlot], float]] = None
+
+    def _consider(size_: int, ratio_: float) -> None:
+        nonlocal best
+        if best is None or ratio_ > best[2]:
+            best = (size_, _slots_for(size_, centre), ratio_)
+
+    # Pass 1: preferred range down to the preferred floor (28 px default).
+    for size in range(max_size, preferred_floor - 1, -1):
         slots = _slots_for(size, centre)
-        bbox, _ = _metrics_for(slots, size)
-        block_w = bbox[2] - bbox[0]
-        block_h = bbox[3] - bbox[1]
-        if block_w > 1.5 * gw or block_h > 1.5 * gh:
+        bbox, block_w, block_h = _block_size(slots, size)
+        if block_w > gw or block_h > gh or not _fits_island(bbox):
             continue
-        if not (bbox[0] >= allow_x1 and bbox[1] >= allow_y1 and bbox[2] <= allow_x2 and bbox[3] <= allow_y2):
-            continue
-        ratio = None
-        if area_rect is not None and area_rect > 0:
-            ratio = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / area_rect
-        if ratio is not None and config.min_ratio <= ratio <= config.max_ratio:
+        ratio = _ratio(bbox)
+        if config.min_ratio <= ratio <= config.max_ratio:
             return size, slots, ratio, ()
-        if best is None or (ratio is not None and (best[2] is None or ratio > best[2])):
-            best = (size, slots, ratio)
+        _consider(size, ratio)
+    # Pass 2: below the preferred floor the font keeps shrinking (down to
+    # the absolute floor) so the text always fits the island box.
+    for size in range(min(preferred_floor - 1, max_size), MIN_FONT_SIZE_MIN - 1, -1):
+        slots = _slots_for(size, centre)
+        bbox, block_w, block_h = _block_size(slots, size)
+        if block_w > gw or block_h > gh or not _fits_island(bbox):
+            continue
+        ratio = _ratio(bbox)
+        if config.min_ratio <= ratio <= config.max_ratio:
+            return size, slots, ratio, ()
+        _consider(size, ratio)
     if best is not None:
         size, slots, ratio = best
-        if ratio is not None:
-            reasons = (f"area ratio {ratio:.2f} outside [{config.min_ratio}, {config.max_ratio}]",)
-        else:
-            reasons = ("no area base (empty group bbox)",)
-        return size, slots, ratio, reasons
-    # Nothing fits even at the font floor: render at the floor anyway.  The
-    # caller clips to the island, so an erased island is never left blank.
-    size = config.min_font_size
+        return size, slots, ratio, (
+            f"area ratio {ratio:.2f} outside [{config.min_ratio}, {config.max_ratio}]",
+        )
+    # Nothing fits even at the absolute floor: the block may exceed the
+    # island bbox up to the 150% envelope (soft cap); beyond that it is
+    # rendered at the floor and clipped.  An erased island is never blank.
+    size = MIN_FONT_SIZE_MIN
     slots = _slots_for(size, centre)
-    reasons = (
-        f"does not fit the group bbox at the font floor ({config.min_font_size}px); "
-        "rendered and clipped",
-    )
+    bbox, block_w, block_h = _block_size(slots, size)
+    allow_x1 = x1 - MAX_GROUP_BBOX_OVERFLOW_RATIO * gw
+    allow_x2 = x2 + MAX_GROUP_BBOX_OVERFLOW_RATIO * gw
+    allow_y1 = y1 - MAX_GROUP_BBOX_OVERFLOW_RATIO * gh
+    allow_y2 = y2 + MAX_GROUP_BBOX_OVERFLOW_RATIO * gh
+    if (
+        block_w <= 1.5 * gw and block_h <= 1.5 * gh
+        and bbox[0] >= allow_x1 and bbox[1] >= allow_y1
+        and bbox[2] <= allow_x2 and bbox[3] <= allow_y2
+    ):
+        reasons = (
+            f"does not fit the island bbox at the absolute font floor "
+            f"({MIN_FONT_SIZE_MIN}px)",
+            "block exceeds the island bbox (soft cap within the 150% envelope)",
+        )
+    else:
+        reasons = (
+            f"does not fit the island bbox at the absolute font floor "
+            f"({MIN_FONT_SIZE_MIN}px); rendered and clipped",
+        )
     return size, slots, 0.0, reasons
+
+
+def _compute_island_plan(
+    island: IslandInfo,
+    text: str,
+    direction: str,
+    config: TypesetConfig,
+    union_overrides: Optional[Mapping[str, dict]] = None,
+) -> dict:
+    """Layout-only geometry for one island (no drawing, no pixel access).
+
+    The island bbox is the canonical "one box" (the blue-box group
+    expanded 6 px): the layout bounds, the containment boundary, the
+    centre, and the area-ratio base A_text / A_island.  The reported
+    ``block_bbox`` is the actual laid-out text block (inside the island
+    box except for the absolute-floor fallback).
+    """
+    x1, y1, x2, y2 = island.image_bbox
+    centre = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+    area_rect = float((x2 - x1) * (y2 - y1))
+    try:
+        union = (union_overrides or {}).get(island.id)
+        size, slots, ratio, reasons = _fit_size(
+            text, island, area_rect, centre, config,
+            direction=direction,
+            glyph_width_limit=union.get("glyph_width_limit") if union else None,
+            glyph_height_limit=union.get("glyph_height_limit") if union else None,
+        )
+    except TypesettingError as error:
+        return {
+            "island_id": island.id, "text": text, "direction": direction,
+            "font_size": 0, "stroke_width": 0, "tracking": 0, "column_gap": 0,
+            "area_base": area_rect, "area_text": None, "area_ratio": None,
+            "center_offset": 0.0, "center_tolerance": 0.0, "block_bbox": None,
+            "slots": (), "status": "translation_failed", "reasons": (str(error),),
+            "margin": 2,
+        }
+    if direction == "horizontal":
+        bbox, block_centre = _block_metrics_horizontal(slots, size, config)
+    else:
+        bbox, block_centre = _block_metrics(slots, size, config)
+    margin = max(2, config.stroke(size) + 2)
+    left_room = bbox[0] - (x1 + margin)
+    right_room = (x2 - margin) - bbox[2]
+    top_room = bbox[1] - (y1 + margin)
+    bottom_room = (y2 - margin) - bbox[3]
+
+    def _clamped_shift(room_low, room_high, low, high, delta):
+        # Prefer the margin zone [room_low, room_high]; when the block is
+        # too big for it (inverted interval), fall back to keeping the
+        # block inside the island bbox -- a fitted block is never shifted
+        # out of the canonical box.
+        if room_high < room_low:
+            room_low, room_high = low, high
+        return max(room_low, min(room_high, delta))
+
+    shift_x = _clamped_shift(
+        -left_room, right_room, x1 - bbox[0], x2 - bbox[2],
+        centre[0] - block_centre[0],
+    )
+    shift_y = _clamped_shift(
+        -top_room, bottom_room, y1 - bbox[1], y2 - bbox[3],
+        centre[1] - block_centre[1],
+    )
+    adjusted = [
+        TypesetColumnSlot(
+            index=slot.index,
+            x_center=slot.x_center + shift_x,
+            y_center=slot.y_center + shift_y,
+            char_count=slot.char_count,
+        )
+        for slot in slots
+    ]
+    # Audit the geometry that is actually rendered (after the centre
+    # shift), not the pre-shift layout.
+    if direction == "horizontal":
+        bbox, block_centre = _block_metrics_horizontal(adjusted, size, config)
+    else:
+        bbox, block_centre = _block_metrics(adjusted, size, config)
+    # Vertical blocks are top-aligned (all columns share the top edge),
+    # so only the horizontal centring against the island centre is
+    # checked; horizontal blocks are centred both ways.
+    if direction == "horizontal":
+        offset = math.hypot(
+            block_centre[0] - centre[0], block_centre[1] - centre[1]
+        )
+    else:
+        offset = abs(block_centre[0] - centre[0])
+    diagonal = math.hypot(x2 - x1, y2 - y1)
+    tolerance = diagonal * config.center_tolerance_fraction
+    status = "typeset"
+    audit_reasons = list(reasons)
+    if any("soft cap" in reason for reason in reasons):
+        # The block exceeds the island bbox (within the 150% envelope):
+        # rendered but flagged for review.
+        status = "typeset_pending_review"
+    if ratio is not None and (ratio < config.min_ratio or ratio > config.max_ratio):
+        # The area ratio is a quality signal only; the fit itself keeps
+        # the block inside the island bbox (the canonical box).
+        status = "typeset_pending_review"
+    if offset > tolerance:
+        status = "typeset_pending_review"
+        audit_reasons.append(f"center offset {offset:.1f}px > {tolerance:.1f}px tolerance")
+    area_text = float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+    return {
+        "island_id": island.id, "text": text, "direction": direction,
+        "font_size": size, "stroke_width": config.stroke(size),
+        "tracking": config.tracking(size), "column_gap": config.column_gap(size),
+        "area_base": area_rect, "area_text": area_text, "area_ratio": ratio,
+        "center_offset": round(offset, 2), "center_tolerance": round(tolerance, 2),
+        "block_bbox": bbox, "slots": tuple(adjusted), "status": status,
+        "reasons": tuple(audit_reasons), "margin": margin,
+    }
 
 
 def typeset_island_page(
@@ -599,101 +745,39 @@ def typeset_island_page(
         direction = str((direction_overrides or {}).get(island.id) or "vertical")
         if direction not in ("horizontal", "vertical"):
             direction = "vertical"
-        x1, y1, x2, y2 = island.image_bbox
-        override = (geometry_overrides or {}).get(island.id)
-        if override is not None:
-            area_base, area_rect, centre, has_geometry, columns = override
-        else:
-            area_base, area_rect, centre, has_geometry, columns = _island_geometry(
-                island, paddle_lines
-            )
-        if centre is None:
-            centre = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-        if area_rect is None:
-            # No Paddle geometry (e.g. a capture without OCR lines): fall
-            # back to the island bbox as the target rectangle so the
-            # centred layout still renders.
-            area_rect = float((x2 - x1) * (y2 - y1))
-        group_bbox = _columns_bbox(columns) if columns else None
-        if group_bbox is None:
-            group_bbox = (x1, y1, x2, y2)
-        try:
-            union = (union_overrides or {}).get(island.id)
-            size, slots, ratio, reasons = _fit_size(
-                text, island, area_rect, centre, config,
-                direction=direction,
-                group_bbox=group_bbox,
-                glyph_width_limit=union.get("glyph_width_limit") if union else None,
-                glyph_height_limit=union.get("glyph_height_limit") if union else None,
-            )
-        except TypesettingError as error:
+        plan = _compute_island_plan(
+            island, text, direction, config,
+            union_overrides=union_overrides,
+        )
+        if plan.get("block_bbox") is None:
             audits.append(
                 IslandTypesetAudit(
-                    island_id=island.id, text=text, font_size=0, stroke_width=0,
-                    tracking=0, column_gap=0, area_base=area_base, area_text=None,
+                    island_id=island.id, text=plan.get("text") or text,
+                    font_size=0, stroke_width=0, tracking=0, column_gap=0,
+                    area_base=plan.get("area_base"), area_text=None,
                     area_ratio=None, center_offset=0.0, center_tolerance=0.0,
                     block_bbox=None, slots=(), status="translation_failed",
-                    reasons=(str(error),), changed_inside=0, changed_outside=0,
+                    reasons=tuple(plan.get("reasons") or ()),
+                    changed_inside=0, changed_outside=0,
                 )
             )
             continue
-        if direction == "horizontal":
-            bbox, block_centre = _block_metrics_horizontal(slots, size, config)
-        else:
-            bbox, block_centre = _block_metrics(slots, size, config)
-        margin = max(2, config.stroke(size) + 2)
-        left_room = bbox[0] - (x1 + margin)
-        right_room = (x2 - margin) - bbox[2]
-        top_room = bbox[1] - (y1 + margin)
-        bottom_room = (y2 - margin) - bbox[3]
-        shift_x = max(-left_room, min(right_room, centre[0] - block_centre[0]))
-        shift_y = max(-top_room, min(bottom_room, centre[1] - block_centre[1]))
-        adjusted = [
-            TypesetColumnSlot(
-                index=slot.index,
-                x_center=slot.x_center + shift_x,
-                y_center=slot.y_center + shift_y,
-                char_count=slot.char_count,
-            )
-            for slot in slots
-        ]
-        # Audit the geometry that is actually rendered (after the centre
-        # shift), not the pre-shift layout.
-        if direction == "horizontal":
-            bbox, block_centre = _block_metrics_horizontal(adjusted, size, config)
-        else:
-            bbox, block_centre = _block_metrics(adjusted, size, config)
-        # Vertical blocks are top-aligned (all columns share the top edge),
-        # so only the horizontal centring against the group centre is
-        # checked; horizontal blocks are centred both ways.
-        if direction == "horizontal":
-            offset = math.hypot(
-                block_centre[0] - centre[0], block_centre[1] - centre[1]
-            )
-        else:
-            offset = abs(block_centre[0] - centre[0])
-        diagonal = math.hypot(x2 - x1, y2 - y1)
-        tolerance = diagonal * config.center_tolerance_fraction
-        _draw_slots(canvas, text, adjusted, size, config, direction=direction)
-        status = "typeset"
-        audit_reasons = list(reasons)
-        if ratio is not None and (ratio < config.min_ratio or ratio > config.max_ratio):
-            # The area ratio is a quality signal only; the hard layout cap
-            # is the 150% group-bbox envelope enforced by _fit_size.
-            status = "typeset_pending_review"
-        if offset > tolerance:
-            status = "typeset_pending_review"
-            audit_reasons.append(f"center offset {offset:.1f}px > {tolerance:.1f}px tolerance")
-        area_text = float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+        _draw_slots(
+            canvas, plan["text"], plan["slots"], plan["font_size"],
+            config, direction=direction,
+        )
         audits.append(
             IslandTypesetAudit(
-                island_id=island.id, text=text, font_size=size,
-                stroke_width=config.stroke(size), tracking=config.tracking(size),
-                column_gap=config.column_gap(size), area_base=area_rect,
-                area_text=area_text, area_ratio=ratio,
-                center_offset=round(offset, 2), center_tolerance=round(tolerance, 2),
-                block_bbox=bbox, slots=tuple(adjusted), status=status,
-                reasons=tuple(audit_reasons), changed_inside=0, changed_outside=0,
+                island_id=island.id, text=plan["text"],
+                font_size=plan["font_size"], stroke_width=plan["stroke_width"],
+                tracking=plan["tracking"], column_gap=plan["column_gap"],
+                area_base=plan["area_base"], area_text=plan["area_text"],
+                area_ratio=plan["area_ratio"],
+                center_offset=plan["center_offset"],
+                center_tolerance=plan["center_tolerance"],
+                block_bbox=plan["block_bbox"], slots=plan["slots"],
+                status=plan["status"], reasons=plan["reasons"],
+                changed_inside=0, changed_outside=0,
             )
         )
     difference = ImageChops.difference(erased, canvas)

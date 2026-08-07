@@ -34,7 +34,7 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
 ## 三、参数
 
 ```
---images <dir>      原图目录（默认：桌面《甲书》）
+--images <dir>      原图目录（默认：D:\workplace\opencode\try_comic\漫画翻译\原文\《甲书》）
 --pages <list>      页列表，如 "1-24" 或 "1,3,5"
 --parallel <n>      Photos 并行窗口数（默认 3；6 窗口布局为上3下3）
 --display-scale <p> 窗口显示缩放百分比（默认 25：窗口=页面×25%，整页完整可见，
@@ -45,8 +45,24 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
 --process           只跑 stage2（后台处理），跳过采集
 --auto              采集完成立即处理
 --confirm-no-boxes <pages>   人工审核确认某页确无蓝色框（标记后 stage2 静默跳过）
+--ai-url <url>       AI 翻译接口（默认 https://api.deepseek.com/v1）
+--ai-model <name>    AI 翻译模型（默认 deepseek-chat）
+--ai-api-key <key>   AI 翻译 Key（或 DEEPSEEK_API_KEY 环境变量 / config/api_keys.json）
+--ai-ocr-url <url>   AI OCR 视觉接口（OpenAI 兼容，如 GLM-4V/Qwen-VL；留空=本地 manga-ocr）
+--ai-ocr-model <name> AI OCR 视觉模型
+--ai-ocr-api-key <key> AI OCR Key（或 AI_OCR_API_KEY 环境变量 / config/api_keys.json）
+--resume             断点续跑：跳过已有 typeset 输出的页
 --bluebox-fill R,G,B  填黑图填充色（默认 0,0,0 黑；若文字非黑色可用白 255,255,255）
 ```
+
+## 三.5 运行进度与断点
+
+- 每次运行在 `outputs/oneclick/{书名}/run.json` 实时写入进度
+  （阶段/当前页/计数/耗时/ETA），GUI 的进度条与终端提示据此显示；
+  `run.log` 滚动保留运行日志。
+- `--resume`（GUI"断点续跑"勾选）：跳过已有 `typeset/{page}.typeset.png` 的页；
+  翻译命中缓存天然跳过已翻内容。
+- 单页失败不中断整批：失败页记录并在 PDF 中保持原图。
 
 ## 四、采集注意事项（重要）
 
@@ -72,7 +88,10 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
 outputs/oneclick/{书名}/
 ├── capture/{page}/              # 采集帧 + capture.json（每页 base/ocr/selected 三帧）
 ├── check/{page}.bluebox_check.png   # 采集核对（原图 + 蓝框叠加）
-├── masked/{page}.bluebox_masked.png # 扩框填黑图（蓝框扩 6px 保留像素，其余填黑）
+├── dataset/{page}/              # islands.json（分组）、selection_blocks.json、original.jpg、填黑图
+├── translation_cache/           # 本地翻译缓存
+├── translation_batch_cache/     # AI 整页批量翻译缓存
+├── ocr_readings.json            # OCR 读数缓存（非空读数；重跑免 OCR）
 ├── typeset/{page}.typeset.png       # 嵌字结果图（逐页人工抽查）
 └── {书名}.pdf                       # 最终 PDF
 ```
@@ -83,26 +102,45 @@ outputs/oneclick/{书名}/
 - 嵌字字号是否 ≤ 蓝框宽度（竖排）/ 蓝框高度（横排）
 - 面积比 60%-110% 内 → 正常；不达标页面在 `typeset.png` 中字号偏小属预期
 
+## 五.5 常见重跑操作（缓存友好）
+
+| 目的 | 操作 | 代价 |
+|---|---|---|
+| 只重嵌字（改样式/字号/规则后） | `--process --pages ... --no-pdf`（OCR/翻译全命中缓存） | 分钟级 |
+| 改分组规则后全书重分组 | 删 `dataset/*/islands.json` → `--process` | 仅合并组重译（API）+ 重嵌字，OCR 0 |
+| 强制重翻译 | 删 `translation_cache/` + `translation_batch_cache/` | 全书 API 重翻 |
+| 强制重识别 | 删 `ocr_readings.json` | 全书 ~40 分钟 OCR |
+| 断点续跑 | `--resume`（跳过已有 typeset 页） | — |
+| 单页调试 | `--process --pages 12 --no-pdf` | 分钟级 |
+
 ## 六、嵌字标准速查
 
 | 规则 | 值 |
 |---|---|
-| 布局边界 | 组 bbox（外接矩形），块中心 = 组 bbox 中心 |
-| 面积比（唯一） | A_text / A_group_bbox ∈ [60%, 110%]（质量信号；达标 typeset，否则 pending_review） |
-| 硬上限 | 块宽/高 ≤ 组 bbox 宽/高 × 150%（每边各允超 50%）；仍放不下 → 30px 渲染并裁剪 |
-| 字号下限 | 30px |
+| 蓝框分组 | 扩框(±6px)间距 < 20%×较小扩框宽/高 且 重叠 > 40%×较大扩框高/宽；混合方向与沿阅读方向堆叠不合并 |
+| 统一框 B | 每岛蓝框组并集 ±6px；擦字范围 = 布局边界 = 合成裁剪 = 面积比基准 = B |
+| 面积比（唯一） | A_text / A_B ∈ [60%, 110%]（质量信号；达标 typeset，否则 pending_review） |
+| 硬上限 | 块必须完整在 B 内（宽/高 ≤ B 宽/高）；放不下 → 缩字号至 12px 绝对下限，仍放不下才允许 150% 包络（pending_review） |
+| 字号下限 | 首选 28px，可降到 12px |
 | 字号上限 | 竖排 ≤ 蓝框扩 6px 后的最窄宽；横排 ≤ 蓝框扩 6px 后的最矮高 |
-| 对齐 | 竖排同句各列顶端对齐；横排各行左对齐 |
-| 列位 | 蓝框扩 6px，x 中心 = 蓝框中心；中心横向容差 = 对角线 5% |
+| 对齐 | 竖排同句各列顶端对齐；横排各行左对齐；块以 B 中心居中 |
+| 列位 | 整组居中均分（不跟随各蓝框位置）；中心横向容差 = B 对角线 5% |
 | 样式 | 黑字白描边（描边=字号//10），字距=字号//16，列距=字号//4（≥1，永不为 0） |
 
 ## 七、翻译缓存
 
-- 位置：`outputs/oneclick/{书名}/translation_cache/`
+- 位置：`outputs/oneclick/{书名}/translation_cache/`（本地兜底）+ `translation_batch_cache/`（AI 整页批量）
 - 缓存键：源文本 + 上下文 + 术语表哈希 + 提示词版本
 - 删除 `translation_cache/` 可强制全部重新翻译
 - 注意：缓存是**跨页共享**的，同文本不同上下文不会误命中；
   若曾用旧逻辑跑过且产生幻觉缓存（如源文本 "それでも、"），请清理后再跑
+
+## 七.5 OCR 读数缓存
+
+- 位置：`outputs/oneclick/{书名}/ocr_readings.json`
+- 内容：`{"{page}:box:{box_id}": "识别文本"}`，**只存非空读数**（空框每次照常复读判误选）
+- 用途：任何重跑（重分组/重嵌字/重合并 PDF）**跳过 OCR**，识别零成本
+- 删除该文件可强制全书重新识别（~40 分钟）；重新采集过的页旧键自动失效
 
 ## 八、故障排查
 
