@@ -17,9 +17,6 @@ dependencies = [
 ]
 
 [project.scripts]
-manga-render = "manga_localizer.cli:main"
-manga-batch = "manga_localizer.batch_cli:main"
-manga-gui = "manga_localizer.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

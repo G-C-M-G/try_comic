@@ -1,9 +1,0 @@
-﻿OCR handoff package
-root_commit=3e70885f9a567194684feb34c2125409168a0512
-root_tag=ocr-manual-review-2026-08-04
-prior_tag=ocr-handoff-2026-08-04
-manga_image_translator_commit=269588d
-schema_version=4
-manual_review_default=true
-sample_pages=1,8,19,22
-manual_review_candidates=1:5,8:0,19:1,22:10
