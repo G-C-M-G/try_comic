@@ -74,6 +74,9 @@ class WindowRelockTests(unittest.TestCase):
         def rectangle(self):
             return self._rect
 
+        def set_focus(self):
+            pass
+
     def test_relocks_when_window_drifted(self):
         window = self._Window(self._Rect(100, 100, 800, 900))  # drifted from tile
         with patch("photos_capture._fix_window") as fix:
@@ -87,6 +90,28 @@ class WindowRelockTests(unittest.TestCase):
         with patch("photos_capture._fix_window") as fix:
             _ensure_window_rect(window, (120, 120, 760, 860))
         fix.assert_not_called()
+
+    def test_selection_boxes_relocks_before_grab(self):
+        # Parallel windows may drift/resize while unfocused: the Ctrl+A
+        # grab path must re-pin the window before typing AND before the
+        # screen grab, or the frame extends into a neighbour's tile.
+        import numpy as np
+
+        from photos_capture import _capture_selection_boxes
+
+        window = self._Window(self._Rect(100, 100, 800, 900))  # drifted
+        active = np.zeros((600, 400, 3), dtype=np.uint8)
+        with patch("photos_capture._ensure_window_rect") as relock, \
+             patch("photos_capture._capture_control_region", return_value=active), \
+             patch("photos_capture.detect_selection_boxes", return_value=[]), \
+             patch("photos_capture.time.sleep"), \
+             patch("pywinauto.keyboard.send_keys"):
+            _capture_selection_boxes(
+                window, object(), active,
+                fixed_window_rect=(120, 120, 760, 860),
+                box_area_ratio=0.2,
+            )
+        self.assertGreaterEqual(relock.call_count, 2)
 
 
 class ParallelCaptureTests(unittest.TestCase):
@@ -109,6 +134,33 @@ class ParallelCaptureTests(unittest.TestCase):
             self.assertEqual(len(report["pages"]), 4)
             self.assertTrue(all(p["status"] == "captured" for p in report["pages"]))
             self.assertEqual(report["parallel"], 2)
+            self.assertEqual(report["effective_parallel"], 2)
+
+    def test_effective_parallel_tracks_row_drop(self):
+        # When the display-scale layout has to drop rows (even at the 12%
+        # floor the region is too small), the batch must run exactly the
+        # effective window count -- two windows must never share a rect.
+        with tempfile.TemporaryDirectory() as tmp:
+            images = Path(tmp) / "images"
+            out = Path(tmp) / "out"
+            images.mkdir()
+            for page in ("1", "2", "3", "4", "5", "6"):
+                Image.new("RGB", (2000, 5000), (200, 200, 200)).save(
+                    images / f"{page}.jpg"
+                )
+
+            def ok(*args, **kwargs):
+                return _ok_manifest(), None
+
+            with patch("photos_capture._capture_photos_fast_page", side_effect=ok):
+                report = capture_photos_fast_batch(
+                    images, out, pages={"1", "2", "3", "4", "5", "6"},
+                    max_attempts=1, ask_fallback=False, parallel=6,
+                    display_scale=42, layout_region="1200x700",
+                )
+            self.assertEqual(report["parallel"], 6)
+            self.assertEqual(report["effective_parallel"], 3)
+            self.assertLess(report["effective_display_scale"], 42)
 
     def test_frames_only_forwards_flag_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:

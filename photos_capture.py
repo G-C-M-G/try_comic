@@ -641,6 +641,7 @@ def _capture_selection_boxes(
     debug_dir: str | None = None,
     island_blocks: Sequence[OverlayBlock] | None = None,
     base: np.ndarray | None = None,
+    fixed_window_rect: tuple[int, int, int, int] | None = None,
     box_delta: int = 8,
     box_tolerance: float = 5.0,
     box_area_ratio: float = 0.20,
@@ -650,8 +651,11 @@ def _capture_selection_boxes(
     The focus + Ctrl+A sequence is serialized, then the blue frame is
     grabbed and verified: when no blue boxes appear (the overlay is still
     rendering or focus was stolen), Ctrl+A is re-sent with an increasing
-    wait (0.4s / 0.8s / 1.2s) up to three attempts.  Fails soft only after
-    all attempts: the frame is still saved and the caller marks the page
+    wait (0.4s / 0.8s / 1.2s) up to three attempts.  ``fixed_window_rect``
+    (the pinned tile) is re-applied right before every grab: parallel
+    windows may drift/resize while unfocused, and a drifted grab extends
+    into the neighbour's tile.  Fails soft only after all attempts: the
+    frame is still saved and the caller marks the page
     ``selection_missing`` so the batch is never blocked.
     """
     from pywinauto import keyboard
@@ -664,8 +668,12 @@ def _capture_selection_boxes(
             with _INPUT_LOCK:
                 window.set_focus()
                 time.sleep(0.2)
+                if fixed_window_rect is not None:
+                    _ensure_window_rect(window, fixed_window_rect)
                 keyboard.send_keys("^a")
                 time.sleep(wait)
+                if fixed_window_rect is not None:
+                    _ensure_window_rect(window, fixed_window_rect)
                 selected = _capture_control_region(window, active_control)
                 blocks = detect_selection_boxes(
                     active, selected, base=base, island_blocks=island_blocks,
@@ -1512,6 +1520,7 @@ def _capture_photos_fast_page(
         _ensure_window_rect(window, fixed_window_rect)
     selection_blocks, selected_frame, selection_error = _capture_selection_boxes(
         window, active_control, active, debug_dir, island_blocks=blocks, base=base,
+        fixed_window_rect=fixed_window_rect,
         box_delta=box_delta, box_tolerance=box_tolerance,
         box_area_ratio=box_area_ratio,
     )
@@ -2320,7 +2329,7 @@ def _page_display_rects(
     *,
     parallel: int = 3,
     margin: int = 24,
-    gap: int = 40,
+    gap: int = 32,
     min_width: int = 320,
     min_height: int = 240,
     max_per_row: int = 3,
@@ -2328,37 +2337,44 @@ def _page_display_rects(
     right_limit: int | None = None,
     row_gap_px: int | None = None,
     bottom_shift_up: int = 0,
-) -> tuple[dict[str, tuple[int, int, int, int]], int]:
-    """Window rects at ``scale`` percent of each page's size, tile-aligned.
+) -> tuple[dict[str, tuple[int, int, int, int]], int, float]:
+    """Window rects at up to ``scale`` percent of each page's size,
+    edge-aligned on the usable area.
 
     Every rect keeps its page's aspect ratio, so Photos fit-in-view renders
     the whole page at exactly ``scale`` percent (the image file itself is
     never resized -- resolution is unchanged; coordinates map back to the
-    original image through the existing fit transform).  Rects follow the
-    batch slot layout: each worker slot gets one position; slots fill rows
-    of ``max_per_row`` windows; every row spans the usable width (the
-    left window hugs the left edge, the right window hugs the right edge --
-    or ``right_limit`` when given, e.g. to keep the rightmost window clear
-    of an obstruction); the first row hugs the top, a second row hugs the
-    bottom, further rows spread evenly.  ``row_gap_px`` overrides the
-    per-column spacing with a fixed value (e.g. 20 keeps the rightmost
-    window further left than the spread layout would); ``bottom_shift_up``
-    lifts the last row that many pixels off the bottom edge.  Rows that
-    cannot fit on the screen (their heights plus the gaps exceed the usable
-    height, e.g. two 720px rows on a 1067px screen) are dropped until they
-    fit -- the zoom and the alignment stay unchanged, only fewer windows
-    run concurrently.  ``screen_bounds`` overrides the detected screen
-    (testing only).  Windows are re-pinned before every grab so overlap
-    cannot pollute screen grabs.
+    original image through the existing fit transform).  The requested
+    ``scale`` is an UPPER BOUND: when the rows cannot fit the usable area
+    (``screen_bounds`` region, clipped by ``right_limit``), the zoom shrinks
+    uniformly -- every window stays the same fraction of its page, so the
+    alignment stays intact -- down to a 12% floor.  Only when even the
+    floor cannot fit are rows dropped (fewer concurrent windows).
 
-    Returns ``({page_stem: rect}, effective_count)``.
+    The grid hugs the usable area's edges: the first row aligns to the top,
+    a second row aligns to the bottom, the leftmost window hugs the left
+    edge and the rightmost window hugs the right edge (``right_limit`` when
+    given); columns keep at least ``gap`` px between windows
+    (``row_gap_px`` fixes the column spacing instead of spreading).
+    ``bottom_shift_up`` lifts the last row that many pixels off the bottom
+    edge.  Rects never overlap and never cross the right limit or the
+    bottom edge.  Windows are re-pinned before every grab so overlap cannot
+    pollute screen grabs.
+
+    Returns ``({page_stem: rect}, effective_count, effective_fraction)``.
     """
     vx, vy, vw, vh = (
         screen_bounds if screen_bounds is not None else _virtual_screen_bounds()
     )
     right = min(vx + vw, right_limit) if right_limit else vx + vw
-    fraction = max(1, int(scale)) / 100.0
-    sizes: dict[str, tuple[int, int]] = {}
+    base_fraction = max(1, int(scale)) / 100.0
+    floor_fraction = 0.12
+    requested = max(1, int(parallel))
+    cols = max(1, int(max_per_row))
+    usable_h = vh - 2 * margin
+    usable_w = (right - vx) - 2 * margin
+
+    page_sizes: dict[str, tuple[int, int]] = {}
     for path in image_paths:
         try:
             with Image.open(path) as image:
@@ -2367,41 +2383,90 @@ def _page_display_rects(
             width = height = 0
         if width <= 0 or height <= 0:
             continue
-        win_w = max(min_width, min(right - vx - 2 * margin, int(round(width * fraction))))
-        win_h = max(min_height, min(vh - 2 * margin, int(round(height * fraction))))
-        sizes[path.stem] = (win_w, win_h)
-    if not sizes:
-        return {}, 0
-    keys = list(sizes.keys())
-    cols = max(1, int(max_per_row))
-    requested = max(1, int(parallel))
-    usable_h = vh - 2 * margin
+        page_sizes[path.stem] = (width, height)
+    if not page_sizes:
+        return {}, 0, base_fraction
+    keys = list(page_sizes.keys())
 
     def _slot_of(count: int) -> dict[str, int]:
         return {key: index % count for index, key in enumerate(keys)}
 
-    def _row_heights(count: int, row_count: int) -> list[int]:
-        slots = _slot_of(count)
-        return [
-            max(
-                (sizes[key][1] for key in keys if slots[key] // cols == row),
-                default=min_height,
-            )
-            for row in range(row_count)
-        ]
+    def _win_dims(key: str, fraction: float) -> tuple[int, int]:
+        width, height = page_sizes[key]
+        return (
+            max(min_width, min(usable_w, int(round(width * fraction)))),
+            max(min_height, min(usable_h, int(round(height * fraction)))),
+        )
 
-    # Drop rows until they physically fit on the screen (same zoom, same
-    # alignment; fewer concurrent windows instead of overlapping ones).
-    row_count = (requested + cols - 1) // cols
-    while row_count > 1:
-        candidate = min(requested, row_count * cols)
-        heights = _row_heights(candidate, row_count)
-        if sum(heights) + gap * (row_count - 1) <= usable_h:
+    def _rows_fit(fraction: float, count: int, row_count: int) -> bool:
+        """True when every row fits vertically and horizontally in the
+        usable area (with the real minimum column gap)."""
+        slot_of = _slot_of(count)
+        row_w = [min_width] * row_count
+        row_h = [min_height] * row_count
+        for key in keys:
+            row = slot_of[key] // cols
+            if row >= row_count:
+                continue
+            w, h = _win_dims(key, fraction)
+            row_w[row] = max(row_w[row], w)
+            row_h[row] = max(row_h[row], h)
+        if sum(row_h) + gap * (row_count - 1) > usable_h:
+            return False
+        col_gap = max(1, int(row_gap_px)) if row_gap_px is not None else max(1, gap)
+        for row in range(row_count):
+            n = min(cols, count - row * cols)
+            if n <= 0:
+                continue
+            if row_w[row] * n + col_gap * (n - 1) > usable_w:
+                return False
+        return True
+
+    row_count_full = (requested + cols - 1) // cols
+    count = min(requested, row_count_full * cols)
+    row_count = row_count_full
+    fraction = base_fraction
+    if not _rows_fit(base_fraction, count, row_count):
+        # Auto-fit: shrink the zoom (down to the floor) until every
+        # requested window fits; only then drop rows (fewer windows).
+        best = None
+        for rc in range(row_count_full, 0, -1):
+            candidate = min(requested, rc * cols)
+            if not _rows_fit(floor_fraction, candidate, rc):
+                continue
+            lo, hi = floor_fraction, base_fraction
+            if _rows_fit(hi, candidate, rc):
+                best = (hi, candidate, rc)
+            else:
+                for _ in range(24):
+                    mid = (lo + hi) / 2.0
+                    if _rows_fit(mid, candidate, rc):
+                        lo = mid
+                    else:
+                        hi = mid
+                best = (lo, candidate, rc)
             break
-        row_count -= 1
-    count = min(requested, row_count * cols)
+        if best is None:
+            # Degenerate: not even one row of ``cols`` windows fits at the
+            # floor (extreme aspect ratio) -- narrow the row to fit.
+            row_w_floor = max(
+                (_win_dims(key, floor_fraction)[0] for key in keys),
+                default=min_width,
+            )
+            n = cols
+            while n > 1 and row_w_floor * n + gap * (n - 1) > usable_w:
+                n -= 1
+            best = (floor_fraction, n, 1)
+        fraction, count, row_count = best
+
     slot_of = _slot_of(count)
-    row_heights = _row_heights(count, row_count)
+    row_heights = [
+        max(
+            (_win_dims(key, fraction)[1] for key in keys if slot_of[key] // cols == row),
+            default=min_height,
+        )
+        for row in range(row_count)
+    ]
 
     # Vertical distribution: the first row hugs the top, a second row hugs
     # the bottom (lifted by ``bottom_shift_up`` when given), further rows
@@ -2422,17 +2487,17 @@ def _page_display_rects(
             cursor += height + pitch
 
     rects: dict[str, tuple[int, int, int, int]] = {}
-    usable_w = (right - vx) - 2 * margin
     for row in range(row_count):
         in_row = [key for key in keys if slot_of[key] // cols == row]
         if not in_row:
             continue
         # Uniform spacing from the row's widest window so the row spans the
-        # full width (manga books have uniform page sizes).  The row holds
-        # at most ``cols`` slots -- the page count in the row may be larger.
-        # ``row_gap_px`` fixes the column spacing instead of spreading the
-        # row across the usable width (keeps the rightmost window inset).
-        row_w = max((sizes[key][0] for key in in_row), default=min_width)
+        # full usable width: the left window hugs the left edge, the right
+        # window hugs the right edge.  The row holds at most ``cols``
+        # slots -- the page count in the row may be larger.  ``row_gap_px``
+        # fixes the column spacing instead of spreading the row (keeps the
+        # rightmost window inset).
+        row_w = max((_win_dims(key, fraction)[0] for key in in_row), default=min_width)
         n = min(cols, count - row * cols)
         total_w = row_w * n
         spread = usable_w - total_w
@@ -2447,10 +2512,10 @@ def _page_display_rects(
             x += row_w + row_gap
         y = row_tops[row]
         for key in in_row:
-            win_w, win_h = sizes[key]
+            win_w, win_h = _win_dims(key, fraction)
             slot_x = xs[slot_of[key] % cols]
             rects[key] = (slot_x, y, slot_x + win_w, y + win_h)
-    return rects, count
+    return rects, count, fraction
 
 
 def _tile_rects(
@@ -2737,6 +2802,9 @@ def _capture_one_page(
             },
             None,
         )
+    # User declined the manga fallback: the page is NOT processed downstream
+    # until they review it and confirm (hard rule, same gate as the
+    # no-blue-pixels case) -- ``selection_review_required`` blocks stage2.
     failure = {
         "schema_version": 2,
         "backend": "Windows Photos Scan Text",
@@ -2745,6 +2813,7 @@ def _capture_one_page(
             "complete": False,
             "error": last_error,
             "attempts": attempts,
+            "selection_review_required": True,
             "display_scale": display_scale,
         },
     }
@@ -2755,6 +2824,7 @@ def _capture_one_page(
             "status": "failed",
             "error": last_error,
             "attempts": attempts,
+            "selection_review_required": True,
             "manifest": str(manifest_path),
         },
         None,
@@ -2820,6 +2890,7 @@ def capture_photos_fast_batch(
     lock = threading.Lock()
     requested = max(1, int(parallel))
     count = requested
+    effective_scale = display_scale
     scale_rects = None
     if display_scale != 100:
         region_bounds = None
@@ -2833,7 +2904,7 @@ def capture_photos_fast_batch(
                 raise ValueError(
                     f"invalid --layout-region {layout_region!r} (expected WxH, e.g. 2400x1400)"
                 ) from None
-        scale_rects, count = _page_display_rects(
+        scale_rects, count, scale_fraction = _page_display_rects(
             image_paths,
             display_scale,
             parallel=requested,
@@ -2842,11 +2913,17 @@ def capture_photos_fast_batch(
             bottom_shift_up=bottom_shift_up,
             screen_bounds=region_bounds,
         )
+        effective_scale = round(scale_fraction * 100)
     tiles = (
         _tile_rects(parallel)
         if (fixed_window or parallel > 1) and scale_rects is None
         else None
     )
+    if scale_rects is not None:
+        print(
+            f"layout: {count} concurrent windows at {effective_scale}% "
+            f"(requested {display_scale}%)"
+        )
 
     def _work(paths: list[Path], slot: int) -> None:
         for image_path in paths:
@@ -2873,8 +2950,7 @@ def capture_photos_fast_batch(
                 if seconds is not None:
                     foreground_totals.append(seconds)
 
-    count = max(1, int(parallel))
-    count = max(1, int(parallel))
+    count = max(1, int(count))
     if count > 1:
         chunks = [image_paths[index::count] for index in range(count)]
         threads = [
@@ -2921,6 +2997,7 @@ def capture_photos_fast_batch(
         "parallel": requested,
         "effective_parallel": count,
         "display_scale": display_scale,
+        "effective_display_scale": effective_scale,
         "foreground": foreground,
         "pages": results,
         "no_blue_boxes": no_blue_boxes,
