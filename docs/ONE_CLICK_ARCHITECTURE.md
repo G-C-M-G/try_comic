@@ -49,8 +49,10 @@ Photos 并行窗口 (上3下3, 行距=窗口高150%)
   OCR 控件/蒙版）→ 标记 `no_text`；两者 stage2 均跳过
 - **蓝框检测双路径**（`detect_selection_boxes`，详见 `BLUEBOX_CAPTURE.md`）：
   1. **严格公式优先**（有 base 帧）：`selected == keep×base + (0,38,67)`，
-     keep=174/255，容差 12 + paint-delta>2 守卫（排除页面固有纯蓝）
-  2. **delta 兜底**：`|selected - photos_ocr|` 任一 RGB 通道 > 8
+     keep=174/255，容差 5 + paint-delta>2 守卫（排除页面固有纯蓝）
+  2. **蓝色像素门槛 + delta 兜底**：全选帧存在蓝色蒙版像素（B-R>30）时，
+     `|selected - photos_ocr|` 任一 RGB 通道 > 8 出框；**全选帧完全无蓝色
+     像素 → 判定无框，页进入人工审核**（delta 不会把两帧差异误检成框）
 - 整页大框过滤：连通域面积 > 帧 20% 的整页选中框**直接丢弃**（非原子文字框）
 - **硬规则（人工审核门）**：三次 Ctrl+A 仍无蓝色像素 → `selection_review_required: true`，
   该页不进 stage2；stage1/2 提示待审核，`--confirm-no-boxes <页>` 确认无框后才可关闭

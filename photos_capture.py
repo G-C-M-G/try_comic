@@ -191,6 +191,66 @@ def _launch_photos(path: str) -> None:
     subprocess.Popen(["explorer.exe", absolute_path], close_fds=True)
 
 
+def _ensure_review_image(page_dir: Path, image_path) -> None:
+    """Guarantee a reviewable image for failed pages.
+
+    The base/ocr frames are only saved after ``_prepare_overlay`` succeeds,
+    so a failed page (no-text / exception) would leave the review gate with
+    NOTHING to look at.  Copy the ORIGINAL page as ``photos_base.png`` when
+    the frame files are missing.
+    """
+    base_path = Path(page_dir) / "photos_base.png"
+    if base_path.is_file():
+        return
+    source = Path(image_path)
+    if source.is_file():
+        try:
+            import shutil
+
+            shutil.copyfile(source, base_path)
+        except OSError:
+            pass
+
+
+def _close_window_wait(window, timeout: float = 2.5) -> None:
+    """Close a Photos window and WAIT until it is really gone.
+
+    A closed-but-not-yet-destroyed window can be picked up by the next
+    page's ``_open_photos`` title scan, which then waits on a dying window
+    and fails -- making parallel capture appear to stop opening windows.
+    Falls back to WM_CLOSE (twice) so a Photos dialog cannot pin the
+    window open.
+    """
+    if window is None:
+        return
+    try:
+        window.close()
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        handle = int(window.handle)
+        user32 = ctypes.windll.user32
+        deadline = time.monotonic() + timeout
+        sent = 0
+        while time.monotonic() < deadline:
+            try:
+                if not user32.IsWindow(handle):
+                    return
+            except Exception:
+                return
+            if sent == 0 and time.monotonic() > deadline - 1.2:
+                user32.PostMessageW(handle, 0x0010, 0, 0)  # WM_CLOSE
+                sent = 1
+            elif sent == 1 and time.monotonic() > deadline - 0.5:
+                user32.PostMessageW(handle, 0x0010, 0, 0)
+                sent = 2
+            time.sleep(0.2)
+    except Exception:
+        pass
+
+
 def _open_photos(path: str, timeout: float):
     title = os.path.basename(path)
     existing = None
@@ -198,6 +258,16 @@ def _open_photos(path: str, timeout: float):
         existing = _wait_for_window(title, 0.2)
     except RuntimeError:
         pass
+    if existing is not None:
+        # A window with the same title is a leftover from THIS page's
+        # previous attempt (each page gets a fresh window).  Reusing it
+        # risks showing a stale/mismatched image (parallel drift) and a
+        # half-closed window.  Close it for real, then open fresh.
+        try:
+            _close_window_wait(existing)
+        except Exception:
+            pass
+        existing = None
     if existing is None:
         _launch_photos(path)
     window = _wait_for_window(title, timeout)
@@ -429,6 +499,11 @@ BLUE_OVERLAY_PAINT_DELTA = 2.0
 # dropped (not an atomic text box).
 WHOLE_PAGE_AREA_RATIO = 0.20
 
+# Blue-overlay gate: the all-selected frame must contain at least one
+# pixel with B well above R, otherwise Ctrl+A rendered nothing and the
+# delta fallback must not fabricate boxes (page goes to review instead).
+_BLUE_GATE_BR = 30
+
 
 def blue_overlay_image(base: np.ndarray) -> np.ndarray:
     """Expected all-selected frame under Photos' blue selection overlay.
@@ -495,6 +570,14 @@ def detect_selection_boxes(
             return sorted(values, key=lambda item: (item.y, -item.x))
     active_f = active.astype(np.int16)
     selected_f = selected.astype(np.int16)
+    # Blue-overlay gate: the all-selected frame must actually contain blue
+    # overlay pixels (B well above R).  A page whose selected frame has NO
+    # blue at all means Ctrl+A rendered nothing -- the delta fallback would
+    # only fabricate boxes from unrelated frame differences (e.g. the gray
+    # scan-text mask toggling).  Such a page reports no boxes and goes to
+    # the review gate instead of being silently "captured".
+    if int((selected_f[..., 2] - selected_f[..., 0] > _BLUE_GATE_BR).sum()) == 0:
+        return []
     changed = (np.abs(selected_f - active_f) > delta_min).any(axis=2)
     mask = cv2.morphologyEx(
         changed.astype(np.uint8) * 255,
@@ -1462,99 +1545,446 @@ def _capture_photos_fast_page(
     box_tolerance: float = 5.0,
     box_area_ratio: float = 0.20,
 ) -> tuple[dict, object]:
-    """One fast-mask page capture; returns ``(manifest, window)`` for reuse.
+    try:
+        """One fast-mask page capture; returns ``(manifest, window)`` for reuse.
 
-    ``frames_only`` captures only the three frames (base / overlay /
-    all-selected) plus the blue selection boxes and returns immediately --
-    no masked OCR, no column pass, no clipboard work.  All recognition
-    happens later in a background batch, so the Photos window is held open
-    for the shortest possible time.
-    """
-    timings: dict[str, float] = {}
+        ``frames_only`` captures only the three frames (base / overlay /
+        all-selected) plus the blue selection boxes and returns immediately --
+        no masked OCR, no column pass, no clipboard work.  All recognition
+        happens later in a background batch, so the Photos window is held open
+        for the shortest possible time.
+        """
+        timings: dict[str, float] = {}
 
-    def _tick(name: str) -> None:
-        timings[name] = round(time.monotonic() - start, 2)
+        def _tick(name: str) -> None:
+            timings[name] = round(time.monotonic() - start, 2)
 
-    start = time.monotonic()
-    foreground_started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    source = os.path.abspath(path)
-    image = Image.open(source).convert("RGB")
-    image_arr = np.array(image)
-    opened_window = window is None
-    open_start = time.monotonic()
-    if window is None:
-        window = _open_photos(source, timeout)
-        _tick("open_photos")
-        photos_wait_open = timings["open_photos"]
-    else:
-        _launch_photos(source)
-        target_small = _thumbnail(image_arr)
-        deadline = time.monotonic() + timeout
-        base_ready = False
-        while time.monotonic() < deadline:
+        start = time.monotonic()
+        foreground_started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        source = os.path.abspath(path)
+        image = Image.open(source).convert("RGB")
+        image_arr = np.array(image)
+        opened_window = window is None
+        open_start = time.monotonic()
+        if window is None:
+            window = _open_photos(source, timeout)
+            _tick("open_photos")
+            photos_wait_open = timings["open_photos"]
+        else:
+            _launch_photos(source)
+            target_small = _thumbnail(image_arr)
+            deadline = time.monotonic() + timeout
+            base_ready = False
+            while time.monotonic() < deadline:
+                try:
+                    fresh = _get_control(window, "D2DImageControl", 0.6)
+                    probe = _capture(fresh)
+                    if probe is not None and _display_matches(target_small, probe):
+                        base_ready = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.15)
+            if not base_ready:
+                raise RuntimeError(f"Photos window did not become available: {source}")
+            photos_wait_open = round(time.monotonic() - open_start, 2)
+        if fixed_window_rect is not None:
+            _fix_window(window, fixed_window_rect)
+        base, active, blocks, active_control = _prepare_overlay(
+            window, timeout, screen_capture=True,
+            fixed_window_rect=fixed_window_rect,
+        )
+        _tick("overlay")
+        timings["photos_wait_seconds"] = round(photos_wait_open + timings["overlay"], 2)
+        viewport = (active.shape[1], active.shape[0])
+        if not _display_matches(_thumbnail(image_arr), base):
+            raise RuntimeError(f"Photos displayed a different image than requested: {source}")
+
+        if fixed_window_rect is not None:
+            _ensure_window_rect(window, fixed_window_rect)
+        selection_blocks, selected_frame, selection_error = _capture_selection_boxes(
+            window, active_control, active, debug_dir, island_blocks=blocks, base=base,
+            fixed_window_rect=fixed_window_rect,
+            box_delta=box_delta, box_tolerance=box_tolerance,
+            box_area_ratio=box_area_ratio,
+        )
+        _tick("selection_boxes")
+        selection_boxes_status = (
+            "ok" if not selection_error else f"failed: {selection_error}"
+        )
+        selection_missing = bool(selection_error)
+        # Hard rule: three Ctrl+A attempts produced no blue overlay pixels --
+        # the page must be reviewed by the user before it can be closed.
+        # ``selection_review_required`` gates the page out of downstream
+        # processing until the user confirms the page genuinely has no boxes.
+        selection_review_required = bool(selection_error)
+        if selection_error:
+            selection_blocks = []
+
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            Image.fromarray(base).save(os.path.join(debug_dir, "photos_base.png"))
+            Image.fromarray(active).save(os.path.join(debug_dir, "photos_ocr.png"))
+
+        screenshot_path = None
+        if screenshot:
+            screenshot_path = os.path.abspath(screenshot)
+            os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
+            Image.fromarray(active).save(screenshot_path)
+
+        if frames_only:
+            # Publish the frames + blue boxes and stop: no masked OCR, no
+            # column pass.  Recognition runs later in a background batch.
+            timings["total"] = round(time.monotonic() - start, 2)
+            timings["foreground_started_at"] = foreground_started_at
+            timings["foreground_ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            timings["foreground_active_seconds"] = timings["total"]
+            manifest = {
+                "schema_version": 2,
+                "backend": "Windows Photos Scan Text",
+                "source": {"path": source, "width": image.width, "height": image.height},
+                "capture": {
+                    "app": "Windows Photos",
+                    "automation_control": "OcrControl",
+                    "viewport_size": viewport,
+                    "method": "frames-only",
+                    "frames_only": True,
+                    "display_scale": display_scale,
+                    "screenshot": screenshot_path,
+                    "timing": timings,
+                    "island_count": len(blocks),
+                    "selection_boxes_status": selection_boxes_status,
+                    "selection_missing": selection_missing,
+                    "selection_review_required": selection_review_required,
+                    "selection_blocks": [
+                        {
+                            "id": f"sel_{index:03d}",
+                            "display_bbox": [
+                                block.x, block.y,
+                                block.x + block.width, block.y + block.height,
+                            ],
+                            "image_bbox": _display_bbox_to_image(
+                                [block.x, block.y, block.x + block.width, block.y + block.height],
+                                viewport,
+                                image.size,
+                            ),
+                            "page_scale": block.page_scale,
+                        }
+                        for index, block in enumerate(selection_blocks, 1)
+                    ],
+                    "selection_groups": [
+                        {
+                            "id": f"selg_{index:03d}",
+                            "display_bbox": list(bbox),
+                            "image_bbox": _display_bbox_to_image(
+                                bbox, viewport, image.size
+                            ),
+                            "members": [
+                                f"sel_{selection_blocks.index(member) + 1:03d}"
+                                for member in members
+                            ],
+                        }
+                        for index, (bbox, members) in enumerate(
+                            aggregate_selection_boxes(selection_blocks), 1
+                        )
+                    ],
+                    "complete": True,
+                },
+                "columns": [],
+            }
+            if opened_window:
+                _close_window_wait(window)
+                window = None
+            return manifest, window
+
+        viewport_area = active.shape[0] * active.shape[1]
+        page_scale_blocks = [
+            block
+            for block in blocks
+            if block.width * block.height >= 0.35 * viewport_area
+        ]
+        tiny_blocks = [
+            block
+            for block in blocks
+            if block not in page_scale_blocks
+            and (block.width < 10 or block.height < 12)
+        ]
+        normal_blocks = [
+            block
+            for block in blocks
+            if block not in page_scale_blocks and block not in tiny_blocks
+        ]
+        if keep_sfx:
+            # Tiny islands are usually furigana or SFX.  Keep them as SFX columns
+            # so onomatopoeia is translated instead of being silently dropped.
+            normal_blocks = normal_blocks + tiny_blocks
+
+        islands = [
+            _display_bbox_to_image(
+                [block.x, block.y, block.x + block.width, block.y + block.height],
+                viewport,
+                image.size,
+            )
+            for block in blocks
+        ]
+        tiny_islands = [
+            _display_bbox_to_image(
+                [block.x, block.y, block.x + block.width, block.y + block.height],
+                viewport,
+                image.size,
+            )
+            for block in tiny_blocks
+        ]
+
+        masked = _build_island_mask(image_arr, islands)
+        if debug_dir:
+            Image.fromarray(masked).save(os.path.join(debug_dir, "photos_masked_ocr.png"))
+            # Publish the blackened preview as soon as the islands are known so it
+            # does not wait for PaddleOCR and the column pass.
+            display_islands = [
+                _display_bbox_to_image(
+                    [block.x, block.y, block.x + block.width, block.y + block.height],
+                    viewport,
+                    image.size,
+                )
+                for block in blocks
+                if block not in page_scale_blocks
+            ]
+            Image.fromarray(_build_island_mask(image_arr, display_islands)).save(
+                os.path.join(debug_dir, "photos_masked.png")
+            )
+        # OCR runs in the background: keep Photos out of the foreground.
+        try:
+            window.minimize()
+        except Exception:
+            pass
+        ocr_engine = "paddle"
+        with tempfile.TemporaryDirectory(prefix="photos_fast_") as temporary:
+            masked_path = os.path.join(temporary, "masked.png")
+            Image.fromarray(masked).save(masked_path)
+            if paddle is not None:
+                predictions = paddle.whole_page(masked_path)
+            else:
+                # Windows.Media.Ocr (ja) is the primary island reader: fast and
+                # no extra runtime.  PaddleOCR takes over only when the engine is
+                # unavailable or reads nothing (e.g. stylized SFX pages).
+                predictions = windows_ocr_predictions(masked_path)
+                if predictions:
+                    ocr_engine = "windows-ocr"
+                else:
+                    predictions = _run_paddle_whole_page(masked_path, paddle_device)
+        _tick("paddle_masked")
+
+        def _island_polys(prediction_list, island_bbox) -> list[dict]:
+            x1, y1, x2, y2 = island_bbox
+            hits = []
+            for prediction in prediction_list:
+                points = np.asarray(
+                    prediction.get("polygon") or [], dtype=np.float64
+                ).reshape(-1, 2)
+                if points.size == 0:
+                    continue
+                cx, cy = points.mean(axis=0)
+                if x1 - 2 <= cx <= x2 + 2 and y1 - 2 <= cy <= y2 + 2:
+                    hits.append(prediction)
+            return hits
+
+        columns = []
+        for block in normal_blocks:
+            block_index = blocks.index(block)
+            island_bbox = _display_bbox_to_image(
+                [block.x, block.y, block.x + block.width, block.y + block.height],
+                viewport,
+                image.size,
+            )
+            sfx = keep_sfx and block in tiny_blocks
+            # Photos box granularity varies between runs (one line per box or a
+            # whole region per box), so OCR polygons define the columns inside an
+            # island.  Bands not covered by any OCR-derived column are still added
+            # so text the OCR engine missed (e.g. one line of a multi-line box)
+            # can be recovered by the crop-retry / Photos copy chain.
+            derived = _group_paddle_columns(
+                _island_polys(predictions, island_bbox), [], image.size,
+                f"{ocr_engine}-masked",
+            )
+            covered: list[list[int]] = []
+            for column in derived:
+                column["overlay_block"] = block_index
+                if sfx:
+                    column["role"] = "sfx"
+                covered.append(
+                    _image_bbox_to_display(column["image_bbox"], viewport, image.size)
+                )
+                columns.append(column)
+            for band in _split_column_bands(active, block):
+                bx1, by1, bx2, by2 = band
+                cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
+                if any(
+                    dx1 - 3 <= cx <= dx2 + 3 and dy1 - 3 <= cy <= dy2 + 3
+                    for dx1, dy1, dx2, dy2 in covered
+                ):
+                    continue
+                image_bbox = _display_bbox_to_image(band, viewport, image.size)
+                columns.append({
+                    "id": "",
+                    "text": "",
+                    "paddle_text": "",
+                    "paddle_confidence": None,
+                    "text_source": "",
+                    "needs_review": False,
+                    "display_bbox": band,
+                    "image_bbox": image_bbox,
+                    "selection_order": len(columns),
+                    "direction": (
+                        "vertical"
+                        if (image_bbox[3] - image_bbox[1]) >= (image_bbox[2] - image_bbox[0])
+                        else "horizontal"
+                    ),
+                    "role": "sfx" if sfx else "text",
+                    "overlay_block": block_index,
+                })
+
+        if page_scale_blocks:
+            # The page-scale island's interior is the whole page: Photos gave no
+            # column geometry, so Paddle polygons supply it. Polygons already
+            # claimed by normal/SFX islands are excluded.
+            block_index = blocks.index(page_scale_blocks[0])
+            excluded = [
+                {
+                    "image_bbox": _display_bbox_to_image(
+                        [block.x, block.y, block.x + block.width, block.y + block.height],
+                        viewport,
+                        image.size,
+                    )
+                }
+                for block in normal_blocks
+            ]
+            for column in _group_paddle_columns(
+                predictions, excluded, image.size, f"{ocr_engine}-masked"
+            ):
+                column["overlay_block"] = block_index
+                columns.append(column)
+
+        for column in columns:
+            if column.get("paddle_confidence") is None:
+                _assign_paddle_predictions(column, predictions)
+                _finalize_paddle_column(column, f"{ocr_engine}-masked")
+
+        columns = _split_columns_by_vertical_gaps(image_arr, columns)
+        for column in columns:
+            if column.get("paddle_confidence") is None:
+                _assign_paddle_predictions(column, predictions)
+                _finalize_paddle_column(column, f"{ocr_engine}-masked")
+
+        _retry_columns_with_crops(source, columns, paddle_device, paddle)
+        _tick("retry_crops")
+
+        input_control_start = time.monotonic()
+        needs_fallback = (
+            [column for column in columns if not column["text"]] if not skip_fallback else []
+        )
+        if needs_fallback:
+            # Re-fetch only when clicks are actually needed: Photos UIA can block
+            # for many seconds while the window is busy re-rendering, and without
+            # mouse activity the prepared control wrapper stays valid.
             try:
-                fresh = _get_control(window, "D2DImageControl", 0.6)
-                probe = _capture(fresh)
-                if probe is not None and _display_matches(target_small, probe):
-                    base_ready = True
-                    break
+                window.restore()
+                window.set_focus()
             except Exception:
                 pass
-            time.sleep(0.15)
-        if not base_ready:
-            raise RuntimeError(f"Photos window did not become available: {source}")
-        photos_wait_open = round(time.monotonic() - open_start, 2)
-    if fixed_window_rect is not None:
-        _fix_window(window, fixed_window_rect)
-    base, active, blocks, active_control = _prepare_overlay(
-        window, timeout, screen_capture=True,
-        fixed_window_rect=fixed_window_rect,
-    )
-    _tick("overlay")
-    timings["photos_wait_seconds"] = round(photos_wait_open + timings["overlay"], 2)
-    viewport = (active.shape[1], active.shape[0])
-    if not _display_matches(_thumbnail(image_arr), base):
-        raise RuntimeError(f"Photos displayed a different image than requested: {source}")
+            active_control = _get_control(window, "OcrControl", min(timeout, 5))
+            for column in needs_fallback:
+                _photos_fallback_copy(active_control, column, viewport, image.size)
+            try:
+                window.minimize()
+            except Exception:
+                pass
+        _tick("fallback")
 
-    if fixed_window_rect is not None:
-        _ensure_window_rect(window, fixed_window_rect)
-    selection_blocks, selected_frame, selection_error = _capture_selection_boxes(
-        window, active_control, active, debug_dir, island_blocks=blocks, base=base,
-        fixed_window_rect=fixed_window_rect,
-        box_delta=box_delta, box_tolerance=box_tolerance,
-        box_area_ratio=box_area_ratio,
-    )
-    _tick("selection_boxes")
-    selection_boxes_status = (
-        "ok" if not selection_error else f"failed: {selection_error}"
-    )
-    selection_missing = bool(selection_error)
-    # Hard rule: three Ctrl+A attempts produced no blue overlay pixels --
-    # the page must be reviewed by the user before it can be closed.
-    # ``selection_review_required`` gates the page out of downstream
-    # processing until the user confirms the page genuinely has no boxes.
-    selection_review_required = bool(selection_error)
-    if selection_error:
-        selection_blocks = []
+        inventory: list[str] = []
+        inventory_error = None
+        try:
+            try:
+                window.restore()
+                window.set_focus()
+            except Exception:
+                pass
+            if needs_fallback:
+                active_control = _get_control(window, "OcrControl", min(timeout, 5))
+            inventory = _inventory_text(active_control, blocks[0])
+        except Exception as error:
+            inventory_error = str(error)
+        _tick("inventory")
+        timings["input_control_seconds"] = round(time.monotonic() - input_control_start, 2)
+        columns.sort(key=lambda item: (item["image_bbox"][1], -item["image_bbox"][2]))
+        for index, column in enumerate(columns, 1):
+            column["id"] = f"column_{index:03d}"
+            column["selection_order"] = index - 1
 
-    if debug_dir:
-        os.makedirs(debug_dir, exist_ok=True)
-        Image.fromarray(base).save(os.path.join(debug_dir, "photos_base.png"))
-        Image.fromarray(active).save(os.path.join(debug_dir, "photos_ocr.png"))
-
-    screenshot_path = None
-    if screenshot:
-        screenshot_path = os.path.abspath(screenshot)
-        os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
-        Image.fromarray(active).save(screenshot_path)
-
-    if frames_only:
-        # Publish the frames + blue boxes and stop: no masked OCR, no
-        # column pass.  Recognition runs later in a background batch.
+        empty = [column for column in columns if not column["text"]]
+        dropped_noise = []
+        if keep_sfx:
+            # Onomatopoeia and furigana boxes that neither engine could read are
+            # retained as SFX columns instead of being dropped; empty text renders
+            # nothing downstream but the geometry stays auditable.
+            for column in empty:
+                column["role"] = "sfx"
+                column["text"] = column.get("paddle_text") or ""
+                column["text_source"] = column.get("text_source") or "sfx-kept"
+                column["needs_review"] = True
+        else:
+            for column in empty:
+                # A confident, acceptable OCR reading that Photos refused to copy
+                # is a genuine capture problem.  An empty or unacceptable box (noise
+                # such as bubble tails, digits or dashed art) that Photos also cannot
+                # select is dropped with an audit record instead of failing the page.
+                if _text_acceptable(
+                    column.get("paddle_text") or "",
+                    column.get("paddle_confidence"),
+                ):
+                    raise RuntimeError(
+                        f"Photos fast capture could not copy text for {column['id']} "
+                        f"({column['image_bbox']}) even though the OCR engine read "
+                        f"{column['paddle_text']!r}"
+                    )
+                dropped_noise.append({
+                    "id": column["id"],
+                    "image_bbox": column["image_bbox"],
+                    "paddle_text": column.get("paddle_text") or "",
+                    "paddle_confidence": column.get("paddle_confidence"),
+                })
+            if dropped_noise:
+                columns = [column for column in columns if column["text"]]
+                for index, column in enumerate(columns, 1):
+                    column["id"] = f"column_{index:03d}"
+                    column["selection_order"] = index - 1
         timings["total"] = round(time.monotonic() - start, 2)
         timings["foreground_started_at"] = foreground_started_at
         timings["foreground_ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         timings["foreground_active_seconds"] = timings["total"]
+        if debug_dir:
+            # The blackened preview was already published right after island
+            # detection.  Only a page-scale island needs the column-based update
+            # because Photos highlighted the whole page there.
+            if page_scale_blocks:
+                display_islands = [
+                    _display_bbox_to_image(
+                        [block.x, block.y, block.x + block.width, block.y + block.height],
+                        viewport,
+                        image.size,
+                    )
+                    for block in blocks
+                    if block not in page_scale_blocks
+                ]
+                for column in columns:
+                    display_islands.append(
+                        _tight_ink_bbox(image_arr, column["image_bbox"], pad=6)
+                    )
+                Image.fromarray(_build_island_mask(image_arr, display_islands)).save(
+                    os.path.join(debug_dir, "photos_masked.png")
+                )
+            with open(os.path.join(debug_dir, "timing.json"), "w", encoding="utf-8") as handle:
+                json.dump(timings, handle, ensure_ascii=False, indent=2)
         manifest = {
             "schema_version": 2,
             "backend": "Windows Photos Scan Text",
@@ -1563,22 +1993,21 @@ def _capture_photos_fast_page(
                 "app": "Windows Photos",
                 "automation_control": "OcrControl",
                 "viewport_size": viewport,
-                "method": "frames-only",
-                "frames_only": True,
+                "method": "fast-mask",
                 "display_scale": display_scale,
                 "screenshot": screenshot_path,
                 "timing": timings,
+                "inventory": inventory,
+                "inventory_error": inventory_error,
+                "inventory_count": len(inventory),
                 "island_count": len(blocks),
+                "page_scale_islands": len(page_scale_blocks),
                 "selection_boxes_status": selection_boxes_status,
-                "selection_missing": selection_missing,
-                "selection_review_required": selection_review_required,
+                    "selection_missing": selection_missing,
                 "selection_blocks": [
                     {
                         "id": f"sel_{index:03d}",
-                        "display_bbox": [
-                            block.x, block.y,
-                            block.x + block.width, block.y + block.height,
-                        ],
+                        "display_bbox": [block.x, block.y, block.x + block.width, block.y + block.height],
                         "image_bbox": _display_bbox_to_image(
                             [block.x, block.y, block.x + block.width, block.y + block.height],
                             viewport,
@@ -1592,9 +2021,7 @@ def _capture_photos_fast_page(
                     {
                         "id": f"selg_{index:03d}",
                         "display_bbox": list(bbox),
-                        "image_bbox": _display_bbox_to_image(
-                            bbox, viewport, image.size
-                        ),
+                        "image_bbox": _display_bbox_to_image(bbox, viewport, image.size),
                         "members": [
                             f"sel_{selection_blocks.index(member) + 1:03d}"
                             for member in members
@@ -1604,383 +2031,40 @@ def _capture_photos_fast_page(
                         aggregate_selection_boxes(selection_blocks), 1
                     )
                 ],
+                "ignored_tiny_islands": tiny_islands if not keep_sfx else [],
+                "dropped_noise_columns": dropped_noise,
+                "sfx_columns": sum(column["role"] == "sfx" for column in columns),
+                "column_count": len(columns),
+                "ocr_engine": ocr_engine,
+                "masked_columns": sum(
+                    column["text_source"] in {"paddle-masked", "windows-ocr-masked"}
+                    for column in columns
+                ),
+                "retry_columns": sum(
+                    column["text_source"] in {"paddle-retry", "windows-ocr-retry"}
+                    for column in columns
+                ),
+                "fallback_columns": sum(
+                    column["text_source"] == "photos-fallback" for column in columns
+                ),
                 "complete": True,
             },
-            "columns": [],
+            "columns": columns,
         }
+        # Do not leave Photos hanging in the foreground: a window opened by this
+        # call is closed; a reused window (batch) stays minimized.
         if opened_window:
-            try:
-                window.close()
-            except Exception:
-                pass
+            _close_window_wait(window)
             window = None
         return manifest, window
 
-    viewport_area = active.shape[0] * active.shape[1]
-    page_scale_blocks = [
-        block
-        for block in blocks
-        if block.width * block.height >= 0.35 * viewport_area
-    ]
-    tiny_blocks = [
-        block
-        for block in blocks
-        if block not in page_scale_blocks
-        and (block.width < 10 or block.height < 12)
-    ]
-    normal_blocks = [
-        block
-        for block in blocks
-        if block not in page_scale_blocks and block not in tiny_blocks
-    ]
-    if keep_sfx:
-        # Tiny islands are usually furigana or SFX.  Keep them as SFX columns
-        # so onomatopoeia is translated instead of being silently dropped.
-        normal_blocks = normal_blocks + tiny_blocks
 
-    islands = [
-        _display_bbox_to_image(
-            [block.x, block.y, block.x + block.width, block.y + block.height],
-            viewport,
-            image.size,
-        )
-        for block in blocks
-    ]
-    tiny_islands = [
-        _display_bbox_to_image(
-            [block.x, block.y, block.x + block.width, block.y + block.height],
-            viewport,
-            image.size,
-        )
-        for block in tiny_blocks
-    ]
-
-    masked = _build_island_mask(image_arr, islands)
-    if debug_dir:
-        Image.fromarray(masked).save(os.path.join(debug_dir, "photos_masked_ocr.png"))
-        # Publish the blackened preview as soon as the islands are known so it
-        # does not wait for PaddleOCR and the column pass.
-        display_islands = [
-            _display_bbox_to_image(
-                [block.x, block.y, block.x + block.width, block.y + block.height],
-                viewport,
-                image.size,
-            )
-            for block in blocks
-            if block not in page_scale_blocks
-        ]
-        Image.fromarray(_build_island_mask(image_arr, display_islands)).save(
-            os.path.join(debug_dir, "photos_masked.png")
-        )
-    # OCR runs in the background: keep Photos out of the foreground.
-    try:
-        window.minimize()
     except Exception:
-        pass
-    ocr_engine = "paddle"
-    with tempfile.TemporaryDirectory(prefix="photos_fast_") as temporary:
-        masked_path = os.path.join(temporary, "masked.png")
-        Image.fromarray(masked).save(masked_path)
-        if paddle is not None:
-            predictions = paddle.whole_page(masked_path)
-        else:
-            # Windows.Media.Ocr (ja) is the primary island reader: fast and
-            # no extra runtime.  PaddleOCR takes over only when the engine is
-            # unavailable or reads nothing (e.g. stylized SFX pages).
-            predictions = windows_ocr_predictions(masked_path)
-            if predictions:
-                ocr_engine = "windows-ocr"
-            else:
-                predictions = _run_paddle_whole_page(masked_path, paddle_device)
-    _tick("paddle_masked")
-
-    def _island_polys(prediction_list, island_bbox) -> list[dict]:
-        x1, y1, x2, y2 = island_bbox
-        hits = []
-        for prediction in prediction_list:
-            points = np.asarray(
-                prediction.get("polygon") or [], dtype=np.float64
-            ).reshape(-1, 2)
-            if points.size == 0:
-                continue
-            cx, cy = points.mean(axis=0)
-            if x1 - 2 <= cx <= x2 + 2 and y1 - 2 <= cy <= y2 + 2:
-                hits.append(prediction)
-        return hits
-
-    columns = []
-    for block in normal_blocks:
-        block_index = blocks.index(block)
-        island_bbox = _display_bbox_to_image(
-            [block.x, block.y, block.x + block.width, block.y + block.height],
-            viewport,
-            image.size,
-        )
-        sfx = keep_sfx and block in tiny_blocks
-        # Photos box granularity varies between runs (one line per box or a
-        # whole region per box), so OCR polygons define the columns inside an
-        # island.  Bands not covered by any OCR-derived column are still added
-        # so text the OCR engine missed (e.g. one line of a multi-line box)
-        # can be recovered by the crop-retry / Photos copy chain.
-        derived = _group_paddle_columns(
-            _island_polys(predictions, island_bbox), [], image.size,
-            f"{ocr_engine}-masked",
-        )
-        covered: list[list[int]] = []
-        for column in derived:
-            column["overlay_block"] = block_index
-            if sfx:
-                column["role"] = "sfx"
-            covered.append(
-                _image_bbox_to_display(column["image_bbox"], viewport, image.size)
-            )
-            columns.append(column)
-        for band in _split_column_bands(active, block):
-            bx1, by1, bx2, by2 = band
-            cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
-            if any(
-                dx1 - 3 <= cx <= dx2 + 3 and dy1 - 3 <= cy <= dy2 + 3
-                for dx1, dy1, dx2, dy2 in covered
-            ):
-                continue
-            image_bbox = _display_bbox_to_image(band, viewport, image.size)
-            columns.append({
-                "id": "",
-                "text": "",
-                "paddle_text": "",
-                "paddle_confidence": None,
-                "text_source": "",
-                "needs_review": False,
-                "display_bbox": band,
-                "image_bbox": image_bbox,
-                "selection_order": len(columns),
-                "direction": (
-                    "vertical"
-                    if (image_bbox[3] - image_bbox[1]) >= (image_bbox[2] - image_bbox[0])
-                    else "horizontal"
-                ),
-                "role": "sfx" if sfx else "text",
-                "overlay_block": block_index,
-            })
-
-    if page_scale_blocks:
-        # The page-scale island's interior is the whole page: Photos gave no
-        # column geometry, so Paddle polygons supply it. Polygons already
-        # claimed by normal/SFX islands are excluded.
-        block_index = blocks.index(page_scale_blocks[0])
-        excluded = [
-            {
-                "image_bbox": _display_bbox_to_image(
-                    [block.x, block.y, block.x + block.width, block.y + block.height],
-                    viewport,
-                    image.size,
-                )
-            }
-            for block in normal_blocks
-        ]
-        for column in _group_paddle_columns(
-            predictions, excluded, image.size, f"{ocr_engine}-masked"
-        ):
-            column["overlay_block"] = block_index
-            columns.append(column)
-
-    for column in columns:
-        if column.get("paddle_confidence") is None:
-            _assign_paddle_predictions(column, predictions)
-            _finalize_paddle_column(column, f"{ocr_engine}-masked")
-
-    columns = _split_columns_by_vertical_gaps(image_arr, columns)
-    for column in columns:
-        if column.get("paddle_confidence") is None:
-            _assign_paddle_predictions(column, predictions)
-            _finalize_paddle_column(column, f"{ocr_engine}-masked")
-
-    _retry_columns_with_crops(source, columns, paddle_device, paddle)
-    _tick("retry_crops")
-
-    input_control_start = time.monotonic()
-    needs_fallback = (
-        [column for column in columns if not column["text"]] if not skip_fallback else []
-    )
-    if needs_fallback:
-        # Re-fetch only when clicks are actually needed: Photos UIA can block
-        # for many seconds while the window is busy re-rendering, and without
-        # mouse activity the prepared control wrapper stays valid.
-        try:
-            window.restore()
-            window.set_focus()
-        except Exception:
-            pass
-        active_control = _get_control(window, "OcrControl", min(timeout, 5))
-        for column in needs_fallback:
-            _photos_fallback_copy(active_control, column, viewport, image.size)
-        try:
-            window.minimize()
-        except Exception:
-            pass
-    _tick("fallback")
-
-    inventory: list[str] = []
-    inventory_error = None
-    try:
-        try:
-            window.restore()
-            window.set_focus()
-        except Exception:
-            pass
-        if needs_fallback:
-            active_control = _get_control(window, "OcrControl", min(timeout, 5))
-        inventory = _inventory_text(active_control, blocks[0])
-    except Exception as error:
-        inventory_error = str(error)
-    _tick("inventory")
-    timings["input_control_seconds"] = round(time.monotonic() - input_control_start, 2)
-    columns.sort(key=lambda item: (item["image_bbox"][1], -item["image_bbox"][2]))
-    for index, column in enumerate(columns, 1):
-        column["id"] = f"column_{index:03d}"
-        column["selection_order"] = index - 1
-
-    empty = [column for column in columns if not column["text"]]
-    dropped_noise = []
-    if keep_sfx:
-        # Onomatopoeia and furigana boxes that neither engine could read are
-        # retained as SFX columns instead of being dropped; empty text renders
-        # nothing downstream but the geometry stays auditable.
-        for column in empty:
-            column["role"] = "sfx"
-            column["text"] = column.get("paddle_text") or ""
-            column["text_source"] = column.get("text_source") or "sfx-kept"
-            column["needs_review"] = True
-    else:
-        for column in empty:
-            # A confident, acceptable OCR reading that Photos refused to copy
-            # is a genuine capture problem.  An empty or unacceptable box (noise
-            # such as bubble tails, digits or dashed art) that Photos also cannot
-            # select is dropped with an audit record instead of failing the page.
-            if _text_acceptable(
-                column.get("paddle_text") or "",
-                column.get("paddle_confidence"),
-            ):
-                raise RuntimeError(
-                    f"Photos fast capture could not copy text for {column['id']} "
-                    f"({column['image_bbox']}) even though the OCR engine read "
-                    f"{column['paddle_text']!r}"
-                )
-            dropped_noise.append({
-                "id": column["id"],
-                "image_bbox": column["image_bbox"],
-                "paddle_text": column.get("paddle_text") or "",
-                "paddle_confidence": column.get("paddle_confidence"),
-            })
-        if dropped_noise:
-            columns = [column for column in columns if column["text"]]
-            for index, column in enumerate(columns, 1):
-                column["id"] = f"column_{index:03d}"
-                column["selection_order"] = index - 1
-    timings["total"] = round(time.monotonic() - start, 2)
-    timings["foreground_started_at"] = foreground_started_at
-    timings["foreground_ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    timings["foreground_active_seconds"] = timings["total"]
-    if debug_dir:
-        # The blackened preview was already published right after island
-        # detection.  Only a page-scale island needs the column-based update
-        # because Photos highlighted the whole page there.
-        if page_scale_blocks:
-            display_islands = [
-                _display_bbox_to_image(
-                    [block.x, block.y, block.x + block.width, block.y + block.height],
-                    viewport,
-                    image.size,
-                )
-                for block in blocks
-                if block not in page_scale_blocks
-            ]
-            for column in columns:
-                display_islands.append(
-                    _tight_ink_bbox(image_arr, column["image_bbox"], pad=6)
-                )
-            Image.fromarray(_build_island_mask(image_arr, display_islands)).save(
-                os.path.join(debug_dir, "photos_masked.png")
-            )
-        with open(os.path.join(debug_dir, "timing.json"), "w", encoding="utf-8") as handle:
-            json.dump(timings, handle, ensure_ascii=False, indent=2)
-    manifest = {
-        "schema_version": 2,
-        "backend": "Windows Photos Scan Text",
-        "source": {"path": source, "width": image.width, "height": image.height},
-        "capture": {
-            "app": "Windows Photos",
-            "automation_control": "OcrControl",
-            "viewport_size": viewport,
-            "method": "fast-mask",
-            "display_scale": display_scale,
-            "screenshot": screenshot_path,
-            "timing": timings,
-            "inventory": inventory,
-            "inventory_error": inventory_error,
-            "inventory_count": len(inventory),
-            "island_count": len(blocks),
-            "page_scale_islands": len(page_scale_blocks),
-            "selection_boxes_status": selection_boxes_status,
-                "selection_missing": selection_missing,
-            "selection_blocks": [
-                {
-                    "id": f"sel_{index:03d}",
-                    "display_bbox": [block.x, block.y, block.x + block.width, block.y + block.height],
-                    "image_bbox": _display_bbox_to_image(
-                        [block.x, block.y, block.x + block.width, block.y + block.height],
-                        viewport,
-                        image.size,
-                    ),
-                    "page_scale": block.page_scale,
-                }
-                for index, block in enumerate(selection_blocks, 1)
-            ],
-            "selection_groups": [
-                {
-                    "id": f"selg_{index:03d}",
-                    "display_bbox": list(bbox),
-                    "image_bbox": _display_bbox_to_image(bbox, viewport, image.size),
-                    "members": [
-                        f"sel_{selection_blocks.index(member) + 1:03d}"
-                        for member in members
-                    ],
-                }
-                for index, (bbox, members) in enumerate(
-                    aggregate_selection_boxes(selection_blocks), 1
-                )
-            ],
-            "ignored_tiny_islands": tiny_islands if not keep_sfx else [],
-            "dropped_noise_columns": dropped_noise,
-            "sfx_columns": sum(column["role"] == "sfx" for column in columns),
-            "column_count": len(columns),
-            "ocr_engine": ocr_engine,
-            "masked_columns": sum(
-                column["text_source"] in {"paddle-masked", "windows-ocr-masked"}
-                for column in columns
-            ),
-            "retry_columns": sum(
-                column["text_source"] in {"paddle-retry", "windows-ocr-retry"}
-                for column in columns
-            ),
-            "fallback_columns": sum(
-                column["text_source"] == "photos-fallback" for column in columns
-            ),
-            "complete": True,
-        },
-        "columns": columns,
-    }
-    # Do not leave Photos hanging in the foreground: a window opened by this
-    # call is closed; a reused window (batch) stays minimized.
-    if opened_window:
-        try:
-            window.close()
-        except Exception:
-            pass
-        window = None
-    return manifest, window
-
-
+        # Never leak the Photos window this function opened: close it
+        # before propagating so the next page starts from a clean slate.
+        if opened_window and window is not None:
+            _close_window_wait(window)
+        raise
 def capture_photos_quick(
     path: str,
     output_dir: str | Path,
@@ -2739,8 +2823,9 @@ def _capture_one_page(
                 seconds,
             )
         except PhotosNoTextError as error:
-            # A page without any text is normal (pure illustration, cover):
-            # no retries and no fallback dialog -- mark it like a black page.
+            # A page Photos cannot find text on is usually a pure
+            # illustration/cover, but it still goes to the review gate so
+            # the user can confirm before it is skipped.
             failure = {
                 "schema_version": 2,
                 "backend": "Windows Photos Scan Text",
@@ -2750,61 +2835,32 @@ def _capture_one_page(
                     "error": str(error),
                     "attempts": attempts,
                     "no_text": True,
+                    "selection_review_required": True,
                     "display_scale": display_scale,
                 },
             }
             _write_json_atomic(manifest_path, failure)
-            if window is not None:
-                try:
-                    window.close()
-                except Exception:
-                    pass
-                window = None
+            _ensure_review_image(page_dir, image_path)
+            _close_window_wait(window)
+            window = None
             return (
                 {
                     "page": image_path.stem,
                     "status": "no-text",
+                    "selection_review_required": True,
                     "manifest": str(manifest_path),
                 },
                 None,
             )
         except Exception as error:
             last_error = str(error)
-            if window is not None:
-                try:
-                    window.close()
-                except Exception:
-                    pass
-                window = None
+            _close_window_wait(window)
+            window = None
             if attempts < max(1, max_attempts):
                 time.sleep(2)
-    if ask_fallback and _prompt_fallback(image_path):
-        failure = {
-            "schema_version": 2,
-            "backend": "Windows Photos Scan Text",
-            "source": {"path": str(image_path), "sha256": _sha256(image_path)},
-            "capture": {
-                "complete": False,
-                "error": last_error,
-                "attempts": attempts,
-                "fallback_manga": True,
-                "display_scale": display_scale,
-            },
-        }
-        _write_json_atomic(manifest_path, failure)
-        return (
-            {
-                "page": image_path.stem,
-                "status": "fallback-manga",
-                "error": last_error,
-                "attempts": attempts,
-                "manifest": str(manifest_path),
-            },
-            None,
-        )
-    # User declined the manga fallback: the page is NOT processed downstream
-    # until they review it and confirm (hard rule, same gate as the
-    # no-blue-pixels case) -- ``selection_review_required`` blocks stage2.
+    # Hard rule: a failed capture is NEVER silently closed -- it goes to the
+    # review gate (``selection_review_required``).  The manga fallback is a
+    # review-page decision (one click there), not a blocking dialog here.
     failure = {
         "schema_version": 2,
         "backend": "Windows Photos Scan Text",
@@ -2818,6 +2874,7 @@ def _capture_one_page(
         },
     }
     _write_json_atomic(manifest_path, failure)
+    _ensure_review_image(page_dir, image_path)
     return (
         {
             "page": image_path.stem,
@@ -3004,7 +3061,13 @@ def capture_photos_fast_batch(
         "selection_review_required": review_required,
         "complete": bool(results)
         and all(
-            item["status"] in {"captured", "reused", "black-page", "no-text"}
+            # failed / fallback-manga pages are EXPECTED outcomes: they land
+            # in the review gate (or the manga fallback path) and must not
+            # turn the whole batch into an exit-code failure.
+            item["status"] in {
+                "captured", "reused", "black-page", "no-text",
+                "failed", "fallback-manga",
+            }
             for item in results
         ),
     }
@@ -3088,10 +3151,7 @@ def recapture_photos_columns(
             })
         except Exception as error:
             results.append({"page": page, "status": "failed", "error": str(error)})
-            try:
-                window.close()
-            except Exception:
-                pass
+            _close_window_wait(window)
             window = None
     report = {
         "schema_version": 1,

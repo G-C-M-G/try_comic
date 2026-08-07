@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsView,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -31,7 +32,10 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -199,7 +203,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("漫画翻译软件")
-        self.resize(1180, 760)
+        self.resize(1180, 860)
         icon = ROOT / "app.ico"
         if icon.is_file():
             self.setWindowIcon(QIcon(str(icon)))
@@ -248,12 +252,16 @@ class MainWindow(QMainWindow):
         side_l.addWidget(self.theme_btn)
         root.addWidget(side)
 
-        # ---- content ----
+        # ---- content (scrollable so nothing is cut off on small windows) ----
         content = QWidget()
         cl = QVBoxLayout(content)
         cl.setContentsMargins(24, 24, 24, 24)
         cl.setSpacing(16)
-        root.addWidget(content, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
 
         # shared controls (capture + process)
         self.images_edit = QLineEdit()
@@ -883,20 +891,157 @@ class MainWindow(QMainWindow):
         self._term_reload()
 
     def _build_review_tab(self) -> QFrame:
-        card, lay = self._card("审核（三次采集无蓝色像素的页面）")
+        card, lay = self._card("审核（失败/无蓝像素/无文本页，默认全部进审核）")
+        split = QHBoxLayout()
+        split.setSpacing(16)
+
+        left = QVBoxLayout()
+        left.addWidget(label("待审核页（多选）"))
         self.review_list = QListWidget()
-        lay.addWidget(self.review_list, 1)
+        self.review_list.setSelectionMode(QListWidget.ExtendedSelection)
+        left.addWidget(self.review_list, 1)
+        split.addLayout(left, 2)
+
+        right = QVBoxLayout()
+        top = QHBoxLayout()
+        top.addWidget(label("预览帧"))
+        self.review_frame_combo = QComboBox()
+        self.review_frame_combo.addItem("扫描文本帧（有无文字）", "photos_ocr")
+        self.review_frame_combo.addItem("全选帧（有无蓝框）", "photos_selected")
+        top.addWidget(self.review_frame_combo)
+        top.addStretch(1)
+        right.addLayout(top)
+        self.review_view = QGraphicsView()
+        self.review_view.setMinimumSize(520, 420)
+        self.review_view.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.review_scene = QGraphicsScene(self)
+        self.review_view.setScene(self.review_scene)
+        self.review_pix = QGraphicsPixmapItem()
+        self.review_scene.addItem(self.review_pix)
+        self.review_view.wheelEvent = self._review_zoom
+        right.addWidget(self.review_view, 1)
+        split.addLayout(right, 3)
+        lay.addLayout(split, 1)
+
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self._refresh_review)
-        confirm = QPushButton("确认这些页无框")
+        confirm = QPushButton("确认无框（跳过）")
         confirm.setProperty("primary", True)
         confirm.clicked.connect(self._confirm_review)
+        manga = QPushButton("改用 manga 保底")
+        manga.clicked.connect(self._review_manga_fallback)
+        recapture = QPushButton("重采所选")
+        recapture.setProperty("danger", True)
+        recapture.clicked.connect(self._review_recapture)
         h = QHBoxLayout()
-        h.addWidget(refresh)
-        h.addWidget(confirm)
+        for b in (refresh, confirm, manga, recapture):
+            h.addWidget(b)
         h.addStretch(1)
         lay.addLayout(h)
+        self.review_list.currentRowChanged.connect(self._review_show_preview)
+        self.review_frame_combo.currentIndexChanged.connect(self._review_show_preview)
         return card
+
+    def _review_zoom(self, event) -> None:
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.review_view.scale(factor, factor)
+        event.accept()
+
+    def _review_selected_pages(self) -> list[str]:
+        pages = []
+        for item in self.review_list.selectedItems():
+            page = item.data(Qt.UserRole)
+            if page:
+                pages.append(page)
+        return pages
+
+    def _review_show_preview(self) -> None:
+        page = self._review_selected_pages()
+        if not page or not self.review_list.count():
+            return
+        page = page[0]
+        images = self.images_edit.text().strip()
+        if not images:
+            return
+        out = ROOT / "outputs" / "oneclick" / Path(images).name
+        page_dir = out / "capture" / page
+        frame = self.review_frame_combo.currentData()
+        path = page_dir / f"{frame}.png"
+        if not path.is_file():
+            # Fallback chain: photos_base (original copy for failed pages)
+            # -> the original source image from the manifest.
+            path = page_dir / "photos_base.png"
+            if not path.is_file():
+                manifest = page_dir / "capture.json"
+                if manifest.is_file():
+                    try:
+                        data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+                        src = data.get("source", {}).get("path")
+                        if src and Path(src).is_file():
+                            path = Path(src)
+                    except (OSError, ValueError):
+                        pass
+        if not path.is_file():
+            self.review_scene.clear()
+            self.review_pix = QGraphicsPixmapItem()
+            self.review_scene.addItem(self.review_pix)
+            return
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            return
+        self.review_scene.clear()
+        self.review_pix = QGraphicsPixmapItem(pixmap)
+        self.review_scene.addItem(self.review_pix)
+        self.review_scene.setSceneRect(self.review_pix.boundingRect())
+        self.review_view.fitInView(self.review_pix, Qt.KeepAspectRatio)
+
+    def _review_manga_fallback(self) -> None:
+        images = self._images()
+        if not images:
+            return
+        pages = self._review_selected_pages()
+        if not pages:
+            QMessageBox.information(self, "提示", "请先选择要改用的页面")
+            return
+        out = ROOT / "outputs" / "oneclick" / Path(images).name / "capture"
+        for page in pages:
+            manifest = out / page / "capture.json"
+            if not manifest.is_file():
+                continue
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            cap = data.setdefault("capture", {})
+            cap["fallback_manga"] = True
+            cap["selection_review_required"] = False
+            manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._log(f"已改用 manga 保底：{', '.join(pages)}")
+        self._refresh_review()
+
+    def _review_recapture(self) -> None:
+        images = self._images()
+        if not images:
+            return
+        pages = self._review_selected_pages()
+        if not pages:
+            QMessageBox.information(self, "提示", "请先选择要重采的页面")
+            return
+        answer = QMessageBox.question(
+            self, "重采确认", f"删除并重新采集这 {len(pages)} 页？\n{', '.join(pages)}"
+        )
+        if answer != QMessageBox.Yes:
+            return
+        out = ROOT / "outputs" / "oneclick" / Path(images).name / "capture"
+        import shutil
+
+        for page in pages:
+            page_dir = out / page
+            if page_dir.is_dir():
+                shutil.rmtree(page_dir)
+        self._log(f"已清除 {len(pages)} 页数据，开始重新采集…")
+        args = [*self._base_args(), "--pages", ",".join(pages)]
+        self._run(args)
 
     # ---- tab switching ----
     def _show_tab(self, index: int) -> None:
@@ -1052,7 +1197,8 @@ class MainWindow(QMainWindow):
         self._refresh_review()
 
     # ---- review ----
-    def _review_pages(self) -> list[str]:
+    def _review_pages(self) -> list[tuple[str, str]]:
+        """Review-gated pages with their failure reason."""
         images = self.images_edit.text().strip()
         if not images:
             return []
@@ -1070,19 +1216,36 @@ class MainWindow(QMainWindow):
                 continue
             cap = data.get("capture", {})
             if cap.get("selection_review_required") and not cap.get("selection_review_confirmed"):
-                review.append(page.name)
+                if cap.get("no_text"):
+                    reason = "无文本"
+                elif cap.get("selection_missing"):
+                    reason = "无蓝色像素"
+                else:
+                    reason = "采集失败"
+                review.append((page.name, reason))
         return review
 
     def _refresh_review(self) -> None:
         self.review_list.clear()
-        for page in self._review_pages():
-            self.review_list.addItem(QListWidgetItem(page))
+        for page, reason in self._review_pages():
+            item = QListWidgetItem(f"{page}  [{reason}]")
+            item.setData(Qt.UserRole, page)
+            self.review_list.addItem(item)
+        if self.review_list.count():
+            self.review_list.setCurrentRow(0)
+            self._review_show_preview()
+        else:
+            self.review_scene.clear()
+            self.review_pix = QGraphicsPixmapItem()
+            self.review_scene.addItem(self.review_pix)
 
     def _confirm_review(self) -> None:
         images = self._images()
         if not images:
             return
-        pages = self._review_pages()
+        pages = self._review_selected_pages()
+        if not pages:
+            pages = [p for p, _ in self._review_pages()]
         if not pages:
             QMessageBox.information(self, "提示", "当前没有待审核页")
             return

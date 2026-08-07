@@ -120,6 +120,27 @@ class SelectionBoxTests(unittest.TestCase):
 
         self.assertEqual(blocks, [])
 
+    def test_no_blue_overlay_gate_returns_empty(self):
+        # The all-selected frame contains NO blue at all (Ctrl+A rendered
+        # nothing); the delta fallback must NOT fabricate boxes from the
+        # unrelated frame differences -- the page goes to review instead.
+        active, selected = _frames_with_blue_boxes([])
+        # A large gray-mask-like change with zero blue pixels.
+        selected[:, :] = (90, 90, 90)
+        blocks = detect_selection_boxes(active, selected)
+
+        self.assertEqual(blocks, [])
+
+    def test_delta_fallback_still_works_with_blue(self):
+        # Delta fallback is preserved when the selected frame DOES contain
+        # blue overlay pixels (non-standard render, e.g. pre-selected).
+        active, selected = _frames_with_blue_boxes([])
+        for x, y, w, h in ((50, 30, 30, 40), (200, 100, 25, 35)):
+            selected[y:y + h, x:x + w] = _blend(128)
+        blocks = detect_selection_boxes(active, selected)
+
+        self.assertTrue(blocks)
+
     def test_aggregates_horizontal_neighbours_into_one_group(self):
         boxes = [
             OverlayBlock(50, 30, 22, 90),

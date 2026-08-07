@@ -140,12 +140,13 @@ def stage1_capture(
         progress.log(line)
         if "capture" in line and "page" in line.lower():
             captured += 1
-            progress.progress(min(captured, len(pages) or 1), item=line[:60])
+            total = len(pages) if pages else 0
+            progress.progress(min(captured, total or 1), item=line[:60])
     code = proc.wait()
     if code != 0:
         progress.fail(f"photos_capture exited {code}")
         return False
-    progress.progress(len(pages) or 0, item="capture done")
+    progress.progress(len(pages) if pages else 0, item="capture done")
 
     # check images: blue boxes (blue, drawn padded like OCR uses them) +
     # page_scale (red) per page.  No highlight-island detection: only the
