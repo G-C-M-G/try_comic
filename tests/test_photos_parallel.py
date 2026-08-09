@@ -79,7 +79,10 @@ class WindowRelockTests(unittest.TestCase):
 
     def test_relocks_when_window_drifted(self):
         window = self._Window(self._Rect(100, 100, 800, 900))  # drifted from tile
-        with patch("photos_capture._fix_window") as fix:
+        with patch(
+            "photos_capture._fix_window",
+            return_value=(120, 120, 760, 860),
+        ) as fix:
             _ensure_window_rect(window, (120, 120, 760, 860))
         fix.assert_called_once()
         args = fix.call_args[0][1]
@@ -140,6 +143,8 @@ class ParallelCaptureTests(unittest.TestCase):
         # When the display-scale layout has to drop rows (even at the 12%
         # floor the region is too small), the batch must run exactly the
         # effective window count -- two windows must never share a rect.
+        # No 462x660 hard floor any more: the 320x240 absolute floor lets
+        # the 1200x800 region hold three windows (one row).
         with tempfile.TemporaryDirectory() as tmp:
             images = Path(tmp) / "images"
             out = Path(tmp) / "out"
@@ -156,11 +161,30 @@ class ParallelCaptureTests(unittest.TestCase):
                 report = capture_photos_fast_batch(
                     images, out, pages={"1", "2", "3", "4", "5", "6"},
                     max_attempts=1, ask_fallback=False, parallel=6,
-                    display_scale=42, layout_region="1200x700",
+                    display_scale=42, layout_region="1200x800",
                 )
             self.assertEqual(report["parallel"], 6)
             self.assertEqual(report["effective_parallel"], 3)
             self.assertLess(report["effective_display_scale"], 42)
+
+    def test_layout_impossible_raises(self):
+        # A layout region smaller than the 320x240 absolute floor cannot
+        # be made non-overlapping: the batch must fail loudly instead of
+        # capturing polluted frames.
+        with tempfile.TemporaryDirectory() as tmp:
+            images = Path(tmp) / "images"
+            out = Path(tmp) / "out"
+            images.mkdir()
+            for page in ("1", "2", "3", "4", "5", "6"):
+                Image.new("RGB", (2000, 5000), (200, 200, 200)).save(
+                    images / f"{page}.jpg"
+                )
+            with self.assertRaises(ValueError):
+                capture_photos_fast_batch(
+                    images, out, pages={"1", "2", "3", "4", "5", "6"},
+                    max_attempts=1, ask_fallback=False, parallel=6,
+                    display_scale=42, layout_region="300x200",
+                )
 
     def test_frames_only_forwards_flag_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:

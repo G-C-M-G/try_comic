@@ -47,12 +47,10 @@ Photos 并行窗口 (上3下3, 行距=窗口高150%)
 - 蓝框抓取重试：0.4s / 0.8s / 1.2s 三次
 - 黑页静默：`_is_black_page`（dark 占比 >0.90）→ 标记 `black_page`；无文字页（Photos 不出现
   OCR 控件/蒙版）→ 标记 `no_text`；两者 stage2 均跳过
-- **蓝框检测双路径**（`detect_selection_boxes`，详见 `BLUEBOX_CAPTURE.md`）：
-  1. **严格公式优先**（有 base 帧）：`selected == keep×base + (0,38,67)`，
-     keep=174/255，容差 5 + paint-delta>2 守卫（排除页面固有纯蓝）
-  2. **蓝色像素门槛 + delta 兜底**：全选帧存在蓝色蒙版像素（B-R>30）时，
-     `|selected - photos_ocr|` 任一 RGB 通道 > 8 出框；**全选帧完全无蓝色
-     像素 → 判定无框，页进入人工审核**（delta 不会把两帧差异误检成框）
+- **蓝框检测单路径**（`detect_selection_boxes`，详见 `BLUEBOX_CAPTURE.md`）：
+  严格公式 `|selected - (keep×base + (0,38,67))| ≤ 5`，keep=174/255，
+  paint-delta>2 守卫（排除页面固有纯蓝）；缺 base 帧或三次 Ctrl+A
+  仍无蓝色像素 → `selection_review_required: true`，进审核门
 - 整页大框过滤：连通域面积 > 帧 20% 的整页选中框**直接丢弃**（非原子文字框）
 - **硬规则（人工审核门）**：三次 Ctrl+A 仍无蓝色像素 → `selection_review_required: true`，
   该页不进 stage2；stage1/2 提示待审核，`--confirm-no-boxes <页>` 确认无框后才可关闭
@@ -79,6 +77,8 @@ masked = 全页填充色 (BLUEBOX_FILL)
 - **只读蓝框**：`{page}:box:{block_id}`，source = 填黑图，bbox = 蓝框扩 6px
 - 无框岛**不进 OCR**（填黑图填充区是纯色，manga-ocr 会幻觉输出，如 "それでも、"）
 - 读空 2 次跳过：同一蓝框连续两轮读空 → 判定为误选区，丢弃（`empty_counts`）
+- **AI OCR 补强（可选）**：manga-ocr 未读出的框（misses）若有配置 `ai_ocr_url/model/key`，
+  走 OpenAI 兼容视觉模型（`manga_localizer/ai_ocr.py`）复读，结果同样入缓存
 
 ### 4.4 组拼接与方向 (page_texts / page_directions)
 - 组内蓝框按方向排序拼接为整句：
@@ -88,7 +88,11 @@ masked = 全页填充色 (BLUEBOX_FILL)
 - 方向判定结果存入 `directions`，供嵌字用
 
 ### 4.5 翻译 (island_translate.py)
-- 引擎：本地 Sakura（OpenAI 兼容，`http://127.0.0.1:8080/v1`，模型 `sukinishiro`），precision=local
+- 引擎双级：**AI 整页批量优先**（`translate_page_batch`，OpenAI 兼容，默认 DeepSeek
+  `https://api.deepseek.com/v1` + `deepseek-chat`，需 `--ai-api-key`/`config/api_keys.json`），
+  失败/未配置 → **本地 Sakura 兜底**（`translate_island_page`，`http://127.0.0.1:8080/v1`，模型 `sukinishiro`）
+- AI 批量缓存 `translation_batch_cache/`（按页批量签名）；本地缓存 `translation_cache/`
+  （signature = 源文本 + 上下文 + 术语表 + 提示词版本）
 - 防护（`_validate_island_translation`）：
   - 空输出 / 原文照抄 → 拒绝
   - 泄漏提示词字段（本页前文/术语表/人名表/翻译成…）→ 拒绝
@@ -98,7 +102,7 @@ masked = 全页填充色 (BLUEBOX_FILL)
   - 泄漏上下文文本 / 无关术语表目标词 → 拒绝
 - 短符号岛（≤2 字符标点/符号）→ 零引擎调用，直接保留
 - 每岛硬上限 3 次引擎调用 → 仍失败则 kept-source（保留源文本，绝不留空）
-- 翻译缓存：`translation_cache/`（signature = 源文本 + 上下文 + 术语表 + 提示词版本）
+- 每页译文同时落盘到 `translations.json`（原子写），使 `--stage typeset` 可独立运行于已翻译页
 
 ### 4.6 擦字 (erase_and_typeset_page_with)
 - `dataclasses.replace` 构造**只含有框岛的 dataset 子集** → `erase_island_image` 只擦有框岛
@@ -116,6 +120,7 @@ masked = 全页填充色 (BLUEBOX_FILL)
   - **只缓存非空读数**：读空的框不入缓存 → 二次复读判误选逻辑完全保留
   - 缓存损坏/缺失 → 忽略并重建；重新采集（框变）→ 旧键自然失效
 - **收益**：改分组/改嵌字/重合并 PDF 等任何重跑，OCR 阶段 ≈ 0 秒
+- `--stage ocr` 独立运行时按同一缓存逻辑只补缺失框；`--overwrite` 会先剔除选中页的读数/译文键再全量重读
 
 ### 4.9 输出
 - `typeset/{page}.typeset.png`、合并 PDF `outputs/oneclick/{书名}/{书名}.pdf`
@@ -123,7 +128,31 @@ masked = 全页填充色 (BLUEBOX_FILL)
 ### 4.10 备份与恢复
 - **代码/规则版本**：git 提交即备份（分组规则、嵌字规则、文档都随代码版本化）
 - **书级产物**：`outputs/oneclick/{书名}/` 可整体复制/压缩即完整备份（含 capture、dataset、两套翻译缓存、OCR 读数缓存、typeset、PDF）；重新铺到同样路径即可恢复/继续
+- **整库快照**：`robocopy outputs\oneclick backups\<日期>\oneclick /E` + `robocopy config backups\<日期>\config /E`
+  （`backups/` 已被 .gitignore 忽略；`config/api_keys.json` 含密钥，勿提交 git）
 - **恢复重跑**：删除 `dataset/*/islands.json` → 用新分组规则重建；翻译/OCR 缓存命中则零重算；`--resume` 跳过已有 typeset 页
+- **单页重采**：删 `capture/<页>/`（+ `dataset/<页>/`）→ `--pages <页>` 重跑 stage1 → 核对 `check/<页>.bluebox_check.png` → `--pages <页> --process --no-pdf` 重嵌该页
+
+### 4.11 可清理的冗余（详见 ONE_CLICK_USAGE.md 五.7）
+- `crops.*.json`（每次运行生成的 OCR 临时任务文件）、`_logs/`（旧分段日志）
+- `check/` 下旧管线调试图（`*.erased.png` / `*.erasure_mask.png` / `*.ranges_overlay.png` / `*.islands_grouped.png`）、同页旧格式 `*.bluebox_check.jpg`
+- 项目根 `build/`（PyInstaller 中间产物，成品在 `dist/`）
+- 不可删：`dataset/`、`typeset/`、`ocr_readings.json`、两套翻译缓存
+
+### 4.12 阶段拆分与覆盖
+- **阶段拆分（`--stage {ocr,translate,typeset}`，与 `--process` 互斥）**：只跑 stage2 的某一个阶段，
+  `--pages` 选出该阶段页；各阶段有前置依赖，缺前置的页跳过并提示：
+  - `--stage ocr`：需 `capture/{page}/`（已采集页），自动补建 `dataset/{page}/`，按缓存只补缺失框
+  - `--stage translate`：需该页已有 OCR 结果（无结果页跳过并提示），AI 批量优先、Sakura 兜底，
+    结果落盘 `outputs/oneclick/{书名}/translations.json`
+  - `--stage typeset`：需该页已有 `translations.json` 译文（无译文页保持原图），擦字+嵌字+合并 PDF
+- **`--overwrite`（覆盖旧结果，与 `--resume` 互斥）**：级联清除选中页旧产物后全量重做：
+  - 采集覆盖 → 清 `capture/{page}/`、check 图、`dataset/{page}/` + 剔除该页 readings/translations 键
+    → 下游阶段自然全量重做（杜绝新旧蓝框串用旧译文）
+  - `--process`/`--stage ocr` 带 `--overwrite` → 清除选中页 dataset + 缓存键后全量重做/重读；
+    `--stage translate` 带 `--overwrite` → 剔除该页译文键后重翻（签名缓存命中时结果一致、不花引擎费）
+- 不带 `--overwrite` 时沿用缓存：采集跳过已采页、OCR 只补缺失、翻译重写文件、嵌字覆盖 png；
+  `--resume` 与 `--overwrite` 互斥
 
 ## 五、嵌字标准（定稿）
 
@@ -178,6 +207,7 @@ outputs/oneclick/{书名}/
 ├── translation_cache/                   # 本地翻译缓存 (signature 校验)
 ├── translation_batch_cache/             # AI 整页批量翻译缓存
 ├── ocr_readings.json                    # OCR 读数缓存（非空读数；重跑免 OCR）
+├── translations.json                # 书级译文落盘 {page: {island_id: 译文}}（翻译/全链写，嵌字读）
 ├── typeset/{page}.typeset.png           # 嵌字图
 └── {书名}.pdf                           # 最终产物
 ```
@@ -190,3 +220,28 @@ outputs/oneclick/{书名}/
 4. **填黑图裁剪**：蓝框裁剪从填黑图取，但**列位/字号约束用原始蓝框**（不扩 pad）——两者不要混用
 5. **窗口遮挡**：固定平铺（display-scale 100）行距必须 > 窗口高，否则 Photos 弹出菜单会遮挡相邻窗口；
    缩放布局由 auto-fit 保证矩形互不重叠、不越界，线程数 = 实际窗口数
+
+## 八、OCR 引擎切换与扩展
+
+> 引擎分两个层面，互不替代：**采集期**引擎用文字位置"量"出列结构（骨架），
+> **stage2** 引擎读蓝框文字（内容，直接进翻译）。
+
+### 8.1 采集期引擎（`photos_capture.py`）
+- 参数 `--ocr-engine {auto,windows-ocr,paddle}`（GUI 设置页「OCR 引擎（采集）」）
+- `auto`（默认）= Windows OCR 优先，读不出/不可用时 Paddle 兜底
+- 强制指定某引擎：不可用或读不出 → **抛 RuntimeError 报错停止**（不回退）
+- 统一入口 `_run_masked_ocr(masked_path, engine, paddle_device) -> (predictions, engine_used)`；
+  逐列重试链 `_retry_columns_with_crops(..., ocr_engine)` 跟随所选引擎
+- **接入新引擎**：写一个 `_run_<engine>_masked(path) -> list[dict]`，返回统一
+  预测 schema `{polygon, text, confidence}`，在 `_run_masked_ocr` 注册 +
+  batch parser 的 `--ocr-engine` choices + GUI 下拉框加一项即可；
+  下游分组/排版流水线（`_group_paddle_columns` → `_finalize_paddle_column`）零改动
+- 注：GUI 一键流程当前走 `--frames-only`（只拍帧+蓝框，不做遮罩 OCR）；
+  `--ocr-engine` 在完整 fast 路径（不带 `--frames-only`）生效
+
+### 8.2 stage2 读字引擎（`one_click_translate.py`）
+- 参数 `--stage2-engine {manga-ocr,ai-ocr}`（GUI 设置页「读字引擎（嵌字前）」），默认 manga-ocr
+- `manga-ocr`：本地子进程读蓝框（配置了 AI OCR 时 AI 仍补读 misses，历史行为不变）
+- `ai-ocr`：全部框走 AI 视觉模型；未配置 `--ai-ocr-url/--ai-ocr-model/--ai-ocr-api-key`
+  → 抛 RuntimeError 报错停止
+- 接入点 `run_manga(..., stage2_engine=...)`；新引擎在此分支注册即可

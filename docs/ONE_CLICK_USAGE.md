@@ -5,8 +5,10 @@
 | 依赖 | 说明 |
 |---|---|
 | Windows Photos | 采集阶段必须，用户在其中框选蓝框 |
-| 本地 Sakura 服务 | `http://127.0.0.1:8080/v1`（OpenAI 兼容），模型 `sukinishiro`，启动：`start_sakura.bat` |
-| manga-ocr | `venv` 内，模型离线缓存（`HF_HUB_OFFLINE=1`） |
+| AI 翻译 Key（推荐） | DeepSeek 等 OpenAI 兼容接口；填入 GUI 设置或 `config/api_keys.json`；**配置后翻译走 AI 整页批量，本地 Sakura 兜底** |
+| 本地 Sakura 服务 | 兜底翻译引擎：`http://127.0.0.1:8080/v1`（OpenAI 兼容），模型 `sukinishiro`，启动：`start_sakura.bat` |
+| manga-ocr | 本地 OCR，`venv` 内，模型离线缓存（`HF_HUB_OFFLINE=1`） |
+| AI OCR（可选） | OpenAI 兼容视觉模型（如 Qwen-VL），替代/补强 manga-ocr 对漏读框的识别 |
 | 原图目录 | 漫画页 jpg/png/webp，文件名数字排序 |
 
 ## 二、快速开始
@@ -33,25 +35,34 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
 
 ## 三、参数
 
+> CLI 默认值见下表；**GUI 默认值与 CLI 不同**：并行窗口 6、显示缩放 42%。
+
 ```
 --images <dir>      原图目录（默认：D:\workplace\opencode\try_comic\漫画翻译\原文\《甲书》）
---pages <list>      页列表，如 "1-24" 或 "1,3,5"
---parallel <n>      Photos 并行窗口数（默认 3；6 窗口布局为上3下3）
---display-scale <p> 窗口显示缩放百分比（默认 25：窗口=页面×25%，整页完整可见，
+--pages <list>      页列表，如 "1-24" 或 "1,3,5"（采集与处理共用；单页重采见下文）
+--parallel <n>      Photos 并行窗口数（CLI 默认 3；GUI 默认 6；6 窗口布局为上3下3）
+--display-scale <p> 窗口显示缩放百分比（CLI 默认 25；GUI 默认 42：窗口=页面×42%，整页完整可见，
                     原图文件不缩放、坐标还原原分辨率；100 = 固定平铺旧布局）
 --layout-row-gap <px>        固定列间距（默认摊铺铺满；右列左移用更小值）
 --layout-bottom-shift-up <px> 第二行上移量（贴底基础上，默认 0）
 --capture-only      只跑 stage1（采集 + 核对图）
 --process           只跑 stage2（后台处理），跳过采集
+--stage {ocr,translate,typeset}  只跑 stage2 的某一个阶段（--pages 选出该阶段页；前置产物必须已存在，缺前置的页会跳过并提示）
 --auto              采集完成立即处理
 --confirm-no-boxes <pages>   人工审核确认某页确无蓝色框（标记后 stage2 静默跳过）
 --ai-url <url>       AI 翻译接口（默认 https://api.deepseek.com/v1）
 --ai-model <name>    AI 翻译模型（默认 deepseek-chat）
 --ai-api-key <key>   AI 翻译 Key（或 DEEPSEEK_API_KEY 环境变量 / config/api_keys.json）
+                    设置后翻译优先 AI 整页批量，失败回退本地 Sakura；不设则全部走本地
 --ai-ocr-url <url>   AI OCR 视觉接口（OpenAI 兼容，如 GLM-4V/Qwen-VL；留空=本地 manga-ocr）
 --ai-ocr-model <name> AI OCR 视觉模型
 --ai-ocr-api-key <key> AI OCR Key（或 AI_OCR_API_KEY 环境变量 / config/api_keys.json）
+--ocr-engine {auto,windows-ocr,paddle}  采集期遮罩页 OCR 引擎（默认 auto：Windows OCR 优先、
+                    Paddle 兜底；强制指定某引擎时，不可用/读不出即报错停止，不回退）
+--stage2-engine {manga-ocr,ai-ocr}  stage2 读蓝框文字引擎（默认 manga-ocr；ai-ocr 需配置
+                    --ai-ocr-url/--ai-ocr-model/--ai-ocr-api-key，未配置即报错）
 --resume             断点续跑：跳过已有 typeset 输出的页
+--overwrite          覆盖旧结果（与 --resume 互斥）：重采/重做选中页，自动清除旧产物，无需手动删除文件夹
 --bluebox-fill R,G,B  填黑图填充色（默认 0,0,0 黑；若文字非黑色可用白 255,255,255）
 ```
 
@@ -72,10 +83,9 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
    一句完整的话会被自动聚合为一个组（selection group）。
 2. **只处理蓝框**：蓝框外的任何内容（SFX、装饰、页眉页脚、版权行）都会原样保留，
    不识别高亮岛、不翻译、不擦除、不嵌字。
-3. **蓝框检测双路径**（详见 `BLUEBOX_CAPTURE.md`）：严格蓝色蒙版公式优先
-   （keep×原图+(0,38,67)，容差 5）；无结果时先查**蓝色像素门槛**
-   （全选帧有 B-R>30 像素才走 delta 兜底），全选帧完全无蓝色 → 判定无框、
-   该页进审核（不会被两帧差异误检放过）。
+3. **蓝框检测单路径**（详见 `BLUEBOX_CAPTURE.md`）：严格蓝色蒙版公式
+   `|selected - (keep×原图+(0,38,67))| ≤ 5`，keep=174/255；
+   缺 `photos_base.png` 或三次 Ctrl+A 仍无蓝色像素 → 该页进审核门。
 4. **整页大框**：覆盖帧面积 >20% 的整页选中框直接丢弃（非正文单位，封面原样输出）。
 5. **误框**：框了没文字的区域（manga 读空 2 次）会被自动丢弃，不影响结果。
 6. **黑页/无文字页**：全黑页或无文字插图页自动标记跳过，不处理。
@@ -96,6 +106,7 @@ outputs/oneclick/{书名}/
 ├── translation_cache/           # 本地翻译缓存
 ├── translation_batch_cache/     # AI 整页批量翻译缓存
 ├── ocr_readings.json            # OCR 读数缓存（非空读数；重跑免 OCR）
+├── translations.json         # 书级译文落盘（{page: {island_id: 译文}}；翻译阶段/全链写入，嵌字阶段读取）
 ├── typeset/{page}.typeset.png       # 嵌字结果图（逐页人工抽查）
 └── {书名}.pdf                       # 最终 PDF
 ```
@@ -116,6 +127,60 @@ outputs/oneclick/{书名}/
 | 强制重识别 | 删 `ocr_readings.json` | 全书 ~40 分钟 OCR |
 | 断点续跑 | `--resume`（跳过已有 typeset 页） | — |
 | 单页调试 | `--process --pages 12 --no-pdf` | 分钟级 |
+| **单页/多页重采**（蓝框不准时） | 删 `capture/<页>/`（必要时同时删 `dataset/<页>/`）→ `--pages 41` 重跑 stage1 | 单页 ~20s 采集 |
+| 只重 OCR 若干页 | `--stage ocr --pages 5-10` | 秒级~分钟级 |
+| 只重翻译若干页 | `--stage translate --pages 5-10 --overwrite` | 缓存命中零引擎费 |
+| 只重嵌字若干页 | `--stage typeset --pages 5-10 --no-pdf` | 分钟级 |
+| 重采若干页（覆盖旧） | `--pages 41 --overwrite`（原：删 `capture/<页>/` 后重跑） | 单页 ~20s |
+
+## 五.6 蓝框重采流程（本次实测）
+
+当某页 `check/<页>.bluebox_check.png` 蓝框不准（框错/漏框/框到无关区域）时：
+
+```powershell
+# 1) 覆盖重采（推荐）：--pages 41 --overwrite 直接重采选中页——自动清除 capture\41、check 图、
+#    dataset\41，并剔除 ocr_readings.json / translations.json 中该页键，无需手动删除文件夹
+#    备选（原删除方式）：手动清除旧数据后重跑
+Remove-Item capture\41 -Recurse; Remove-Item dataset\41 -Recurse
+
+# 2) 单页重跑 stage1（只打开该页的 Photos 窗口，约 20 秒）
+venv\Scripts\python.exe one_click_translate.py --images "原图目录" --pages 41 --parallel 6 --display-scale 42
+
+# 3) 核对新蓝框
+#    打开 check\41.bluebox_check.png（蓝色 = 蓝框，按 OCR 实际扩 6px 版绘制）
+
+# 4) 确认无误后单页重跑 stage2（OCR/翻译缓存命中，只重嵌该页）
+venv\Scripts\python.exe one_click_translate.py --images "原图目录" --pages 41 --process --no-pdf
+```
+
+- 采集是 GUI 自动化（打开真实 Photos 窗口），期间**不要移动/遮挡窗口**；
+- 重采后 `dataset/`、`ocr_readings.json` 中旧页键自动失效，重跑即重建，无需手动清；
+- 若整页确实无文字/全黑（如插图页），删除 `capture/<页>/` 后无需重采，stage2 自动按原图跳过。
+
+## 五.7 备份与清理
+
+**备份**（产物备份 = 整个 `outputs/oneclick/{书名}/` 目录，含 capture/dataset/缓存/typeset/PDF，复制即完整备份）：
+
+```powershell
+# 整库备份（含全部书 + config）到项目内 backups/（已被 .gitignore 忽略）
+robocopy outputs\oneclick backups\2026-08-09\oneclick /E /NFL /NDL /NJH /NP /R:1 /W:1
+robocopy config backups\2026-08-09\config /E /NFL /NDL /NJH /NP /R:1 /W:1
+```
+
+- 代码/规则版本走 git（`config/api_keys.json`、`outputs/` 已在 .gitignore，不提交）；
+- 恢复 = 把备份目录铺回原路径即可继续（缓存命中零重算）。
+
+**可安全清理的冗余**：
+
+| 文件 | 说明 |
+|---|---|
+| `crops.*.json`（书目录下，多个 PID 后缀） | 每次运行产生的 OCR 临时任务文件，跑完即可删 |
+| `_logs/`（书目录下） | 旧分段处理日志，可删 |
+| `check/*.erased.png`、`*.erasure_mask.png`、`*.ranges_overlay.png`、`*.islands_grouped.png` | 旧管线调试图，新管线不再生成，可删 |
+| `build/`（项目根） | PyInstaller 打包中间产物（dist/ 下的 exe 才是成品），可删 |
+| `check/` 中同页的旧格式 jpg | 新采集生成 `*.bluebox_check.png` 后，同页旧 `*.bluebox_check.jpg` 属旧管线遗留，可删 |
+
+**不可删**：`dataset/`、`typeset/`、`ocr_readings.json`、`translation_cache/`、`translation_batch_cache/`（删了就要重算）。
 
 ## 六、嵌字标准速查
 

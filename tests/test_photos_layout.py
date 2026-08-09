@@ -22,7 +22,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from photos_capture import _page_display_rects
+from photos_capture import _page_display_rects, _work_area_bounds
 
 
 def _make_pages(directory: Path, size, count: int = 8):
@@ -106,10 +106,11 @@ class DisplayScaleLayoutTests(unittest.TestCase):
         self.assertEqual(concurrent[0][1], 24)
         self.assertLessEqual(concurrent[3][3], 1600)
 
-    def test_tall_pages_shrink_to_fit_six_windows_on_short_screen(self):
-        # The same 720px windows cannot stack on a 1707x1067 screen at the
-        # requested zoom: auto-fit shrinks the zoom (alignment kept, windows
-        # equal), so all six windows still run instead of dropping rows.
+    def test_tall_pages_shrink_to_fit_six_windows(self):
+        # 2005x2880 pages at 25% need two tall rows on a 1707x1067 screen;
+        # auto-fit shrinks the zoom (alignment kept, windows equal) so all
+        # six windows still run instead of dropping rows.  No hard 462x660
+        # floor: the layout may shrink below it to keep every window.
         pages = _make_pages(self.directory, (2005, 2880), count=6)
         rects, count, fraction = _page_display_rects(
             pages, 25, parallel=6, screen_bounds=(0, 0, 1707, 1067)
@@ -122,12 +123,12 @@ class DisplayScaleLayoutTests(unittest.TestCase):
             self.assertLessEqual(rect[2], 1707)
             self.assertLessEqual(rect[3], 1067)
         self.assertEqual(rects["1"][1], 24)
-        self.assertEqual(rects["4"][3], 1067 - 24)
 
     def test_rows_dropped_only_when_floor_cannot_fit(self):
         # 2005x5000 pages: even at the 12% floor two rows do not fit on a
-        # 1707x1067 screen, so rows are dropped to a single row of 3 at the
-        # full requested zoom -- still disjoint and inside the screen.
+        # 1707x1067 screen, so the layout drops to a single row of 3 at the
+        # full requested zoom; the window height clamps to the usable area
+        # and everything stays disjoint and inside the screen.
         pages = _make_pages(self.directory, (2005, 5000), count=6)
         rects, count, fraction = _page_display_rects(
             pages, 25, parallel=6, screen_bounds=(0, 0, 1707, 1067)
@@ -173,15 +174,22 @@ class DisplayScaleLayoutTests(unittest.TestCase):
         self.assertGreaterEqual(concurrent[3][1] - concurrent[0][3], 32)
         self.assertGreaterEqual(concurrent[1][0] - concurrent[0][2], 32)
 
-    def test_small_pages_keep_six_windows(self):
-        # 985x1400 pages at 25% = ~320x350 windows (min_width floor): two
-        # rows fit everywhere.
+    def test_small_pages_follow_display_scale(self):
+        # 985x1400 pages at 25% = ~246x350 windows; the 320x240 absolute
+        # floor keeps the width at 320 while the height follows the zoom
+        # (no 462x660 hard floor -- that floor collapsed the parallel
+        # count from 6 to 2, this layout keeps all six edge-aligned).
         pages = _make_pages(self.directory, (985, 1400), count=6)
         rects, count, fraction = _page_display_rects(
             pages, 25, parallel=6, screen_bounds=(0, 0, 1707, 1067)
         )
         self.assertEqual(count, 6)
         self.assertEqual(fraction, 0.25)
+        keys = [str(index) for index in range(1, 7)]
+        sizes = {(rects[key][2] - rects[key][0], rects[key][3] - rects[key][1])
+                 for key in keys}
+        self.assertEqual(sizes, {(320, 350)})
+        _assert_disjoint(self, rects, keys)
 
     def test_wide_pages_shrink_for_horizontal_fit(self):
         # Wide 2000x1000 pages at 42%: three 840px columns cannot fit
@@ -239,9 +247,10 @@ class DisplayScaleLayoutTests(unittest.TestCase):
         self.assertGreaterEqual(max(right_edges), 2400 - 50)
 
     def test_fixed_row_gap_insets_rightmost_windows(self):
-        # 2400x1600 pages at 31% = 744x496 windows; with a fixed 20px
-        # column gap the rightmost window moves left of the spread layout,
-        # and the second row lifts 40px off the bottom edge.
+        # 2400x1600 pages at 31% = 744x496 windows (height follows the
+        # zoom, no hard 660px floor).  With a fixed 20px column gap the
+        # rightmost window moves left of the spread layout, and the second
+        # row lifts 40px off the bottom edge.
         pages = _make_pages(self.directory, (2400, 1600), count=6)
         rects, count, fraction = _page_display_rects(
             pages,
@@ -290,6 +299,39 @@ class DisplayScaleLayoutTests(unittest.TestCase):
             self.assertEqual((x2 - x1, y2 - y1), (538, 752))
         self.assertLessEqual(max(rect[2] for rect in concurrent), 2400)
         self.assertLessEqual(max(rect[3] for rect in concurrent), 1600)
+
+    def test_small_absolute_floor_at_every_zoom(self):
+        # Tiny pages still respect the 320x240 absolute floor (the
+        # display-scale floor, not the removed 462x660 hard minimum): a
+        # 300x400 page at 10% would be 30x40, so the floor keeps the
+        # windows usable and edge-aligned.
+        pages = _make_pages(self.directory, (300, 400), count=6)
+        rects, count, fraction = _page_display_rects(
+            pages, 10, parallel=6, screen_bounds=(0, 0, 2560, 1600)
+        )
+        self.assertEqual(count, 6)
+        keys = [str(index) for index in range(1, 7)]
+        for key in keys:
+            x1, y1, x2, y2 = rects[key]
+            self.assertGreaterEqual(x2 - x1, 320)
+            self.assertGreaterEqual(y2 - y1, 240)
+        _assert_disjoint(self, rects, keys)
+
+    def test_raises_when_even_one_window_cannot_fit(self):
+        # A layout area smaller than the minimum window size has no
+        # non-overlapping placement at all: the batch must fail loudly
+        # instead of letting Windows expand windows over each other.
+        pages = _make_pages(self.directory, (985, 1400), count=6)
+        with self.assertRaises(ValueError):
+            _page_display_rects(
+                pages, 42, parallel=6, screen_bounds=(0, 0, 300, 200)
+            )
+
+    def test_work_area_bounds_shape(self):
+        # The work area excludes the taskbar but is still a usable rect.
+        x, y, width, height = _work_area_bounds()
+        self.assertGreater(width, 0)
+        self.assertGreater(height, 0)
 
 
 if __name__ == "__main__":

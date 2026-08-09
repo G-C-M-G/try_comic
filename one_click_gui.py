@@ -83,13 +83,13 @@ LIGHT = {
     "nav_selected_text": "#0d9488",
 }
 DARK = {
-    "bg": "#0f172a", "card": "#1e293b", "border": "#334155",
-    "border_hover": "#475569", "hover": "#243244",
-    "text": "#e2e8f0", "text_sec": "#cbd5e1", "text_mut": "#94a3b8",
+    "bg": "#000000", "card": "#121212", "border": "#262626",
+    "border_hover": "#3a3a3a", "hover": "#1a1a1a",
+    "text": "#e5e5e5", "text_sec": "#a3a3a3", "text_mut": "#737373",
     "primary": "#2dd4bf", "primary_hover": "#14b8a6",
-    "primary_soft": "rgba(19,78,74,0.45)", "primary_text": "#042f2e",
+    "primary_soft": "rgba(45,212,191,0.18)", "primary_text": "#042f2e",
     "danger": "#f87171", "warning": "#fbbf24",
-    "disabled_primary": "rgba(45,212,191,0.4)",
+    "disabled_primary": "rgba(45,212,191,0.35)",
     "selected_text": "#042f2e",
     "nav_selected_bg": "#2dd4bf",
     "nav_selected_text": "#042f2e",
@@ -101,6 +101,9 @@ def build_qss(t: dict) -> str:
     return f"""
 * {{ font-family: "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 14px; color: {t['text']}; }}
 QMainWindow {{ background: {t['bg']}; }}
+QScrollArea, QScrollArea > QWidget, QScrollArea > QWidget > QWidget {{
+  background: {t['bg']}; border: none;
+}}
 #sidebar {{ background: {t['card']}; border-right: 1px solid {t['border']}; }}
 #brand {{ color: {t['primary']}; font-size: 18px; font-weight: 700; }}
 #card {{ background: {t['card']}; border: 1px solid {t['border']}; border-radius: 16px; }}
@@ -148,8 +151,8 @@ QScrollBar:vertical {{ background: transparent; width: 10px; }}
 QScrollBar::handle:vertical {{ background: {t['border']}; border-radius: 5px; min-height: 30px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QToolTip {{
-  background: #ffffff; color: #111827;
-  border: 1px solid #e5e7eb; border-radius: 8px;
+  background: {t['card']}; color: {t['text']};
+  border: 1px solid {t['border']}; border-radius: 8px;
   padding: 8px 10px; font-size: 13px;
 }}
 """
@@ -158,16 +161,16 @@ QToolTip {{
 CAPTURE_HELP = (
     "<b>采集规矩</b><br>"
     "1. 每页采三个帧：原图帧 / 扫描文本帧 / 全选帧；<br>"
-    "   蓝框检测比较<b>扫描文本帧 vs 全选帧</b>（非原图）。<br>"
+    "   蓝框检测用 <b>扫描文本帧 + 全选帧 + 原图帧</b> 三帧。<br>"
     "2. 窗口 = 页面 × 显示缩放%（上限，放不下自动缩小），<br>"
     "   6 窗 3×2 并行、紧贴四边对齐；<br>"
     "   请勿手动移动/遮挡窗口（程序会实时锁位）。<br>"
-    "3. 检测双路径：<b>严格蓝色蒙版公式优先</b><br>"
-    "   （keep×原图+(0,38,67)，容差12），无结果时<br>"
-    "   两帧任一 RGB 通道差&gt;8 兜底。<br>"
+    "3. 检测<b>单路径</b>：严格蓝色蒙版公式<br>"
+    "   <code>|selected - (keep×base + (0,38,67))| ≤ 5</code>，<br>"
+    "   keep=174/255，paint-delta 守卫排除页面固有纯蓝。<br>"
     "4. 整页大框（面积&gt;帧20%）自动丢弃，不是正文单位。<br>"
-    "5. 硬规则：三次 Ctrl+A 无蓝色像素 → 该页进入<br>"
-    "   <b>待审核</b>（审核页确认无框后才可关闭）。<br>"
+    "5. 硬规则：缺 base 帧 / 三次 Ctrl+A 无蓝色像素 /<br>"
+    "   采集异常 → 该页进入 <b>待审核</b>（审核页确认无框或全部重采）。<br>"
     "6. 采集期间勿动鼠标键盘（窗口自动抢焦点）。"
 )
 
@@ -177,26 +180,85 @@ class Runner(QThread):
 
     line = Signal(str)
     finished_ok = Signal(bool)
+    cancelled = Signal()
 
     def __init__(self, args: list[str]) -> None:
         super().__init__()
         self.args = args
+        self.proc: subprocess.Popen | None = None
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Terminate the whole child process tree; safe from the GUI thread.
+
+        ``proc.terminate()`` only kills one_click_translate.py itself; its
+        children (photos_capture.py, the Photos windows it opens) would
+        survive as orphans and keep stacking windows on the desktop.
+        ``taskkill /T /F`` kills the entire tree rooted at this process,
+        and the residual-window sweep closes any Photos window whose
+        title is a page name we were capturing.
+        """
+        self._cancelled = True
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                import subprocess as _sp
+
+                _sp.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, timeout=10,
+                    creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+        # Sweep orphan Photos windows the killed tree may have opened:
+        # any window whose title is one of the page file names from the
+        # --images directory.
+        try:
+            import os as _os
+            from photos_capture import _close_residual_photos_windows
+
+            images_arg = None
+            for index, item in enumerate(self.args):
+                if item == "--images" and index + 1 < len(self.args):
+                    images_arg = self.args[index + 1]
+                    break
+            if images_arg:
+                names = {
+                    name
+                    for name in _os.listdir(images_arg)
+                    if name.lower().endswith(
+                        (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+                    )
+                }
+                _close_residual_photos_windows(names)
+        except Exception:
+            pass
 
     def run(self) -> None:
         cmd = [str(PYTHON), str(SCRIPT), *self.args]
         try:
-            proc = subprocess.Popen(
+            self.proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except FileNotFoundError:
             self.line.emit("!! 找不到 venv Python，请检查安装")
             self.finished_ok.emit(False)
             return
+        proc = self.proc
         for text in proc.stdout:
             self.line.emit(text.rstrip())
         code = proc.wait()
-        self.finished_ok.emit(code == 0)
+        if self._cancelled:
+            self.line.emit("!! 任务已取消")
+            self.cancelled.emit()
+        else:
+            self.finished_ok.emit(code == 0)
 
 
 class MainWindow(QMainWindow):
@@ -208,20 +270,81 @@ class MainWindow(QMainWindow):
         if icon.is_file():
             self.setWindowIcon(QIcon(str(icon)))
         self.runner: Runner | None = None
-        self.dark = True
+        self.dark = self._load_theme(self._theme_path())
         self._pending_colors: dict[str, str] = {}
         self._build()
         self._apply_theme()
+
+    @staticmethod
+    def _theme_path() -> Path:
+        return ROOT / "config" / "ui.json"
+
+    @staticmethod
+    def _load_theme(path: Path) -> bool:
+        """Read the persisted dark-mode flag; default to dark."""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return bool(data.get("dark", True))
+        except (OSError, ValueError):
+            return True
+
+    @staticmethod
+    def _save_theme(path: Path, dark: bool) -> None:
+        """Persist the dark flag, preserving any other keys in ui.json."""
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+            if path.is_file():
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    data = {}
+            data["dark"] = bool(dark)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(path)
+        except OSError:
+            pass
 
     def _apply_theme(self) -> None:
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(build_qss(DARK if self.dark else LIGHT))
         self.theme_btn.setText("🌙 暗色模式" if not self.dark else "☀️ 亮色模式")
+        self._style_progress()
+        tokens = DARK if self.dark else LIGHT
+        for btn in self.findChildren(QPushButton, "helpBtn"):
+            btn.setStyleSheet(
+                "QPushButton { border: 2px solid %s; border-radius: 15px; "
+                "color: %s; font-size: 17px; font-weight: 700; background: transparent; }"
+                "QPushButton:hover { background: %s; }"
+                % (tokens["primary"], tokens["primary"], tokens["primary_soft"])
+            )
 
     def _toggle_theme(self) -> None:
         self.dark = not self.dark
         self._apply_theme()
+        self._save_theme(self._theme_path(), self.dark)
+
+    def closeEvent(self, event) -> None:
+        runner = self.runner
+        if runner is not None and runner.isRunning():
+            answer = QMessageBox.question(
+                self, "退出确认",
+                "后台任务仍在运行，退出将终止处理进程。确定退出？",
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+            self._log("== 正在取消后台任务… ==")
+            runner.cancel()
+            if not runner.wait(5000):
+                # Last resort: the subprocess did not exit within 5 s.
+                runner.terminate()
+                runner.wait(1000)
+        event.accept()
 
     def _build(self) -> None:
         central = QWidget()
@@ -241,7 +364,7 @@ class MainWindow(QMainWindow):
         side_l.addWidget(sub)
         side_l.addSpacing(24)
         nav = QListWidget()
-        for item in ("采集", "处理", "审核", "预览", "术语", "设置"):
+        for item in ("采集", "审核", "处理", "预览", "术语", "设置"):
             nav.addItem(QListWidgetItem(item))
         nav.setCurrentRow(0)
         side_l.addWidget(nav, 1)
@@ -309,6 +432,15 @@ class MainWindow(QMainWindow):
         self._current = self.tab_capture
         self._show_tab(0)
         nav.currentRowChanged.connect(self._show_tab)
+        # Keep the capture and process directory rows in sync: editing or
+        # browsing in either tab updates both, so the process tab never
+        # asks for a directory the user already picked on the capture tab.
+        self.images_edit.textChanged.connect(
+            lambda text: self.process_images_edit.setText(text)
+        )
+        self.process_images_edit.textChanged.connect(
+            lambda text: self.images_edit.setText(text)
+        )
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._poll_progress)
@@ -325,15 +457,11 @@ class MainWindow(QMainWindow):
             row.addWidget(lab)
             row.addStretch(1)
             help_btn = QPushButton("ⓘ")
+            help_btn.setObjectName("helpBtn")
             help_btn.setProperty("ghost", True)
             help_btn.setFixedSize(30, 30)
             help_btn.setCursor(Qt.PointingHandCursor)
             help_btn.setToolTip(help_text)
-            help_btn.setStyleSheet(
-                "QPushButton { border: 2px solid #2dd4bf; border-radius: 15px; "
-                "color: #2dd4bf; font-size: 17px; font-weight: 700; background: transparent; }"
-                "QPushButton:hover { background: rgba(45,212,191,0.25); }"
-            )
             row.addWidget(help_btn)
             lay.addLayout(row)
         else:
@@ -356,24 +484,68 @@ class MainWindow(QMainWindow):
         row2.addSpacing(16)
         row2.addWidget(label("显示缩放%"))
         row2.addWidget(self.scale_spin)
+        row2.addSpacing(16)
+        self.capture_overwrite_check = QCheckBox("覆盖旧采集（重采选中页）")
+        self.capture_overwrite_check.setChecked(True)
+        row2.addWidget(self.capture_overwrite_check)
         row2.addStretch(1)
         lay.addLayout(row2)
         btn = QPushButton("开始采集")
         btn.setProperty("primary", True)
         btn.clicked.connect(self._start_capture)
-        lay.addWidget(btn, alignment=Qt.AlignRight)
+        stop_btn = QPushButton("停止采集")
+        stop_btn.setProperty("danger", True)
+        stop_btn.setEnabled(False)
+        stop_btn.clicked.connect(self._stop_task)
+        row_btns = QHBoxLayout()
+        row_btns.addStretch(1)
+        row_btns.addWidget(stop_btn)
+        row_btns.addWidget(btn)
+        lay.addLayout(row_btns)
         self.capture_btn = btn
+        self.stop_btn = stop_btn
         return card
 
     def _build_process_tab(self) -> QFrame:
         card, lay = self._card("处理（OCR → 翻译 → 擦字 → 嵌字）")
-        note = label("后台跑 stage2：OCR 读蓝框、翻译（AI 优先、本地 Sakura 兜底）、排版出 typeset.png。"
-                      "待审核页会跳过，需先在“审核”页确认。")
+        note = label("后台处理：默认全链（OCR → 翻译 → 擦字 → 嵌字 → PDF），"
+                     "也可只跑某一阶段（例如改完翻译提示词后只重翻译选中页）。"
+                     "待审核页会跳过，需先在“审核”页确认。")
         note.setWordWrap(True)
         lay.addWidget(note)
+        # The process tab needs its own directory row: a QWidget cannot
+        # live in two layouts, so this is a second edit box that stays in
+        # sync with the capture tab's (either one updates both).
+        row0 = QHBoxLayout()
+        row0.addWidget(label("原图目录"))
+        self.process_images_edit = QLineEdit()
+        self.process_images_edit.setPlaceholderText(
+            "与采集页同步；处理前需先选择原图目录"
+        )
+        row0.addWidget(self.process_images_edit, 1)
+        process_browse = QPushButton("浏览…")
+        process_browse.clicked.connect(self._browse_process)
+        row0.addWidget(process_browse)
+        lay.addLayout(row0)
         row = QHBoxLayout()
+        row.addWidget(label("处理范围"))
+        self.stage_combo = QComboBox()
+        self.stage_combo.addItem("全部处理（OCR→翻译→嵌字）", "all")
+        self.stage_combo.addItem("仅 OCR（蓝框读字）", "ocr")
+        self.stage_combo.addItem("仅翻译", "translate")
+        self.stage_combo.addItem("仅嵌字（擦字+嵌字+PDF）", "typeset")
+        row.addWidget(self.stage_combo)
+        row.addSpacing(16)
+        self.overwrite_check = QCheckBox("覆盖旧结果（重跑即重做）")
+        self.overwrite_check.setChecked(True)
+        self.overwrite_check.toggled.connect(
+            lambda checked: self.resume_check.setChecked(False) if checked else None)
         self.resume_check = QCheckBox("断点续跑（跳过已有 typeset 的页）")
+        self.resume_check.toggled.connect(
+            lambda checked: self.overwrite_check.setChecked(False) if checked else None)
         self.pdf_check = QCheckBox("生成 PDF（默认不生成，只出 typeset 图）")
+        row.addWidget(self.overwrite_check)
+        row.addSpacing(16)
         row.addWidget(self.resume_check)
         row.addSpacing(24)
         row.addWidget(self.pdf_check)
@@ -394,18 +566,38 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.workers_spin)
         row2.addStretch(1)
         lay.addLayout(row2)
+        row3 = QHBoxLayout()
+        row3.addWidget(label("页码范围"))
+        self.process_pages_edit = QLineEdit()
+        self.process_pages_edit.setPlaceholderText(
+            "留空=全部，如 41,55,58 或 110-160（只翻译嵌字这些页）"
+        )
+        row3.addWidget(self.process_pages_edit, 1)
+        row3.addStretch(1)
+        lay.addLayout(row3)
         btn = QPushButton("开始处理")
         btn.setProperty("primary", True)
         btn.clicked.connect(self._start_process)
-        lay.addWidget(btn, alignment=Qt.AlignRight)
+        stop_btn = QPushButton("停止处理")
+        stop_btn.setProperty("danger", True)
+        stop_btn.setEnabled(False)
+        stop_btn.clicked.connect(self._stop_task)
+        row_btns = QHBoxLayout()
+        row_btns.addStretch(1)
+        row_btns.addWidget(stop_btn)
+        row_btns.addWidget(btn)
+        lay.addLayout(row_btns)
         self.process_btn = btn
+        self.process_stop_btn = stop_btn
         return card
 
     def _style_progress(self) -> None:
+        tokens = DARK if self.dark else LIGHT
         self.progress_bar.setStyleSheet(
-            "QProgressBar { border: none; border-radius: 12px; background: #334155; "
-            "height: 14px; text-align: center; font-size: 11px; color: #e2e8f0; }"
-            "QProgressBar::chunk { border-radius: 12px; background: #2dd4bf; }"
+            "QProgressBar { border: none; border-radius: 12px; background: %s; "
+            "height: 14px; text-align: center; font-size: 11px; color: %s; }"
+            "QProgressBar::chunk { border-radius: 12px; background: %s; }"
+            % (tokens["border"], tokens["text"], tokens["primary"])
         )
 
     def _build_preview_tab(self) -> QFrame:
@@ -468,8 +660,6 @@ class MainWindow(QMainWindow):
         out = ROOT / "outputs" / "oneclick" / Path(images).name
         if not out.is_dir():
             return []
-        import re as _re
-
         pages = set()
         for page in out.glob("capture/*/capture.json"):
             try:
@@ -479,7 +669,15 @@ class MainWindow(QMainWindow):
                     pages.add(page.parent.name)
             except (OSError, ValueError):
                 continue
-        return sorted(pages, key=lambda p: int(p) if p.isdigit() else p)
+        # Numeric page names sort by numeric value, then non-numeric names
+        # alphabetically.  The previous mixed int/str key raised TypeError
+        # when a book had both ("cover", "1").
+        def _preview_page_key(name: str) -> tuple[int, int | str]:
+            if name.isdigit():
+                return (0, int(name))
+            return (1, name.lower())
+
+        return sorted(pages, key=_preview_page_key)
 
     def _preview_path(self, page: str) -> str | None:
         images = self.images_edit.text().strip()
@@ -490,11 +688,14 @@ class MainWindow(QMainWindow):
             typeset = out / "typeset" / f"{page}.typeset.png"
             if typeset.is_file():
                 return str(typeset)
-            return None
+            # No typeset output for this page (untouched / not processed):
+            # fall through to the original image below instead of showing
+            # a blank preview.
         if self.mode_combo.currentData() == "check":
-            check = out / "check" / f"{page}.jpg"
-            if check.is_file():
-                return str(check)
+            for name in (f"{page}.bluebox_check.png", f"{page}.jpg"):
+                check = out / "check" / name
+                if check.is_file():
+                    return str(check)
         manifest = out / "capture" / page / "capture.json"
         if manifest.is_file():
             try:
@@ -537,15 +738,25 @@ class MainWindow(QMainWindow):
         self._reload_page()
 
     def _goto_edit_page(self) -> None:
+        text = self.page_edit.text().strip()
+        if not text:
+            return
+        # Exact page-name match first (supports non-numeric names like
+        # "cover" or zero-padded "001").
+        if text in self._pages_list:
+            self._current_page = self._pages_list.index(text) + 1
+            self._reload_page()
+            return
         try:
-            page = int(self.page_edit.text().strip())
+            number = int(text)
         except ValueError:
             return
-        if page in (int(p) if p.isdigit() else -1 for p in self._pages_list):
-            self._current_page = self._pages_list.index(str(page)) + 1
-            self._reload_page()
-        else:
-            self._goto_page(page)
+        for index, name in enumerate(self._pages_list):
+            if name.isdigit() and int(name) == number:
+                self._current_page = index + 1
+                self._reload_page()
+                return
+        self._goto_page(number)
 
     def _build_settings_tab(self) -> QFrame:
         card, lay = self._card("设置（AI / 采集 / 嵌字 / 蓝框检测）")
@@ -564,6 +775,13 @@ class MainWindow(QMainWindow):
         self.ai_ocr_model_edit.setPlaceholderText("Qwen/Qwen2.5-VL-72B-Instruct")
         self.ai_ocr_key_edit = QLineEdit()
         self.ai_ocr_key_edit.setEchoMode(QLineEdit.Password)
+        self.ocr_engine_combo = QComboBox()
+        self.ocr_engine_combo.addItem("自动（默认，Windows OCR → Paddle 兜底）", "auto")
+        self.ocr_engine_combo.addItem("Windows OCR", "windows-ocr")
+        self.ocr_engine_combo.addItem("PaddleOCR", "paddle")
+        self.stage2_engine_combo = QComboBox()
+        self.stage2_engine_combo.addItem("manga-ocr（本地，默认）", "manga-ocr")
+        self.stage2_engine_combo.addItem("AI 视觉 OCR", "ai-ocr")
 
         self.region_edit = QLineEdit()
         self.region_edit.setPlaceholderText("2400x1400")
@@ -629,6 +847,8 @@ class MainWindow(QMainWindow):
         _row("AI OCR 接口", self.ai_ocr_url_edit)
         _row("AI OCR 模型", self.ai_ocr_model_edit)
         _row("AI OCR Key", self.ai_ocr_key_edit)
+        _row("OCR 引擎（采集）", self.ocr_engine_combo)
+        _row("读字引擎（嵌字前）", self.stage2_engine_combo)
         cap_title = QLabel("采集", objectName="cardTitle")
         lay.addWidget(cap_title)
         region_row = _row("采集区域（宽×高，屏 2560×1600 留边界用 2400×1400）", self.region_edit)
@@ -680,14 +900,20 @@ class MainWindow(QMainWindow):
         self.ai_ocr_model_edit.setText(data.get("ai_ocr_model", ""))
         self.ai_ocr_key_edit.setText(data.get("ai_ocr_api_key", ""))
         self.region_edit.setText(str(data.get("layout_region", "2400x1400")))
-        self.min_font_spin.setValue(int(data.get("min_font_size", 28)))
+        engine = data.get("ocr_engine")
+        index = self.ocr_engine_combo.findData(engine) if engine else -1
+        self.ocr_engine_combo.setCurrentIndex(index if index >= 0 else 0)
+        stage2_engine = data.get("stage2_engine")
+        index = self.stage2_engine_combo.findData(stage2_engine) if stage2_engine else -1
+        self.stage2_engine_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.min_font_spin.setValue(self._int_setting(data, "min_font_size", 28))
         font = data.get("font_name", "msyh.ttc")
         index = self.font_combo.findData(font)
         self.font_combo.setCurrentIndex(index if index >= 0 else 0)
-        self.stroke_spin.setValue(int(data.get("stroke_divisor", 10)))
-        self.row_gap_spin.setValue(int(data.get("row_gap_divisor", 4)))
-        self.col_gap_spin.setValue(int(data.get("column_gap_divisor", 4)))
-        self.tracking_spin.setValue(int(data.get("tracking_divisor", 16)))
+        self.stroke_spin.setValue(self._int_setting(data, "stroke_divisor", 10))
+        self.row_gap_spin.setValue(self._int_setting(data, "row_gap_divisor", 4))
+        self.col_gap_spin.setValue(self._int_setting(data, "column_gap_divisor", 4))
+        self.tracking_spin.setValue(self._int_setting(data, "tracking_divisor", 16))
         text_color = data.get("text_color", "0,0,0")
         stroke_color = data.get("stroke_color", "255,255,255")
         self._pending_colors["text_color"] = text_color
@@ -700,9 +926,17 @@ class MainWindow(QMainWindow):
             self.bg_color_combo.addItem(f"自定义 {bg}", bg)
             index = self.bg_color_combo.count() - 1
         self.bg_color_combo.setCurrentIndex(index)
-        self.box_delta_spin.setValue(int(data.get("box_delta", 8)))
-        self.box_tol_spin.setValue(int(data.get("box_tolerance", 5)))
-        self.box_area_spin.setValue(int(data.get("box_area_ratio", 20)))
+        self.box_delta_spin.setValue(self._int_setting(data, "box_delta", 8))
+        self.box_tol_spin.setValue(self._int_setting(data, "box_tolerance", 5))
+        self.box_area_spin.setValue(self._int_setting(data, "box_area_ratio", 20))
+
+    @staticmethod
+    def _int_setting(data: dict, key: str, default: int) -> int:
+        """Read an int setting without letting a malformed config crash the GUI."""
+        try:
+            return int(data.get(key, default))
+        except (TypeError, ValueError):
+            return default
 
     def _color_str(self, key: str, default: str) -> str:
         data = {}
@@ -714,13 +948,25 @@ class MainWindow(QMainWindow):
 
     def _set_color_btn(self, btn: QPushButton, key: str, default: str) -> None:
         value = self._color_str(key, default)
-        btn.setText(f"{value.replace(',', ',')} #{''.join('%02X' % int(v) for v in value.split(','))}" if "," in value else value)
+        if "," not in value:
+            btn.setText(value)
+            return
+        try:
+            parts = [int(v) for v in value.split(",")]
+            if len(parts) != 3 or not all(0 <= v <= 255 for v in parts):
+                raise ValueError
+        except (TypeError, ValueError):
+            value = default
+            parts = [int(v) for v in value.split(",")]
+        btn.setText(f"{value} #{''.join('%02X' % v for v in parts)}")
 
     def _pick_color(self, btn: QPushButton, key: str) -> None:
         from PySide6.QtWidgets import QColorDialog
 
         current = self._color_str(key, "0,0,0" if key == "text_color" else "255,255,255")
         parts = [int(v) for v in current.split(",")] if "," in current else [0, 0, 0]
+        if len(parts) != 3 or not all(0 <= v <= 255 for v in parts):
+            parts = [0, 0, 0]
         color = QColorDialog.getColor(QColor(*parts), self, "选择颜色")
         if not color.isValid():
             return
@@ -751,6 +997,8 @@ class MainWindow(QMainWindow):
             "ai_ocr_url": self.ai_ocr_url_edit.text().strip(),
             "ai_ocr_model": self.ai_ocr_model_edit.text().strip(),
             "ai_ocr_api_key": self.ai_ocr_key_edit.text().strip(),
+            "ocr_engine": self.ocr_engine_combo.currentData(),
+            "stage2_engine": self.stage2_engine_combo.currentData(),
             "layout_region": self.region_edit.text().strip() or "2400x1400",
             "min_font_size": self.min_font_spin.value(),
             "font_name": self.font_combo.currentData() or "msyh.ttc",
@@ -933,8 +1181,14 @@ class MainWindow(QMainWindow):
         recapture = QPushButton("重采所选")
         recapture.setProperty("danger", True)
         recapture.clicked.connect(self._review_recapture)
+        recapture_all = QPushButton("全部重采")
+        recapture_all.setProperty("danger", True)
+        recapture_all.setToolTip(
+            "清除所有待审核页的 capture 目录并重新采集"
+        )
+        recapture_all.clicked.connect(self._review_recapture_all)
         h = QHBoxLayout()
-        for b in (refresh, confirm, manga, recapture):
+        for b in (refresh, confirm, manga, recapture, recapture_all):
             h.addWidget(b)
         h.addStretch(1)
         lay.addLayout(h)
@@ -956,10 +1210,17 @@ class MainWindow(QMainWindow):
         return pages
 
     def _review_show_preview(self) -> None:
-        page = self._review_selected_pages()
-        if not page or not self.review_list.count():
+        # Always preview the CURRENT row, not the first selected item:
+        # ``currentRowChanged`` fires before ``itemSelectionChanged`` updates
+        # the selection set, so ``selectedItems()[0]`` can return the
+        # previously-clicked page and show the wrong frame.  ``currentItem``
+        # is updated atomically with the row change.
+        item = self.review_list.currentItem()
+        if item is None or not self.review_list.count():
             return
-        page = page[0]
+        page = item.data(Qt.UserRole)
+        if not page:
+            return
         images = self.images_edit.text().strip()
         if not images:
             return
@@ -1027,12 +1288,37 @@ class MainWindow(QMainWindow):
         if not pages:
             QMessageBox.information(self, "提示", "请先选择要重采的页面")
             return
+        self._recapture_pages(pages)
+
+    def _review_recapture_all(self) -> None:
+        """Re-capture every page currently in the review queue.
+
+        Equivalent to clicking "重采所选" for every pending page in one
+        shot: the single-path detector (strict formula only) means that
+        pages with no blue pixels after three Ctrl+A attempts are now
+        expected to be the majority of the review queue, so a bulk
+        re-capture is the most efficient way to clear it.
+        """
+        images = self._images()
+        if not images:
+            return
+        pages = [name for name, _ in self._review_pages()]
+        if not pages:
+            QMessageBox.information(self, "提示", "当前没有待审核页")
+            return
+        self._recapture_pages(pages)
+
+    def _recapture_pages(self, pages: list[str]) -> None:
+        """Shared recapture pipeline: confirm, clear capture dirs, start stage1."""
+        if not pages:
+            return
         answer = QMessageBox.question(
-            self, "重采确认", f"删除并重新采集这 {len(pages)} 页？\n{', '.join(pages)}"
+            self, "重采确认",
+            f"删除并重新采集这 {len(pages)} 页？\n{', '.join(pages)}"
         )
         if answer != QMessageBox.Yes:
             return
-        out = ROOT / "outputs" / "oneclick" / Path(images).name / "capture"
+        out = ROOT / "outputs" / "oneclick" / Path(self._images()) / "capture"
         import shutil
 
         for page in pages:
@@ -1047,14 +1333,14 @@ class MainWindow(QMainWindow):
     def _show_tab(self, index: int) -> None:
         for w, i in (
             (self.tab_capture, 0),
-            (self.tab_process, 1),
-            (self.tab_review, 2),
+            (self.tab_review, 1),
+            (self.tab_process, 2),
             (self.tab_preview, 3),
             (self.tab_glossary, 4),
             (self.tab_settings, 5),
         ):
             w.setVisible(i == index)
-        if index == 2:
+        if index == 1:
             self._refresh_review()
         if index == 4:
             self._term_reload()
@@ -1086,9 +1372,18 @@ class MainWindow(QMainWindow):
         elapsed = status.get("elapsed", 0)
         eta = status.get("eta", 0)
         finished = status.get("finished", False)
+        ratio = done / total if total else 0
+        running = self.runner is not None and self.runner.isRunning()
+        if not finished and not running and elapsed > 0:
+            # No active task but run.json says unfinished: the previous run
+            # was interrupted (closed window / killed process).
+            self.stage_label.setText(f"阶段：{stage}（上次运行中断）")
+            self.item_label.setText("当前：—")
+            self.progress_bar.setFormat(f"{done}/{total} · {ratio * 100:.0f}%")
+            self.eta_label.setText(f"上次运行未正常结束（耗时 {int(elapsed)}s）")
+            return
         self.stage_label.setText(f"阶段：{stage}（{status.get('stage_index', 0) + 1}/{status.get('total_stages', 6)}）")
         self.item_label.setText(f"当前：{item or '—'}")
-        ratio = done / total if total else 0
         self.progress_bar.setValue(int(ratio * 1000))
         self.progress_bar.setFormat(f"{done}/{total} · {ratio * 100:.0f}%")
         self.eta_label.setText(
@@ -1101,6 +1396,14 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "选择原图目录")
         if path:
             self.images_edit.setText(path)
+
+    def _browse_process(self) -> None:
+        """Browse for the source directory from the process tab.  The two
+        directory rows are kept in sync, so writing here also updates the
+        capture tab's field."""
+        path = QFileDialog.getExistingDirectory(self, "选择原图目录")
+        if path:
+            self.process_images_edit.setText(path)
 
     def _log(self, text: str) -> None:
         self.log.append(text)
@@ -1120,6 +1423,12 @@ class MainWindow(QMainWindow):
             args += ["--pages", pages]
         args += ["--parallel", str(self.parallel_spin.value())]
         args += ["--display-scale", str(self.scale_spin.value())]
+        engine = self.ocr_engine_combo.currentData()
+        if engine and engine != "auto":
+            args += ["--ocr-engine", engine]
+        stage2_engine = self.stage2_engine_combo.currentData()
+        if stage2_engine and stage2_engine != "manga-ocr":
+            args += ["--stage2-engine", stage2_engine]
         return args
 
     def _detection_args(self) -> list[str]:
@@ -1162,14 +1471,43 @@ class MainWindow(QMainWindow):
     def _start_capture(self) -> None:
         if not self._images():
             return
-        self._run([*self._base_args(), *self._detection_args()])
+        args = [*self._base_args(), *self._detection_args()]
+        if self.capture_overwrite_check.isChecked():
+            args.append("--overwrite")
+        self._run(args)
 
     def _start_process(self) -> None:
         if not self._images():
             return
-        args = [*self._base_args(), "--process", *self._ai_args(),
-                *self._detection_args()]
-        if self.resume_check.isChecked():
+        args = [*self._base_args(), *self._ai_args(), *self._detection_args()]
+        # The process tab has its own page range (independent of the
+        # capture tab's): fill it to translate/typeset only those pages.
+        process_pages = self.process_pages_edit.text().strip()
+        if process_pages:
+            # Strip any capture-tab "--pages <value>" pair from _base_args,
+            # then append the process-tab range.  Appending keeps the
+            # --images value intact (inserting at index 1 put --pages
+            # BEFORE the image path, which made --images swallow it).
+            cleaned = []
+            skip_next = False
+            for item in args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if item == "--pages":
+                    skip_next = True
+                    continue
+                cleaned.append(item)
+            args = cleaned
+            args += ["--pages", process_pages]
+        stage = self.stage_combo.currentData()
+        if stage == "all":
+            args.append("--process")
+        else:
+            args += ["--stage", stage]
+        if self.overwrite_check.isChecked():
+            args.append("--overwrite")
+        elif self.resume_check.isChecked():
             args.append("--resume")
         if not self.pdf_check.isChecked():
             args.append("--no-pdf")
@@ -1184,15 +1522,47 @@ class MainWindow(QMainWindow):
             return
         self.capture_btn.setEnabled(False)
         self.process_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.process_stop_btn.setEnabled(True)
         self._log("$ python one_click_translate.py " + " ".join(args))
         self.runner = Runner(args)
         self.runner.line.connect(self._log)
         self.runner.finished_ok.connect(self._on_done)
+        # A cancel outside closeEvent (e.g. the "stop" button) must still
+        # re-enable the action buttons; route it through the same done
+        # handler with ok=False so the UI never gets stuck.
+        self.runner.cancelled.connect(lambda: self._on_done(False))
         self.runner.start()
+
+    def _stop_task(self) -> None:
+        """Stop the running capture/process task (one-click kill switch).
+
+        Terminates the whole child process tree (one_click_translate.py
+        -> photos_capture.py -> Photos windows) and sweeps orphan Photos
+        windows, so no window is left hanging on the desktop.  Safe to
+        click at any time while a task is running.
+        """
+        if self.runner is None or not self.runner.isRunning():
+            return
+        answer = QMessageBox.question(
+            self, "停止任务",
+            "停止当前任务？\n将终止处理进程并关闭其打开的 Photos 窗口。",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._log("== 正在停止任务… ==")
+        self.runner.cancel()
+        # Runner.cancel() emits ``cancelled`` when the process ends,
+        # which routes to _on_done(False) and re-enables the buttons.
+        # If the process tree is already gone the signal may not fire;
+        # restore the UI right away so the buttons never stay locked.
+        self._on_done(False)
 
     def _on_done(self, ok: bool) -> None:
         self.capture_btn.setEnabled(True)
         self.process_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.process_stop_btn.setEnabled(False)
         self._log("== 任务结束（%s）==" % ("成功" if ok else "失败"))
         self._refresh_review()
 
@@ -1206,7 +1576,12 @@ class MainWindow(QMainWindow):
         if not out.is_dir():
             return []
         review = []
-        for page in sorted((p for p in out.iterdir() if p.is_dir()), key=lambda p: int(p.name)):
+
+        def _page_key(path: Path) -> tuple[int, str]:
+            name = path.name
+            return (0, name) if name.isdigit() else (1, name.lower())
+
+        for page in sorted((p for p in out.iterdir() if p.is_dir()), key=_page_key):
             manifest = page / "capture.json"
             if not manifest.is_file():
                 continue

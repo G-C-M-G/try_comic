@@ -91,16 +91,33 @@ def stage1_capture(
     images: Path, out_root: Path, pages: set[str] | None, parallel: int,
     display_scale: int, row_gap_px: int | None, bottom_shift_up: int,
     layout_region: str = "", box_delta: int = 8, box_tolerance: float = 5.0,
-    box_area_ratio: float = 0.20,
+    box_area_ratio: float = 0.20, overwrite: bool = False,
+    ocr_engine: str = "auto",
 ) -> bool:
-    """Parallel frames-only capture + blue-box check images."""
+    """Parallel frames-only capture + blue-box check images.
+
+    ``overwrite`` purges the selected pages' old artifacts (capture,
+    check image, dataset, OCR/translation cache keys) first, so a
+    re-capture replaces the old result instead of being skipped.
+    """
     capture_dir = out_root / "capture"
     check_dir = out_root / "check"
     capture_dir.mkdir(parents=True, exist_ok=True)
     check_dir.mkdir(parents=True, exist_ok=True)
 
+    if overwrite:
+        target = sorted(pages) if pages else [
+            path.name for path in capture_dir.iterdir() if path.is_dir()
+        ]
+        _purge_page_artifacts(out_root, target, capture=True)
+        print(f"overwrite: purged old artifacts of {len(target)} page(s)")
+
     cmd = [
         str(ROOT / "venv" / "Scripts" / "python.exe"),
+        "-u",  # unbuffered: the child must flush layout/progress lines
+               # immediately so a killed run leaves a meaningful trace in
+               # run.log instead of an empty buffer that looks like the
+               # capture never started.
         str(ROOT / "photos_capture.py"),
         "batch", "--fast",
         "--images", str(images),
@@ -108,11 +125,15 @@ def stage1_capture(
         "--frames-only",
         "--parallel", str(parallel),
         "--display-scale", str(display_scale),
-        "--resume",
         "--box-delta", str(box_delta),
         "--box-tolerance", str(box_tolerance),
         "--box-area-ratio", str(box_area_ratio),
     ]
+    if ocr_engine != "auto":
+        cmd += ["--ocr-engine", ocr_engine]
+    if not overwrite:
+        # Skip pages that were already captured (unless overwriting).
+        cmd += ["--resume"]
     if row_gap_px is not None:
         cmd += ["--layout-row-gap", str(row_gap_px)]
     if bottom_shift_up:
@@ -129,6 +150,7 @@ def stage1_capture(
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     assert proc.stdout is not None
     captured = 0
@@ -186,8 +208,6 @@ def stage1_capture(
                       fill="#4363d8")
         image.save(check_dir / f"{page_dir.name}.bluebox_check.png")
     print(f"blue-box check images -> {check_dir}")
-    progress.done(ok=True)
-    return True
 
     # Report pages that will not be processed because no blue boxes (or no
     # usable capture) were found: written to a report file, printed and
@@ -246,6 +266,7 @@ def stage1_capture(
             pass
     else:
         print("all captured pages have blue boxes")
+    progress.done(ok=True)
     return True
 
 
@@ -343,6 +364,142 @@ def _select_crop_misses(crops: list[dict], cached: dict) -> list[dict]:
     ]
 
 
+def _write_cache_json(path: Path, payload: dict) -> None:
+    """Atomic JSON replace (tmp + rename), the cache-write convention."""
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_translations(out_root: Path) -> dict:
+    """Persisted per-page translations ``{page: {island_id: text}}``.
+
+    Written by the translate stage (and every full ``--process`` run), so
+    the typeset stage can run standalone on already-translated pages.
+    A missing or malformed file yields ``{}``.
+    """
+    path = out_root / "translations.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for page, items in payload.items():
+        if not isinstance(items, dict):
+            continue
+        result[str(page)] = {str(iid): str(text) for iid, text in items.items()}
+    return result
+
+
+def _store_translations(out_root: Path, translations: dict) -> None:
+    """Persist per-page translations (atomic whole-file replace)."""
+    _write_cache_json(out_root / "translations.json", translations)
+
+
+def _purge_page_artifacts(out_root: Path, pages: list[str], *,
+                          capture: bool = False, dataset: bool = False,
+                          readings: bool = True, translations: bool = True) -> None:
+    """Delete one page's artifacts and drop its cache keys (--overwrite).
+
+    Re-running a stage with ``--overwrite`` must start clean: a re-captured
+    page's old dataset / readings / translations would otherwise be reused
+    by downstream stages and mix stale text with fresh blue boxes.  All
+    removals are idempotent; pages not in ``pages`` are never touched.
+    """
+    import shutil
+
+    selected = set(pages)
+    if capture:
+        for page in pages:
+            for sub in ("capture", "dataset"):
+                target = out_root / sub / page
+                if target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+            check_png = out_root / "check" / f"{page}.bluebox_check.png"
+            if check_png.is_file():
+                check_png.unlink(missing_ok=True)
+    if dataset:
+        for page in pages:
+            target = out_root / "dataset" / page
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+    if readings:
+        path = out_root / "ocr_readings.json"
+        if path.is_file():
+            payload = _load_readings_cache(out_root)
+            stale = [key for key in payload if key.split(":", 1)[0] in selected]
+            for key in stale:
+                del payload[key]
+            if stale:
+                _write_cache_json(path, payload)
+    if translations:
+        path = out_root / "translations.json"
+        if path.is_file():
+            payload = _load_translations(out_root)
+            stale = [page for page in payload if page in selected]
+            for page in stale:
+                del payload[page]
+            if stale:
+                _write_cache_json(path, payload)
+
+
+def _page_units(dataset_dir: Path, page: str) -> dict | None:
+    """islands / blocks / groups for one page from disk.
+
+    Returns ``None`` when the page has no dataset (never captured, or no
+    blue boxes).  Mirrors the shape ``build_page_texts`` expects.
+    """
+    page_dir = dataset_dir / page
+    islands_path = page_dir / "islands.json"
+    if not islands_path.is_file():
+        return None
+    islands = json.loads(islands_path.read_text(encoding="utf-8-sig"))
+    sel_path = page_dir / "selection_blocks.json"
+    selection = (
+        json.loads(sel_path.read_text(encoding="utf-8-sig"))
+        if sel_path.is_file() else None
+    )
+    blocks = (selection or {}).get("selection_blocks") or []
+    groups = (selection or {}).get("selection_groups") or []
+    box_by_id = {b["id"]: b for b in blocks}
+    return {
+        "islands": {i["id"]: i for i in islands["islands"]},
+        "blocks": box_by_id,
+        "groups": {g["id"]: g for g in groups},
+    }
+
+
+def _load_page_texts(out_root: Path, pages: list[str]) -> tuple[dict, dict, dict]:
+    """Rebuild page texts / directions / dropped boxes from disk.
+
+    Derives exactly what the OCR stage produced: readings come from
+    ``ocr_readings.json`` and a box missing from the cache was read empty
+    twice (false selection) and is dropped -- the two-pass check is
+    already folded into the cache.  Returns
+    ``(page_texts, page_directions, dropped_boxes)`` for pages that have a
+    dataset; pages without one are omitted.
+    """
+    readings = _load_readings_cache(out_root)
+    dataset_dir = out_root / "dataset"
+    units: dict[str, dict] = {}
+    for page in pages:
+        unit = _page_units(dataset_dir, page)
+        if unit is not None:
+            units[page] = unit
+    dropped: dict[str, set[str]] = {}
+    for page, unit in units.items():
+        dropped[page] = {
+            box_id for box_id in unit["blocks"]
+            if f"{page}:box:{box_id}" not in readings
+        }
+    texts, directions = build_page_texts(units, readings, dropped)
+    return texts, directions, dropped
+
+
 def run_manga(
     crops: list[dict],
     out_root: Path,
@@ -351,6 +508,7 @@ def run_manga(
     ai_ocr_url: str = "",
     ai_ocr_model: str = "",
     ai_ocr_api_key: str = "",
+    stage2_engine: str = "manga-ocr",
 ) -> dict:
     """OCR every crop: AI vision model when configured, else manga-ocr.
 
@@ -366,7 +524,23 @@ def run_manga(
     """
     cached = _load_readings_cache(out_root)
     misses = _select_crop_misses(crops, cached)
-    if misses and (ai_ocr_url and ai_ocr_model and ai_ocr_api_key):
+    if stage2_engine == "ai-ocr":
+        if not (ai_ocr_url and ai_ocr_model and ai_ocr_api_key):
+            raise RuntimeError(
+                "--stage2-engine ai-ocr 需要配置 AI OCR："
+                "--ai-ocr-url/--ai-ocr-model/--ai-ocr-api-key"
+            )
+        if misses:
+            from manga_localizer.ai_ocr import ai_ocr_readings
+
+            readings = ai_ocr_readings(
+                misses, ai_ocr_url, ai_ocr_model, ai_ocr_api_key,
+                progress=progress,
+            )
+        else:
+            # all crops cached: nothing to read, even in forced ai-ocr mode
+            readings = {}
+    elif misses and (ai_ocr_url and ai_ocr_model and ai_ocr_api_key):
         from manga_localizer.ai_ocr import ai_ocr_readings
 
         readings = ai_ocr_readings(
@@ -429,6 +603,7 @@ for entry in crops:
         [str(python), "-c", script, str(crops_path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=False, env=env,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     assert proc.stdout is not None
     readings: dict[str, str] = {}
@@ -565,8 +740,9 @@ def build_bluebox_dataset(
     """islands.json purely from the Photos blue boxes (original image space).
 
     No highlight-island detection: the atomic blue boxes are re-grouped by
-    the TWO-AXIS 60% overlap rule (``_group_boxes_by_overlap``) -- every
-    group is one island, padded ``pad`` px, and its own independent bbox.
+    the two-axis 20% gap / 40% overlap rule (``_group_boxes_by_overlap``) --
+    every group is one island, padded ``pad`` px, and its own independent
+    bbox.
     Raises ValueError when the page has no usable blue boxes -- the caller
     keeps the page untouched then.  Also writes selection_blocks.json
     (typeset column positions + the re-grouped groups) and a copy of the
@@ -723,6 +899,7 @@ def stage2_process(
     ai_ocr_url: str = "",
     ai_ocr_model: str = "",
     ai_ocr_api_key: str = "",
+    stage2_engine: str = "manga-ocr",
     resume: bool = False,
     no_pdf: bool = False,
     min_font_size: int | None = None,
@@ -736,8 +913,9 @@ def stage2_process(
     background_color: str = "",
     max_workers: int = 1,
     progress: "ProgressFile | None" = None,
+    overwrite: bool = False,
 ) -> bool:
-    """Background: blue boxes -> manga -> translate -> typeset -> PDF.
+    """Full stage 2: dataset -> OCR -> translate -> typeset -> PDF.
 
     Translation prefers the AI (OpenAI-compatible, e.g. DeepSeek) whole-page
     batch; islands whose numbered line is missing/malformed fall back to
@@ -745,29 +923,56 @@ def stage2_process(
     local Sakura.  ``ai_ocr_*`` enable an OpenAI-compatible vision model to
     read the blue-box crops instead of manga-ocr.  ``resume`` skips pages
     whose typeset output already exists.  ``no_pdf`` skips the final PDF
-    merge (typeset images only).  ``progress`` publishes run.json.
-    """
-    from island_extract import build_fallback_dataset
-    from manga_localizer.island_contract import load_island_dataset
-    from manga_localizer.island_translate import (
-        IslandTranslateConfig,
-        IslandTranslationCache,
-        PageBatchCache,
-        translate_island_page,
-        translate_page_batch,
-    )
-    from manga_localizer.translator import load_glossary
+    merge (typeset images only).  ``overwrite`` purges the selected pages'
+    dataset + cache keys first, so every stage redoes its work from
+    scratch.  ``progress`` publishes run.json.
 
+    The same stages are exposed individually through ``--stage``
+    (``_run_stage2_single``); this function is their composition and
+    shares their implementations, so full runs and split runs produce
+    identical artifacts.
+    """
     if progress is None:
         from manga_localizer.progress import ProgressFile
 
         progress = ProgressFile(out_root)
 
+    active_pages = _stage2_dataset(images, out_root, pages, progress,
+                                   overwrite=overwrite)
+    page_texts, page_directions, dropped_boxes = _stage2_ocr(
+        out_root, active_pages, progress=progress, overwrite=overwrite,
+        ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
+        ai_ocr_api_key=ai_ocr_api_key, stage2_engine=stage2_engine,
+    )
+    translations = _stage2_translate(
+        out_root, active_pages, page_texts, progress=progress,
+        overwrite=overwrite, ai_url=ai_url, ai_model=ai_model,
+        ai_api_key=ai_api_key, max_workers=max_workers,
+    )
+    return _stage2_typeset(
+        out_root, images, pages, active_pages, translations,
+        page_directions, dropped_boxes, progress=progress, resume=resume,
+        no_pdf=no_pdf, min_font_size=min_font_size, font_name=font_name,
+        stroke_divisor=stroke_divisor, row_gap_divisor=row_gap_divisor,
+        column_gap_divisor=column_gap_divisor,
+        tracking_divisor=tracking_divisor, text_color=text_color,
+        stroke_color=stroke_color, background_color=background_color,
+        max_workers=max_workers,
+    )
+
+
+def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
+                    progress: "ProgressFile", *,
+                    overwrite: bool = False) -> list[str]:
+    """Build islands from capture (one island per blue-box selection
+    group).  Returns the pages that ended up with a dataset (active)."""
+    from island_extract import build_fallback_dataset
+
     capture_dir = out_root / "capture"
     dataset_dir = out_root / "dataset"
-    typeset_dir = out_root / "typeset"
-    typeset_dir.mkdir(parents=True, exist_ok=True)
-
+    if overwrite:
+        _purge_page_artifacts(out_root, pages, dataset=True,
+                              readings=True, translations=True)
     fallback = _fallback_pages_for(capture_dir, pages)
     # Islands come ONLY from the Photos blue boxes (no highlight-island
     # detection): one island per selection group, original image space.
@@ -775,8 +980,29 @@ def stage2_process(
     for index, page in enumerate(pages):
         progress.progress(index, item=f"page {page}")
         page_dir = dataset_dir / page
-        if (page_dir / "islands.json").is_file():
-            continue
+        manifest_path = capture_dir / page / "capture.json"
+        islands_path = page_dir / "islands.json"
+        if islands_path.is_file():
+            # A stale dataset is the classic silent bug: the page was
+            # RE-captured (new capture.json with different blue boxes)
+            # but the old islands/selection_blocks were reused, so the
+            # OCR crops no longer match the check image.  Only reuse the
+            # dataset when it is NEWER than the capture manifest; a
+            # re-captured page must rebuild its islands from scratch.
+            try:
+                manifest_mtime = manifest_path.stat().st_mtime
+                islands_mtime = islands_path.stat().st_mtime
+            except OSError:
+                manifest_mtime = islands_mtime = 0.0
+            if islands_mtime >= manifest_mtime:
+                continue
+            import shutil
+
+            shutil.rmtree(page_dir, ignore_errors=True)
+            print(
+                f"{page}: capture re-done after dataset, rebuilding islands "
+                "(check image and OCR now share the same blue boxes)"
+            )
         source = _source_image_for(images, page)
         if source is None:
             continue
@@ -785,7 +1011,6 @@ def stage2_process(
                 image_size = probe.size
             build_fallback_dataset(source, page_dir, image_size)
             continue
-        manifest_path = capture_dir / page / "capture.json"
         if not manifest_path.is_file():
             continue
         try:
@@ -795,27 +1020,39 @@ def stage2_process(
             # original (kept out of the OCR/translate/typeset loops).
             print(f"{page}: {error}")
 
-    active_pages = [
+    return [
         page for page in pages
         if (dataset_dir / page / "islands.json").is_file()
     ]
 
+
+def _stage2_ocr(out_root: Path, pages: list[str], *,
+                progress: "ProgressFile", overwrite: bool = False,
+                ai_ocr_url: str = "", ai_ocr_model: str = "",
+                ai_ocr_api_key: str = "",
+                stage2_engine: str = "manga-ocr") -> tuple[dict, dict, dict]:
+    """OCR the blue boxes (manga/AI) and derive page texts/directions.
+
+    Reads ONLY blue boxes, cropped from the whole-page masked image so
+    neighbour text can never leak into a crop.  A box read empty twice is
+    a false selection and is dropped.  Returns
+    ``(page_texts, page_directions, dropped_boxes)``.
+    """
+    if overwrite:
+        # Full re-read: purge the selected pages' readings/translations so
+        # a re-captured page can never mix fresh blue boxes with stale OCR.
+        _purge_page_artifacts(out_root, pages, readings=True, translations=True)
+    dataset_dir = out_root / "dataset"
     # manga reads: blue boxes only, from the blue-box masked image so
     # neighbour text can never leak into a crop
     crops, units = [], {}
-    for page in active_pages:
+    for page in pages:
+        unit = _page_units(dataset_dir, page)
+        if unit is None:
+            continue
         page_dir = dataset_dir / page
-        islands = json.loads((page_dir / "islands.json").read_text(encoding="utf-8-sig"))
-        sel_path = page_dir / "selection_blocks.json"
-        selection = (
-            json.loads(sel_path.read_text(encoding="utf-8-sig"))
-            if sel_path.is_file()
-            else None
-        )
-        blocks = (selection or {}).get("selection_blocks") or []
-        groups = (selection or {}).get("selection_groups") or []
+        blocks = list(unit["blocks"].values())
         source = str(page_dir / "original.jpg")
-        box_by_id = {b["id"]: b for b in blocks}
         # whole-page masked image: blue boxes (pad 2) keep pixels, rest fill
         if blocks:
             original = np.array(Image.open(source).convert("RGB"))
@@ -843,20 +1080,19 @@ def stage2_process(
         # boxes everything stays original (no read, no translation, no
         # erasure, no typesetting).  Reading the fill area would only
         # invite manga-ocr hallucinations.
-        units[page] = {"islands": {i["id"]: i for i in islands["islands"]},
-                       "blocks": box_by_id, "groups": {g["id"]: g for g in groups}}
+        units[page] = unit
     progress.set_stage("ocr", total=len(crops))
     progress.sub_progress(0, len(crops), "manga-ocr")
     readings = run_manga(
         crops, out_root, progress=progress,
         ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
-        ai_ocr_api_key=ai_ocr_api_key,
+        ai_ocr_api_key=ai_ocr_api_key, stage2_engine=stage2_engine,
     )
 
     # Second pass: reread the boxes manga-ocr read empty once.  A box that
     # stays empty is a false selection -- dropped everywhere (never joined
     # into a sentence, never erased, never typeset).
-    dropped_boxes: dict[str, set[str]] = {page: set() for page in active_pages}
+    dropped_boxes: dict[str, set[str]] = {page: set() for page in units}
     rereads = []
     for crop in crops:
         page = crop["id"].split(":", 1)[0]
@@ -874,7 +1110,7 @@ def stage2_process(
         reread_readings = run_manga(
             rereads, out_root, progress=progress,
             ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
-            ai_ocr_api_key=ai_ocr_api_key,
+            ai_ocr_api_key=ai_ocr_api_key, stage2_engine=stage2_engine,
         )
         for crop in rereads:
             page, _, rest = crop["id"].partition(":box:")
@@ -887,69 +1123,166 @@ def stage2_process(
                 dropped_boxes[page].add(box_id)
 
     page_texts, page_directions = build_page_texts(units, readings, dropped_boxes)
+    return page_texts, page_directions, dropped_boxes
 
+
+def _translate_one_page(page: str, texts: dict[str, str], *,
+                        dataset_dir: Path, glossary, cache, batch_cache,
+                        ai_url: str, ai_model: str,
+                        ai_api_key: str) -> dict[str, str]:
+    """Whole-page translate: AI batch preferred, local Sakura fallback."""
+    from manga_localizer.island_contract import load_island_dataset
+    from manga_localizer.island_translate import (
+        IslandTranslateConfig,
+        translate_island_page,
+        translate_page_batch,
+    )
+
+    dataset = load_island_dataset(dataset_dir / page / "islands.json")
+    page_translations: dict[str, str] = {}
+    fallback_texts: dict[str, str] = {}
+    if ai_api_key and texts:
+        try:
+            batch = translate_page_batch(
+                dataset,
+                texts,
+                IslandTranslateConfig(
+                    precision="online",
+                    online_base_url=ai_url,
+                    online_model=ai_model,
+                    online_api_key=ai_api_key,
+                    glossary_path=str(ROOT / "config" / "glossary.json"),
+                ),
+                glossary=glossary,
+                cache=batch_cache,
+            )
+            page_translations.update(batch.translations)
+            fallback_texts = {island_id: texts[island_id] for island_id in batch.failures}
+            if batch.parse_errors:
+                print(f"  {page}: AI parse errors={len(batch.parse_errors)} fallback={len(batch.failures)}")
+        except Exception as error:  # noqa: BLE001 - AI failure degrades to local
+            print(f"  {page}: AI batch failed ({error}), local fallback")
+            fallback_texts = dict(texts)
+    else:
+        fallback_texts = dict(texts)
+    if fallback_texts:
+        result = translate_island_page(
+            dataset,
+            fallback_texts,
+            IslandTranslateConfig(
+                precision="local",
+                sakura_base_url="http://127.0.0.1:8080/v1",
+                sakura_model="sukinishiro",
+                glossary_path=str(ROOT / "config" / "glossary.json"),
+            ),
+            glossary=glossary,
+            cache=cache,
+        )
+        for unit in result.units:
+            page_translations[unit.island_id] = unit.translated_text or ""
+    return page_translations
+
+
+def _stage2_translate(out_root: Path, pages: list[str],
+                      texts: dict[str, dict[str, str]], *,
+                      progress: "ProgressFile", overwrite: bool = False,
+                      ai_url: str = "https://api.deepseek.com/v1",
+                      ai_model: str = "deepseek-chat", ai_api_key: str = "",
+                      max_workers: int = 1) -> dict[str, dict[str, str]]:
+    """Translate every given page and persist ``translations.json``.
+
+    AI whole-page batch first, local Sakura fallback; the per-page result
+    is written atomically at the end (re-running is free when the caches
+    hit).  Returns ``{page: {island_id: text}}``.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from manga_localizer.island_translate import (
+        IslandTranslationCache,
+        PageBatchCache,
+    )
+    from manga_localizer.translator import load_glossary
+
+    if overwrite:
+        # Discard the old translations of the selected pages: they must be
+        # re-derived (cache hits return the same text, so this is cheap).
+        _purge_page_artifacts(out_root, pages, readings=False, translations=True)
     glossary = load_glossary(ROOT / "config" / "glossary.json")
     cache = IslandTranslationCache(out_root / "translation_cache")
     batch_cache = PageBatchCache(out_root / "translation_batch_cache")
+    dataset_dir = out_root / "dataset"
+    translations: dict[str, dict[str, str]] = {}
+    failed: list[str] = []
+
+    def _translate(page: str) -> tuple[str, dict[str, str] | None]:
+        try:
+            return page, _translate_one_page(
+                page, texts[page], dataset_dir=dataset_dir,
+                glossary=glossary, cache=cache, batch_cache=batch_cache,
+                ai_url=ai_url, ai_model=ai_model, ai_api_key=ai_api_key,
+            )
+        except Exception as error:  # noqa: BLE001 - per-page isolation
+            print(f"!! translate {page} FAILED: {error}")
+            progress.log(f"translate {page} failed: {error}")
+            return page, None
+
+    progress.set_stage("translate", total=len(pages))
+    results: list[tuple[str, dict[str, str] | None]] = []
+    workers = max(1, int(max_workers))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_translate, page) for page in pages]
+            for future in futures:
+                results.append(future.result())
+    else:
+        results = [_translate(page) for page in pages]
+    for page, result in results:
+        if result is not None:
+            translations[page] = result
+        else:
+            failed.append(page)
+    _store_translations(out_root, translations)
+    if failed:
+        print(f"!! 翻译失败页（未写入 translations.json）: {', '.join(failed)}")
+    return translations
+
+def _stage2_typeset(out_root: Path, images: Path, pages: list[str],
+                    active_pages: list[str],
+                    translations: dict[str, dict[str, str]],
+                    page_directions: dict, dropped_boxes: dict, *,
+                    progress: "ProgressFile", resume: bool = False,
+                    no_pdf: bool = False, min_font_size: int | None = None,
+                    font_name: str = "", stroke_divisor: int | None = None,
+                    row_gap_divisor: int | None = None,
+                    column_gap_divisor: int | None = None,
+                    tracking_divisor: int | None = None,
+                    text_color: str = "", stroke_color: str = "",
+                    background_color: str = "", max_workers: int = 1) -> bool:
+    """Erase + typeset every translated page, then assemble the PDF.
+
+    Pages without translations (never translated, or translate failed) are
+    kept as the original image in the PDF -- unless a stale typeset.png
+    already exists, which is kept as-is.
+    """
+    import shutil
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    dataset_dir = out_root / "dataset"
+    typeset_dir = out_root / "typeset"
+    typeset_dir.mkdir(parents=True, exist_ok=True)
     parsed_text = _parse_color(text_color)
     parsed_stroke = _parse_color(stroke_color)
     parsed_background = _parse_color(background_color)
 
-    def _translate_one_page(page: str) -> dict[str, str]:
-        """Whole-page translate: AI batch preferred, local Sakura fallback."""
-        dataset = load_island_dataset(dataset_dir / page / "islands.json")
-        texts = page_texts[page]
-        page_translations: dict[str, str] = {}
-        fallback_texts: dict[str, str] = {}
-        if ai_api_key and texts:
-            try:
-                batch = translate_page_batch(
-                    dataset,
-                    texts,
-                    IslandTranslateConfig(
-                        precision="online",
-                        online_base_url=ai_url,
-                        online_model=ai_model,
-                        online_api_key=ai_api_key,
-                        glossary_path=str(ROOT / "config" / "glossary.json"),
-                    ),
-                    glossary=glossary,
-                    cache=batch_cache,
-                )
-                page_translations.update(batch.translations)
-                fallback_texts = {island_id: texts[island_id] for island_id in batch.failures}
-                if batch.parse_errors:
-                    print(f"  {page}: AI parse errors={len(batch.parse_errors)} fallback={len(batch.failures)}")
-            except Exception as error:  # noqa: BLE001 - AI failure degrades to local
-                print(f"  {page}: AI batch failed ({error}), local fallback")
-                fallback_texts = dict(texts)
-        else:
-            fallback_texts = dict(texts)
-        if fallback_texts:
-            result = translate_island_page(
-                dataset,
-                fallback_texts,
-                IslandTranslateConfig(
-                    precision="local",
-                    sakura_base_url="http://127.0.0.1:8080/v1",
-                    sakura_model="sukinishiro",
-                    glossary_path=str(ROOT / "config" / "glossary.json"),
-                ),
-                glossary=glossary,
-                cache=cache,
-            )
-            for unit in result.units:
-                page_translations[unit.island_id] = unit.translated_text or ""
-        return page_translations
-
     def _worker(page: str) -> bool:
-        """One page: translate then typeset.  Returns True on failure."""
-        try:
-            translations_page = _translate_one_page(page)
-        except Exception as error:  # noqa: BLE001 - per-page isolation
-            print(f"!! translate {page} FAILED: {error}")
-            progress.log(f"translate {page} failed: {error}")
-            return True
+        """One page: typeset with its translation.  True on failure."""
+        translations_page = translations.get(page)
+        if not translations_page:
+            # Standalone typeset on a page that was never translated: the
+            # page keeps its original (listed with the untouched pages).
+            progress.log(f"skip {page}: no translations (run translate first)")
+            return False
         out_png = typeset_dir / f"{page}.typeset.png"
         if resume and out_png.is_file():
             progress.log(f"resume: skip {page} (typeset exists)")
@@ -972,9 +1305,6 @@ def stage2_process(
             return True
         print(f"typeset {page} -> {typeset_dir / f'{page}.typeset.png'}")
         return False
-
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
 
     progress.set_stage("typeset", total=len(active_pages))
     failed_pages: list[str] = []
@@ -1007,30 +1337,40 @@ def stage2_process(
         for page in active_pages:
             _on_page_done(page, _worker(page))
 
-    # Pages without blue boxes stay untouched: the PDF keeps them as the
-    # original image.
-    untouched = [page for page in pages if page not in active_pages]
-    if untouched:
-        print("")
-        print("=" * 60)
-        print(f"!! 以下页面无蓝框/未处理，PDF 中保持原图: {', '.join(untouched)}")
-        print("=" * 60)
+    # Every page without a fresh typeset image keeps the original in the
+    # PDF: untouched pages (no blue boxes), never-translated pages, and
+    # failed pages that have no stale image to fall back on.
+    kept_original: list[str] = []
     for page in pages:
-        if page in active_pages:
+        out_png = typeset_dir / f"{page}.typeset.png"
+        if out_png.is_file():
             continue
         source = dataset_dir / page / "original.jpg"
         if not source.is_file():
             source = _source_image_for(images, page)
         if source is not None:
-            import shutil
+            shutil.copyfile(source, out_png)
+            kept_original.append(page)
+    if kept_original:
+        print("")
+        print("=" * 60)
+        print(f"!! 无嵌字结果、PDF 中保持原图的页: {', '.join(kept_original)}")
+        print("=" * 60)
 
-            shutil.copyfile(source, typeset_dir / f"{page}.typeset.png")
-
-    typeset_files = [
-        typeset_dir / f"{page}.typeset.png"
-        for page in pages
-        if (typeset_dir / f"{page}.typeset.png").is_file()
-    ]
+    # Assemble the PDF from EVERY existing typeset image in the directory
+    # (natural page order), not just the pages of this run: when the user
+    # re-processes a subset ("处理页 41,55,58"), the PDF must still contain
+    # the whole book -- the other pages' typeset files are already there.
+    typeset_files = sorted(
+        (
+            path for path in typeset_dir.glob("*.typeset.png")
+            if path.is_file()
+        ),
+        key=lambda path: (
+            (0, int(path.stem))
+            if path.stem.isdigit() else (1, path.stem.lower())
+        ),
+    )
     if not typeset_files:
         print("no pages to assemble into a PDF")
         progress.done(ok=not failed_pages)
@@ -1058,6 +1398,93 @@ def stage2_process(
         print(f"!! 失败页（PDF 中保持原图）: {', '.join(failed_pages)}")
     progress.done(ok=not failed_pages)
     return True
+
+
+def _run_stage2_single(stage: str, images: Path, out_root: Path,
+                       pages: list[str], kwargs: dict, *,
+                       overwrite: bool) -> bool:
+    """Run exactly one stage of stage 2 on ``pages`` (--stage).
+
+    Pages whose prerequisite artifacts are missing are skipped with a
+    warning; ``kwargs`` holds the shared stage-2 options.
+    """
+    from manga_localizer.progress import ProgressFile
+
+    progress = ProgressFile(out_root)
+    dataset_dir = out_root / "dataset"
+    if stage == "ocr":
+        active_pages = _stage2_dataset(images, out_root, pages, progress,
+                                       overwrite=overwrite)
+        if not active_pages:
+            print("no pages with a dataset to OCR (capture first)")
+            progress.done(ok=True)
+            return True
+        _stage2_ocr(
+            out_root, active_pages, progress=progress, overwrite=overwrite,
+            ai_ocr_url=kwargs["ai_ocr_url"],
+            ai_ocr_model=kwargs["ai_ocr_model"],
+            ai_ocr_api_key=kwargs["ai_ocr_api_key"],
+            stage2_engine=kwargs.get("stage2_engine", "manga-ocr"),
+        )
+        progress.done(ok=True)
+        return True
+    if stage == "translate":
+        dataset_pages = [
+            page for page in pages
+            if (dataset_dir / page / "islands.json").is_file()
+        ]
+        page_texts, _directions, _dropped = _load_page_texts(
+            out_root, dataset_pages)
+        qualified = [
+            page for page in dataset_pages
+            if any(page_texts.get(page, {}).values())
+        ]
+        skipped = sorted(set(dataset_pages) - set(qualified))
+        if skipped:
+            print("!! " + "=" * 60)
+            print(f"!! 无 OCR 结果的页（先跑 --stage ocr）: {', '.join(skipped)}")
+            print("!! " + "=" * 60)
+        if not qualified:
+            print("no pages to translate (no OCR readings)")
+            progress.done(ok=True)
+            return True
+        _stage2_translate(
+            out_root, qualified, page_texts, progress=progress,
+            overwrite=overwrite, ai_url=kwargs["ai_url"],
+            ai_model=kwargs["ai_model"], ai_api_key=kwargs["ai_api_key"],
+            max_workers=kwargs["max_workers"],
+        )
+        progress.done(ok=True)
+        return True
+    # typeset
+    translations = _load_translations(out_root)
+    dataset_pages = [
+        page for page in pages
+        if (dataset_dir / page / "islands.json").is_file()
+    ]
+    translated = [page for page in dataset_pages if translations.get(page)]
+    skipped = sorted(set(dataset_pages) - set(translated))
+    if skipped:
+        print("!! " + "=" * 60)
+        print(f"!! 无翻译结果的页（先跑 --stage translate，将保持原图）: "
+              f"{', '.join(skipped)}")
+        print("!! " + "=" * 60)
+    page_texts, page_directions, dropped_boxes = _load_page_texts(
+        out_root, dataset_pages)
+    return _stage2_typeset(
+        out_root, images, pages, translated, translations,
+        page_directions, dropped_boxes, progress=progress,
+        resume=kwargs["resume"], no_pdf=kwargs["no_pdf"],
+        min_font_size=kwargs["min_font_size"], font_name=kwargs["font_name"],
+        stroke_divisor=kwargs["stroke_divisor"],
+        row_gap_divisor=kwargs["row_gap_divisor"],
+        column_gap_divisor=kwargs["column_gap_divisor"],
+        tracking_divisor=kwargs["tracking_divisor"],
+        text_color=kwargs["text_color"], stroke_color=kwargs["stroke_color"],
+        background_color=kwargs["background_color"],
+        max_workers=kwargs["max_workers"],
+    )
+
 
 
 def _fallback_pages_for(capture_dir: Path, pages: list[str]) -> set[str]:
@@ -1361,8 +1788,13 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--capture-only", action="store_true",
                         help="stage 1 only (capture + blue-box check images)")
-    parser.add_argument("--process", action="store_true",
-                        help="stage 2 only (background processing)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--process", action="store_true",
+                      help="stage 2 only (background processing)")
+    mode.add_argument("--stage", choices=["ocr", "translate", "typeset"],
+                      help="run only one stage of stage 2 (--pages selects "
+                           "the pages for it; prerequisite artifacts must "
+                           "already exist, pages without them are skipped)")
     parser.add_argument("--auto", action="store_true",
                         help="run stage 2 immediately after stage 1")
     parser.add_argument("--bluebox-fill", default="0,0,0",
@@ -1408,9 +1840,32 @@ def main(argv=None) -> int:
         help="AI OCR API key (or AI_OCR_API_KEY env)",
     )
     parser.add_argument(
+        "--ocr-engine",
+        choices=["auto", "windows-ocr", "paddle"],
+        default="auto",
+        help="capture-stage masked OCR engine (default auto: Windows OCR then "
+             "Paddle fallback; forced engines fail loudly)",
+    )
+    parser.add_argument(
+        "--stage2-engine",
+        choices=["manga-ocr", "ai-ocr"],
+        default="manga-ocr",
+        help="stage2 blue-box reading engine (default manga-ocr; ai-ocr needs "
+             "--ai-ocr-url/--ai-ocr-model/--ai-ocr-api-key)",
+    )
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
         "--resume",
         action="store_true",
         help="stage2: skip pages whose typeset output already exists",
+    )
+    resume_group.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace old results: capture re-captures the selected pages "
+             "(their old capture/dataset/check artifacts and cache keys are "
+             "purged first), and the chosen stage redoes its work from "
+             "scratch instead of reusing caches",
     )
     parser.add_argument(
         "--no-pdf",
@@ -1528,14 +1983,16 @@ def main(argv=None) -> int:
         print(f"no images found in {images}", file=sys.stderr)
         return 2
 
-    if not args.process:
+    if not args.process and not args.stage:
         ok = stage1_capture(images, out_root, pages_set, args.parallel,
                             args.display_scale, args.layout_row_gap,
                             args.layout_bottom_shift_up,
                             layout_region=args.layout_region,
                             box_delta=args.box_delta,
                             box_tolerance=args.box_tolerance,
-                            box_area_ratio=args.box_area_ratio)
+                            box_area_ratio=args.box_area_ratio,
+                            overwrite=args.overwrite,
+                            ocr_engine=args.ocr_engine)
         if not ok:
             print("capture failed", file=sys.stderr)
             return 2
@@ -1568,10 +2025,7 @@ def main(argv=None) -> int:
         print("no capturable pages (all black)", file=sys.stderr)
         return 2
     _config = _load_api_config()
-    return 0 if stage2_process(
-        images,
-        out_root,
-        active_pages,
+    kwargs = dict(
         ai_url=args.ai_url,
         ai_model=args.ai_model,
         ai_api_key=args.ai_api_key
@@ -1582,6 +2036,7 @@ def main(argv=None) -> int:
         ai_ocr_api_key=args.ai_ocr_api_key
         or os.environ.get("AI_OCR_API_KEY", "")
         or _config.get("ai_ocr_api_key", ""),
+        stage2_engine=args.stage2_engine,
         resume=args.resume,
         no_pdf=args.no_pdf,
         min_font_size=args.min_font_size,
@@ -1594,6 +2049,14 @@ def main(argv=None) -> int:
         stroke_color=args.stroke_color,
         background_color=args.background_color,
         max_workers=max(1, min(3, args.max_workers)),
+    )
+    if args.stage:
+        return 0 if _run_stage2_single(
+            args.stage, images, out_root, active_pages, kwargs,
+            overwrite=args.overwrite,
+        ) else 2
+    return 0 if stage2_process(
+        images, out_root, active_pages, overwrite=args.overwrite, **kwargs,
     ) else 2
 
 
