@@ -13,6 +13,7 @@ __pycache__/
 /sakura/llama/
 /sakura/models/
 /sakura/*.log
+/models/baberu-ocr/
 /manga_translator.log
 
 # Legacy archive (kept locally, not tracked)
