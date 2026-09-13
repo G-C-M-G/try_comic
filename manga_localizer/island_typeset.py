@@ -126,8 +126,9 @@ class TypesetConfig:
     column_gap_divisor: int = COLUMN_GAP_DIVISOR
     row_gap_divisor: int = COLUMN_GAP_DIVISOR
     min_font_size: int = MIN_FONT_SIZE
-    # 拟声词字号上限（见 thresholds.SFX_MAX_FONT_SIZE 的说明）。只作用于
-    # 被判定为拟声词的岛，且只封顶不放大。
+    # 字号上限（见 thresholds.SFX_MAX_FONT_SIZE 的说明）。作用于调用方判定为
+    # "短原文/拟声词"的岛（``typeset_island_page(capped_islands=...)``），
+    # 只封顶不放大。
     sfx_max_font_size: int = SFX_MAX_FONT_SIZE
     padding: int = 0
 
@@ -556,7 +557,7 @@ def _fit_size(
     if direction == "horizontal" and glyph_height_limit is not None and glyph_height_limit > 0:
         max_size = max(MIN_FONT_SIZE_MIN, min(max_size, int(glyph_height_limit)))
     if sfx:
-        # 拟声词只封顶不放大：框小的时候仍按框自适应
+        # 短原文/拟声词只封顶不放大：框小的时候仍按框自适应
         max_size = max(
             MIN_FONT_SIZE_MIN,
             min(max_size, int(config.sfx_max_font_size)),
@@ -779,7 +780,7 @@ def typeset_island_page(
     ] = None,
     direction_overrides: Optional[Mapping[str, str]] = None,
     union_overrides: Optional[Mapping[str, dict]] = None,
-    sfx_islands: Optional[Collection[str]] = None,
+    capped_islands: Optional[Collection[str]] = None,
 ) -> IslandTypesetResult:
     if erased.size != dataset.image_size:
         raise ErasureError(
@@ -787,7 +788,7 @@ def typeset_island_page(
         )
     started = time.perf_counter()
     canvas = erased.convert("RGB").copy()
-    sfx_ids = frozenset(sfx_islands or ())
+    capped_ids = frozenset(capped_islands or ())
     audits = []
     for island in dataset.islands:
         if island.id not in translations:
@@ -823,7 +824,7 @@ def typeset_island_page(
         plan = _compute_island_plan(
             island, text, direction, config,
             union_overrides=union_overrides,
-            sfx=island.id in sfx_ids,
+            sfx=island.id in capped_ids,
         )
         if plan.get("block_bbox") is None:
             audits.append(

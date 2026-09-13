@@ -57,9 +57,10 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from manga_localizer.ai_ocr import DEFAULT_WORKERS as AI_OCR_DEFAULT_WORKERS
-from manga_localizer.text_rules import is_sfx_like
+from manga_localizer.text_rules import is_sfx_like, short_source
 from manga_localizer.thresholds import (
     SFX_MAX_FONT_SIZE,
+    SHORT_SOURCE_MAX_CHARS,
     STROKE_OVERFLOW_MARGIN,
     SFX_GLOSSARY_MIN_COUNT,
     SFX_MIN_SIDE_PAGE,
@@ -167,6 +168,75 @@ def _is_black_page(image_path: Path, dark_ratio: float = 0.90) -> bool:
     return float((arr < 32).mean()) > dark_ratio
 
 
+def _direction_groups(bboxes: Sequence[Sequence[int]]) -> dict[str, list[int]]:
+    """按方向分组：横框（宽≥高）/ 竖框。"""
+    groups: dict[str, list[int]] = {"h": [], "v": []}
+    for index, box in enumerate(bboxes):
+        key = "h" if (box[2] - box[0]) >= (box[3] - box[1]) else "v"
+        groups[key].append(index)
+    return groups
+
+
+def _direction_baseline(
+    bboxes: Sequence[Sequence[int]], key: str, *,
+    min_group: int = 3, page_median: float | None = None,
+) -> float:
+    """某方向的短边基准；该方向样本 < ``min_group`` 时回落全页中位数。
+
+    "短边 ≈ 字号"是这套判据的地基（横竖都成立），基准按方向分开算才不会被
+    另一种字号污染；样本太少时基准无法自证，回落全页（判据说明见
+    ``_filter_large_sfx``）。
+    """
+    if page_median is None:
+        page_median = float(np.median(
+            [min(b[2] - b[0], b[3] - b[1]) for b in bboxes]
+        ))
+    indices = _direction_groups(bboxes)[key]
+    if len(indices) < min_group:
+        return page_median
+    return float(np.median([
+        min(bboxes[i][2] - bboxes[i][0], bboxes[i][3] - bboxes[i][1])
+        for i in indices
+    ]))
+
+
+def oversized_single_box_islands(
+    dataset, boxes: Sequence[dict], *,
+    ratio: float = SFX_MIN_SIDE_RATIO, min_group: int = 3,
+) -> set[str]:
+    """**未被合并的框**里，短边远超同方向平均值的岛（大概率是拟声词）。
+
+    只认单框岛：合并过的组是"一句被拆成几段"，短边大是句子长的结果，不是
+    字号大。这类单框在原图里就是巨大的拟声/效果字（比页面常规字号大两倍
+    以上），中文照原尺寸放大只会盖过对白 → 字号封到 --sfx-max-font-size。
+    阈值复用大拟音筛框的 ``--sfx-min-side-ratio``（默认 2.0× 同方向基准）。
+    """
+    if len(boxes) < 3:
+        return set()
+    bboxes = [list(b["image_bbox"]) for b in boxes]
+    page_median = float(np.median(
+        [min(b[2] - b[0], b[3] - b[1]) for b in bboxes]
+    ))
+    capped: set[str] = set()
+    for island in dataset.islands:
+        ix1, iy1, ix2, iy2 = island.image_bbox
+        members = [
+            b for b in boxes
+            if ix1 <= (b["image_bbox"][0] + b["image_bbox"][2]) // 2 <= ix2
+            and iy1 <= (b["image_bbox"][1] + b["image_bbox"][3]) // 2 <= iy2
+        ]
+        if len(members) != 1:
+            continue
+        box = members[0]["image_bbox"]
+        key = "h" if (box[2] - box[0]) >= (box[3] - box[1]) else "v"
+        baseline = _direction_baseline(bboxes, key, min_group=min_group,
+                                       page_median=page_median)
+        short = min(box[2] - box[0], box[3] - box[1])
+        if baseline > 0 and short > ratio * baseline:
+            capped.add(island.id)
+    return capped
+
+
 def _filter_large_sfx(
     bboxes: list[list[int]], image_w: int, image_h: int, *,
     ratio: float = 2.0, page_floor: float = 0.10, min_group: int = 3,
@@ -193,20 +263,17 @@ def _filter_large_sfx(
     page_median = float(np.median(short))
     floor_px = page_floor * min(image_w, image_h)
 
-    groups: dict[str, list[int]] = {"h": [], "v": []}
-    for index, box in enumerate(bboxes):
-        key = "h" if (box[2] - box[0]) >= (box[3] - box[1]) else "v"
-        groups[key].append(index)
-
     kept: list[list[int]] = []
     dropped: list[tuple[list[int], int, str]] = []
-    for key, indices in groups.items():
-        if len(indices) >= min_group:
-            baseline = float(np.median([short[i] for i in indices]))
-            basis = f"{'横' if key == 'h' else '竖'}框基准{baseline:.0f}px"
-        else:
-            baseline = page_median
-            basis = f"仅{len(indices)}个{'横' if key == 'h' else '竖'}框,回落全页基准{baseline:.0f}px"
+    for key, indices in _direction_groups(bboxes).items():
+        baseline = _direction_baseline(
+            bboxes, key, min_group=min_group, page_median=page_median,
+        )
+        basis = (
+            f"{'横' if key == 'h' else '竖'}框基准{baseline:.0f}px"
+            if len(indices) >= min_group
+            else f"仅{len(indices)}个{'横' if key == 'h' else '竖'}框,回落全页基准{baseline:.0f}px"
+        )
         for index in indices:
             box = bboxes[index]
             if short[index] > ratio * baseline and short[index] > floor_px:
@@ -1388,6 +1455,7 @@ def stage2_process(
     max_workers: int = 1,
     sfx_glossary_min_count: int = 2,
     sfx_max_font_size: int | None = None,
+    short_source_max_chars: int = SHORT_SOURCE_MAX_CHARS,
     progress: "ProgressFile | None" = None,
     overwrite: bool = False,
 ) -> bool:
@@ -1437,6 +1505,8 @@ def stage2_process(
         page_directions, dropped_boxes, progress=progress, resume=resume,
         no_pdf=no_pdf, min_font_size=min_font_size,
         sfx_sources=page_texts, sfx_max_font_size=sfx_max_font_size,
+        short_source_max_chars=short_source_max_chars,
+        sfx_min_side_ratio=sfx_min_side_ratio,
         font_name=font_name,
         stroke_divisor=stroke_divisor, row_gap_divisor=row_gap_divisor,
         column_gap_divisor=column_gap_divisor,
@@ -1944,6 +2014,8 @@ def _stage2_typeset(out_root: Path, images: Path, pages: list[str],
                     no_pdf: bool = False, min_font_size: int | None = None,
                     sfx_sources: dict[str, dict[str, str]] | None = None,
                     sfx_max_font_size: int | None = None,
+                    short_source_max_chars: int = SHORT_SOURCE_MAX_CHARS,
+                    sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
                     font_name: str = "", stroke_divisor: int | None = None,
                     row_gap_divisor: int | None = None,
                     column_gap_divisor: int | None = None,
@@ -1986,6 +2058,8 @@ def _stage2_typeset(out_root: Path, images: Path, pages: list[str],
                 min_font_size=min_font_size,
                 sources=(sfx_sources or {}).get(page),
                 sfx_max_font_size=sfx_max_font_size,
+                short_source_max_chars=short_source_max_chars,
+                sfx_min_side_ratio=sfx_min_side_ratio,
                 font_name=font_name,
                 stroke_divisor=stroke_divisor, row_gap_divisor=row_gap_divisor,
                 column_gap_divisor=column_gap_divisor,
@@ -2179,6 +2253,9 @@ def _run_stage2_single(stage: str, images: Path, out_root: Path,
         min_font_size=kwargs["min_font_size"],
         sfx_sources=page_texts,
         sfx_max_font_size=kwargs.get("sfx_max_font_size"),
+        short_source_max_chars=kwargs.get(
+            "short_source_max_chars", SHORT_SOURCE_MAX_CHARS),
+        sfx_min_side_ratio=kwargs.get("sfx_min_side_ratio", SFX_MIN_SIDE_RATIO),
         font_name=kwargs["font_name"],
         stroke_divisor=kwargs["stroke_divisor"],
         row_gap_divisor=kwargs["row_gap_divisor"],
@@ -2442,6 +2519,7 @@ def erase_and_typeset_page_with(
     min_font_size: int | None = None,
     sources: dict[str, str] | None = None,
     sfx_max_font_size: int | None = None,
+    short_source_max_chars: int = SHORT_SOURCE_MAX_CHARS,
     font_name: str | None = None,
     stroke_divisor: int | None = None,
     row_gap_divisor: int | None = None,
@@ -2450,6 +2528,7 @@ def erase_and_typeset_page_with(
     text_color: tuple[int, int, int] | None = None,
     stroke_color: tuple[int, int, int] | None = None,
     background_color: tuple[int, int, int] | None = None,
+    sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
 ):
     import dataclasses
 
@@ -2600,18 +2679,25 @@ def erase_and_typeset_page_with(
         dataset_dir / page, source, active_dataset, extra_regions,
         ErasureConfig(), 800.0,
     )
-    # 拟声词：判据用**日文原文**（不是译文）——短假名/符号才是拟声词，
-    # 正常台词一律不算。它们按 SFX_MAX_FONT_SIZE 封顶，避免大拟声框嵌出
-    # 一个巨型中文拟声盖过对白。
-    sfx_islands = {
+    # 字号封顶的岛：判据用**日文原文**（不是译文）——(a) 拟声词（短假名/符号），
+    # (b) 短原文（≤ SHORT_SOURCE_MAX_CHARS 字，默认 6，用户要求"少于 6 个字就
+    # 严格限制"）。两者都按 SFX_MAX_FONT_SIZE 封顶：漫画里 2~3 个字的台词，
+    # 蓝框往往很大（原文字本来就写得大），字号跟框走会嵌出一个 80~90px 的中文
+    # 短句，与整页文字失衡。只封顶不放大。
+    capped_islands = {
         island_id for island_id, source_text in (sources or {}).items()
         if is_sfx_like(str(source_text))
+        or short_source(str(source_text), short_source_max_chars)
     }
+    # 几何判据（不需要原文）：未合并的单框、短边远超同方向平均 → 大概率拟声词
+    capped_islands |= oversized_single_box_islands(
+        dataset, boxes, ratio=sfx_min_side_ratio,
+    )
     result = typeset_island_page(
         erased, canonical_dataset, translations, blue_lines, config=config,
         direction_overrides=directions,
         union_overrides=union_overrides,
-        sfx_islands=sfx_islands,
+        capped_islands=capped_islands,
     )
     result.image.save(typeset_dir / f"{page}.typeset.png")
     return result
@@ -2667,6 +2753,12 @@ def main(argv=None) -> int:
         help="拟声词嵌字字号上限（默认 %(default)s px）。拟声框在原图里往往"
              "又大又粗，字号跟框走会盖过对白；上限只封顶不放大（框小仍按框"
              "自适应）",
+    )
+    parser.add_argument(
+        "--short-source-max-chars", type=int, default=SHORT_SOURCE_MAX_CHARS,
+        help="短原文字数门槛：原文（日文）≤ 该值时字号严格封顶到 "
+             "--sfx-max-font-size（默认 %(default)s 字）。2~3 个字的台词蓝框往往"
+             "很大，字号跟框走会嵌出 80~90px 的中文短句",
     )
     parser.add_argument(
         "--sfx-glossary-min-count", type=int,
@@ -3032,6 +3124,7 @@ def main(argv=None) -> int:
         sfx_min_side_page=args.sfx_min_side_page,
         sfx_glossary_min_count=args.sfx_glossary_min_count,
         sfx_max_font_size=args.sfx_max_font_size,
+        short_source_max_chars=args.short_source_max_chars,
         resume=args.resume,
         no_pdf=args.no_pdf,
         min_font_size=args.min_font_size,

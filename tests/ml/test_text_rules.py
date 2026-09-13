@@ -38,3 +38,44 @@ class NormalizeEllipsisTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShortSourceTests(unittest.TestCase):
+    """短原文判据：≤ N 字（非空白计数），0/负数 = 关闭。"""
+
+    def test_short_kana_and_kanji_lines(self):
+        from manga_localizer.text_rules import short_source
+
+        self.assertTrue(short_source("ぎゅっ♡", 6))
+        self.assertTrue(short_source("甲书", 6))
+        self.assertTrue(short_source("あ", 6))
+
+    def test_long_source_not_short(self):
+        from manga_localizer.text_rules import short_source
+
+        self.assertFalse(short_source("これはテスト用の長文", 6))
+        self.assertFalse(short_source("あ" * 7, 6))
+
+    def test_whitespace_not_counted(self):
+        from manga_localizer.text_rules import short_source
+
+        self.assertTrue(short_source("ぎゅ っ ♡", 4))
+        self.assertFalse(short_source("ぎゅ っ ♡", 3))
+
+    def test_threshold_is_adjustable(self):
+        from manga_localizer.text_rules import short_source
+
+        self.assertFalse(short_source("ぎゅっ", 2))
+        self.assertTrue(short_source("ぎゅっ", 3))
+
+    def test_zero_disables(self):
+        from manga_localizer.text_rules import short_source
+
+        self.assertFalse(short_source("あ", 0))
+        self.assertFalse(short_source("あ", -1))
+
+    def test_empty_is_not_short(self):
+        from manga_localizer.text_rules import short_source
+
+        self.assertFalse(short_source("", 6))
+        self.assertFalse(short_source("   ", 6))

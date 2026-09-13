@@ -48,6 +48,21 @@ def is_sfx_like(text: str) -> bool:
     return bool(_SFX_LIKE.match(stripped))
 
 
+def short_source(text: str, max_chars: int = 6) -> bool:
+    """原文是否"很短"（非空白字符数 ≤ ``max_chars``）。
+
+    短原文的字号必须封顶：漫画里 2~3 个字的台词，蓝框却可能很大（原文那几个
+    字本来就写得大），字号跟着框走会嵌出一个 80~90px 的中文短句（实测
+    07_6/island_014 = 2 字撑到 88px），与整页文字明显失衡。
+    """
+    if max_chars is None or int(max_chars) <= 0:
+        return False          # 0 或负数 = 关闭该规则
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    return len([ch for ch in stripped if not ch.isspace()]) <= int(max_chars)
+
+
 def suspicious_short_kana(text: str) -> bool:
     """读数是否"可疑的短假名"（= ``is_sfx_like``，OCR 侧命名）。
 

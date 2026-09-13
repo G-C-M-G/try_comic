@@ -195,7 +195,7 @@ if __name__ == "__main__":
 
 
 class SfxFontCapTests(unittest.TestCase):
-    """拟声词（短假名/符号）字号封顶，且只封顶不放大。
+    """字号封顶岛（拟声词/短原文/过大单框）只封顶不放大。
 
     大拟声框在原图里又大又粗，字号若跟着框走会得到 60~120px 的中文拟声，
     压过对白；封顶后固定在小注音量级。判定依据是**日文原文**，正常台词
@@ -207,13 +207,13 @@ class SfxFontCapTests(unittest.TestCase):
             [("island_001", (100, 100, 100 + size[0], 100 + size[1]))], tmp
         )
 
-    def _typeset(self, dataset, translations, sfx_islands, direction="vertical"):
+    def _typeset(self, dataset, translations, capped_islands, direction="vertical"):
         erased = Image.new("RGB", dataset.image_size, (250, 250, 250))
         return typeset_island_page(
             erased, dataset, translations, [],
             config=TypesetConfig(),
             direction_overrides={"island_001": direction},
-            sfx_islands=sfx_islands,
+            capped_islands=capped_islands,
         )
 
     def test_sfx_capped_at_configured_max(self):
@@ -243,7 +243,7 @@ class SfxFontCapTests(unittest.TestCase):
                 erased, dataset, {"island_001": "夹紧♡"}, [],
                 config=TypesetConfig(sfx_max_font_size=18),
                 direction_overrides={"island_001": "vertical"},
-                sfx_islands={"island_001"},
+                capped_islands={"island_001"},
             )
             self.assertLessEqual(result.audits[0].font_size, 18)
 
@@ -262,5 +262,69 @@ class SfxFontCapTests(unittest.TestCase):
             result = self._typeset(
                 dataset, {"island_001": "夹紧♡"}, {"island_001"},
                 direction="horizontal",
+            )
+            self.assertLessEqual(result.audits[0].font_size, 30)
+
+
+class OversizedSingleBoxTests(unittest.TestCase):
+    """过大单框（未合并、短边 ≫ 同方向平均）按拟声词封顶。
+
+    只认单框岛：合并组的短边大是"句子被拆成几段"的结果，不是字号大。
+    阈值复用大拟音筛框的 2.0× 同方向基准。
+    """
+
+    def _boxes(self, sizes):
+        return [
+            {"id": f"sel_{i:03d}", "image_bbox": [10 + i * 40, 10, 10 + i * 40 + w, 10 + h]}
+            for i, (w, h) in enumerate(sizes)
+        ]
+
+    def _islands(self, specs, tmp):
+        return _dataset(specs, tmp)
+
+    def test_oversized_single_box_capped(self):
+        from one_click_translate import oversized_single_box_islands
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 一页常规竖框短边 60，外加一个短边 200 的孤立大框
+            sizes = [(60, 200)] * 4 + [(60, 200), (200, 400)]
+            boxes = self._boxes(sizes)
+            specs = []
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = box["image_bbox"]
+                specs.append((f"island_{i + 1:03d}", (x1, y1, x2, y2)))
+            dataset = self._islands(specs, tmp)
+            capped = oversized_single_box_islands(dataset, boxes, ratio=2.0)
+            self.assertEqual(capped, {"island_006"})
+
+    def test_merged_island_not_capped(self):
+        from one_click_translate import oversized_single_box_islands
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sizes = [(60, 200)] * 4
+            boxes = self._boxes(sizes)
+            # 一个岛包含两个框（合并过）→ 即使框很大也不封顶
+            dataset = self._islands([("island_001", (10, 10, 500, 420))], tmp)
+            self.assertEqual(oversized_single_box_islands(dataset, boxes, ratio=2.0), set())
+
+    def test_normal_single_box_not_capped(self):
+        from one_click_translate import oversized_single_box_islands
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sizes = [(60, 200)] * 4
+            boxes = self._boxes(sizes)
+            specs = [("island_001", (10, 10, 70, 210))]
+            dataset = self._islands(specs, tmp)
+            self.assertEqual(oversized_single_box_islands(dataset, boxes, ratio=2.0), set())
+
+    def test_capped_font_size_in_typeset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = _dataset([("island_001", (100, 100, 500, 700))], tmp)
+            erased = Image.new("RGB", dataset.image_size, (250, 250, 250))
+            result = typeset_island_page(
+                erased, dataset, {"island_001": "轰轰轰"}, [],
+                config=TypesetConfig(),
+                direction_overrides={"island_001": "vertical"},
+                capped_islands={"island_001"},
             )
             self.assertLessEqual(result.audits[0].font_size, 30)
