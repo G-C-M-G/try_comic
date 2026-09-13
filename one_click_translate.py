@@ -195,7 +195,7 @@ def capture_boxes_with_paddle(
     检测到的框是**文本行**级（Photos 对白页也是按句切分，两者粒度接近；
     但大字/疏排页面 Photos 会退化成逐字，Paddle 仍是整行——见 开发记录）。
     """
-    capture_dir = out_root / "capture"
+    capture_dir = _capture_source_dir(out_root, "paddle")
     capture_dir.mkdir(parents=True, exist_ok=True)
     raw_output = out_root / "paddle_boxes.json"
     worker = ROOT / "paddle_ocr_worker.py"
@@ -331,10 +331,11 @@ def stage1_capture(
     check image, dataset, OCR/translation cache keys) first, so a
     re-capture replaces the old result instead of being skipped.
     """
-    capture_dir = out_root / "capture"
     check_dir = out_root / "check"
-    capture_dir.mkdir(parents=True, exist_ok=True)
     check_dir.mkdir(parents=True, exist_ok=True)
+    # 采集结果按来源分开存放：capture/paddle/ 与 capture/photos/ 互不覆盖
+    capture_dir = _capture_source_dir(out_root, "photos")
+    capture_dir.mkdir(parents=True, exist_ok=True)
 
     if overwrite:
         target = sorted(pages) if pages else [
@@ -431,102 +432,83 @@ def stage1_capture(
             return False
         progress.progress(len(pages) if pages else 0, item="capture done")
 
-    # check images: blue boxes (blue, drawn padded like OCR uses them) +
-    # page_scale (red) per page.  No highlight-island detection: only the
-    # Photos blue boxes matter.
+    # check images：画的是 capture.json 的 selection_blocks（扩 6px），
+    # 按来源分目录存放（check/paddle/ 红框、check/photos/ 蓝框）
     pad = 6
-    for page_dir in sorted(capture_dir.iterdir()):
-        if not page_dir.is_dir():
-            continue
-        manifest_path = page_dir / "capture.json"
-        if not manifest_path.is_file():
-            continue
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
+    for source, page, manifest_path in _iter_capture_pages(out_root):
+        manifest = _load_capture(manifest_path)
+        if manifest is None:
             continue
         capture = manifest.get("capture", {})
         if not capture.get("complete"):
             continue
-        source = manifest.get("source", {})
-        image_size = (int(source["width"]), int(source["height"]))
-        image_path = Path(source["path"])
+        source_meta = manifest.get("source", {})
+        image_size = (int(source_meta["width"]), int(source_meta["height"]))
+        image_path = Path(source_meta["path"])
         if not image_path.is_file():
             continue
-        selection_blocks = capture.get("selection_blocks") or []
-        # Check image = the original page with the detected/selected boxes
-        # drawn on top (no dimming/filling): review shows true pixel
-        # brightness.  **颜色按框来源区分**：Photos 蓝框画蓝、Paddle 检测框画红
-        # —— 一眼看出这页的框来自哪条路径，审核页在两种来源下也都能看到
-        # "当时检出了什么"。文件名保持 bluebox_check.png 不变（工具链到处引用）。
-        box_source = str(capture.get("box_source") or "photos")
-        color = "#e6194b" if box_source == "paddle" else "#4363d8"
+        color = "#e6194b" if source == "paddle" else "#4363d8"
         image = Image.open(image_path).convert("RGB")
         draw = ImageDraw.Draw(image)
-        for block in selection_blocks:
+        for block in capture.get("selection_blocks") or []:
             x1, y1, x2, y2 = block["image_bbox"]
             x1 = max(0, x1 - pad)
             y1 = max(0, y1 - pad)
             x2 = min(image_size[0], x2 + pad)
             y2 = min(image_size[1], y2 + pad)
             draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-            draw.text((x1, min(image.height - 14, y2 + 2)), block["id"],
-                      fill=color)
-        image.save(check_dir / f"{page_dir.name}.bluebox_check.png")
+            draw.text((x1, min(image.height - 14, y2 + 2)), block["id"], fill=color)
+        target_dir = _check_source_dir(out_root, source)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        image.save(target_dir / f"{page}.bluebox_check.png")
     print(f"blue-box check images -> {check_dir}")
 
-    # Report pages that will not be processed because no blue boxes (or no
-    # usable capture) were found: written to a report file, printed and
-    # surfaced with a message box.
-    report_rows: list[tuple[str, str]] = []
-    for page_dir in sorted(capture_dir.iterdir()):
-        if not page_dir.is_dir():
-            continue
-        manifest_path = page_dir / "capture.json"
-        if not manifest_path.is_file():
-            continue
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
+    # 报告：没有可用框的页（按来源列出）
+    report_rows: list[tuple[str, str, str]] = []
+    for source, page, manifest_path in _iter_capture_pages(out_root):
+        manifest = _load_capture(manifest_path)
+        if manifest is None:
             continue
         capture = manifest.get("capture", {})
         if capture.get("complete") and not (capture.get("selection_blocks") or []):
             reason = capture.get("selection_boxes_status") or "no blue boxes detected"
-            report_rows.append((page_dir.name, reason))
+            report_rows.append((source, page, reason))
         elif capture.get("black_page"):
-            report_rows.append((page_dir.name, "black page (no content)"))
+            report_rows.append((source, page, "black page (no content)"))
         elif capture.get("no_text"):
-            report_rows.append((page_dir.name, "no text detected"))
+            report_rows.append((source, page, "no text detected"))
         elif capture.get("fallback_manga"):
-            report_rows.append((page_dir.name, "capture failed (manga fallback)"))
+            report_rows.append((source, page, "capture failed (manga fallback)"))
         elif not capture.get("complete"):
             report_rows.append(
-                (page_dir.name, capture.get("error") or "capture failed")
+                (source, page, capture.get("error") or "capture failed")
             )
     if report_rows:
         report_path = out_root / "BLUEBOX_REPORT.md"
         lines = ["# 蓝框缺失报告", ""]
         lines.append("以下页面未识别到蓝框（或采集未完成），将保持原样不处理：")
         lines.append("")
-        for page, reason in report_rows:
-            lines.append(f"- 第 {page} 页：{reason}")
+        for source, page, reason in report_rows:
+            lines.append(f"- [{source}] 第 {page} 页：{reason}")
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        summary = "、".join(page for page, _ in report_rows)
+        summary = "、".join(
+            f"{page}({source})" for _source, page, _reason in report_rows
+        )
         print("")
         print("=" * 60)
         print(f"!! 蓝框缺失: {len(report_rows)} 页 -> {report_path}")
-        for page, reason in report_rows:
-            print(f"   - 第 {page} 页: {reason}")
+        for source, page, reason in report_rows:
+            print(f"   - [{source}] 第 {page} 页: {reason}")
         print("=" * 60)
         try:
             import ctypes
 
             ctypes.windll.user32.MessageBoxW(
                 None,
-                f"以下页面未识别到蓝框，将保持原样不处理：\n{summary}\n\n"
-                f"详见 {report_path}",
+                "以下页面未识别到蓝框，将保持原样不处理：\n"
+                f"{summary}\n\n详见 {report_path}",
                 "蓝框缺失报告",
-                0x00000040 | 0x00001000,  # MB_ICONINFORMATION | MB_SYSTEMMODAL
+                0x00000040 | 0x00001000,
             )
         except Exception:
             pass
@@ -681,13 +663,16 @@ def _purge_page_artifacts(out_root: Path, pages: list[str], *,
     selected = set(pages)
     if capture:
         for page in pages:
-            for sub in ("capture", "dataset"):
-                target = out_root / sub / page
+            target = out_root / "dataset" / page
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            for source in CAPTURE_SOURCES:
+                target = _capture_source_dir(out_root, source) / page
                 if target.is_dir():
                     shutil.rmtree(target, ignore_errors=True)
-            check_png = out_root / "check" / f"{page}.bluebox_check.png"
-            if check_png.is_file():
-                check_png.unlink(missing_ok=True)
+                check_png = _check_source_dir(out_root, source) / f"{page}.bluebox_check.png"
+                if check_png.is_file():
+                    check_png.unlink(missing_ok=True)
     if dataset:
         for page in pages:
             target = out_root / "dataset" / page
@@ -1300,6 +1285,7 @@ def stage2_process(
     ai_ocr_model: str = "",
     ai_ocr_api_key: str = "",
     stage2_engine: str = "manga-ocr",
+    box_source: str = "paddle",
     drop_large_boxes: bool = True,
     sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
     sfx_min_side_page: float = SFX_MIN_SIDE_PAGE,
@@ -1342,6 +1328,7 @@ def stage2_process(
 
     active_pages = _stage2_dataset(
         images, out_root, pages, progress, overwrite=overwrite,
+        box_source=box_source,
         drop_large_boxes=drop_large_boxes,
         sfx_min_side_ratio=sfx_min_side_ratio,
         sfx_min_side_page=sfx_min_side_page,
@@ -1368,36 +1355,107 @@ def stage2_process(
     )
 
 
-def _mark_review_required(capture_dir: Path, page: str, reason: str) -> None:
-    """把一页标记为"待人工审核"（写进 capture.json，审核页据此列出）。
+# ---------------------------------------------------------------------------
+# capture / check 的目录布局
+#   capture/{source}/{page}/capture.json     source = paddle | photos
+#   check/{source}/{page}.bluebox_check.png
+#   dataset/{page}/...   typeset/{page}.typeset.png   （单套，由当前来源生成）
+# 两条框来源**各自独立存放**，切来源不会覆盖对方的采集结果；dataset/typeset
+# 只有一套，由本次运行选用的来源生成。所有读写都走下面这几个解析函数。
+# ---------------------------------------------------------------------------
 
-    用于**筛框之后**才发现无框可用的页：这类页在采集期是有框的，所以不会
-    被采集期的审核标记覆盖到，必须在这里补记，否则会被静默跳过。
+CAPTURE_SOURCES = ("paddle", "photos")
+
+
+def _capture_source_dir(out_root: Path, source: str) -> Path:
+    return Path(out_root) / "capture" / source
+
+
+def _check_source_dir(out_root: Path, source: str) -> Path:
+    return Path(out_root) / "check" / source
+
+
+def _capture_source_dirs(out_root: Path) -> list[tuple[str, Path]]:
+    """已存在的来源目录（按 CAPTURE_SOURCES 顺序，paddle 在前）。"""
+    root = Path(out_root) / "capture"
+    return [
+        (source, root / source)
+        for source in CAPTURE_SOURCES
+        if (root / source).is_dir()
+    ]
+
+
+def _find_capture_page(
+    out_root: Path, page: str, preferred: str = ""
+) -> tuple[str, Path] | None:
+    """定位某页的 capture.json：优先 ``preferred`` 来源，其次另一来源。
+
+    返回 ``(source, manifest_path)``；两个来源都没有则 ``None``。
     """
-    manifest_path = Path(capture_dir) / page / "capture.json"
-    if not manifest_path.is_file():
-        return
+    order = [s for s in CAPTURE_SOURCES if s == preferred]
+    order += [s for s in CAPTURE_SOURCES if s != preferred]
+    for source in order:
+        manifest = _capture_source_dir(out_root, source) / page / "capture.json"
+        if manifest.is_file():
+            return source, manifest
+    return None
+
+
+def _page_sort_key(name: str):
+    return (0, int(name)) if name.isdigit() else (1, name.lower())
+
+
+def _iter_capture_pages(out_root: Path) -> list[tuple[str, str, Path]]:
+    """遍历所有来源下的页，返回 ``(source, page, manifest_path)``。"""
+    rows = []
+    for source, base in _capture_source_dirs(out_root):
+        for page_dir in sorted(base.iterdir(), key=lambda d: _page_sort_key(d.name)):
+            manifest = page_dir / "capture.json"
+            if page_dir.is_dir() and manifest.is_file():
+                rows.append((source, page_dir.name, manifest))
+    return rows
+
+
+def _load_capture(manifest_path: Path) -> dict | None:
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        return json.loads(Path(manifest_path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
-        return
-    capture = manifest.setdefault("capture", {})
-    capture["selection_review_required"] = True
-    capture["selection_review_reason"] = reason
-    capture["selection_empty_after_filter"] = True
-    try:
-        temporary = manifest_path.with_name(manifest_path.name + ".tmp")
-        temporary.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        temporary.replace(manifest_path)
-    except OSError:
-        pass
+        return None
+
+
+def _mark_review_required(out_root: Path, page: str, reason: str) -> None:
+
+    """把一页标记为"待人工审核"（写进该页**所有来源**的 capture.json）。
+
+    用于**筛框之后**才发现无框可用的页：这类页在采集期是有框的，所以不会被
+    采集期的审核标记覆盖到，必须在这里补记，否则会被静默跳过。
+    两个来源都写：审核状态与"框来自哪条路径"无关，审核页读哪个来源都能看到。
+    """
+    for source in CAPTURE_SOURCES:
+        manifest_path = _capture_source_dir(out_root, source) / page / "capture.json"
+        if not manifest_path.is_file():
+            continue
+        manifest = _load_capture(manifest_path)
+        if manifest is None:
+            continue
+        capture = manifest.setdefault("capture", {})
+        capture["selection_review_required"] = True
+        capture["selection_review_reason"] = reason
+        capture["selection_empty_after_filter"] = True
+        try:
+            temporary = manifest_path.with_name(manifest_path.name + ".tmp")
+            temporary.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            temporary.replace(manifest_path)
+        except OSError:
+            pass
 
 
 def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
                     progress: "ProgressFile", *,
                     overwrite: bool = False,
+                    box_source: str = "paddle",
                     drop_large_boxes: bool = True,
                     sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
                     sfx_min_side_page: float = SFX_MIN_SIDE_PAGE) -> list[str]:
@@ -1405,19 +1463,27 @@ def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
     group).  Returns the pages that ended up with a dataset (active)."""
     from island_extract import build_fallback_dataset
 
-    capture_dir = out_root / "capture"
     dataset_dir = out_root / "dataset"
     if overwrite:
         _purge_page_artifacts(out_root, pages, dataset=True,
                               readings=True, translations=True)
-    fallback = _fallback_pages_for(capture_dir, pages)
+    fallback = _fallback_pages_for(out_root, pages)
     # Islands come ONLY from the Photos blue boxes (no highlight-island
     # detection): one island per selection group, original image space.
     progress.set_stage("dataset", total=len(pages))
     for index, page in enumerate(pages):
         progress.progress(index, item=f"page {page}")
         page_dir = dataset_dir / page
-        manifest_path = capture_dir / page / "capture.json"
+        # 本次运行选用的来源优先；该来源没有这页时回退另一来源（并说明），
+        # 这样"用 paddle 跑 stage2、但只有 photos 采集"也能继续。
+        found = _find_capture_page(out_root, page, preferred=box_source)
+        if found is None:
+            continue
+        used_source, manifest_path = found
+        if used_source != box_source:
+            print(
+                f"{page}: 没有 {box_source} 采集结果，改用 {used_source} 采的框"
+            )
         islands_path = page_dir / "islands.json"
         if islands_path.is_file():
             # A stale dataset is the classic silent bug: the page was
@@ -1465,7 +1531,7 @@ def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
             # 在审核页可选择"重新识别（Paddle）"或"重采（Photos）"。
             print(f"{page}: {error}")
             _mark_review_required(
-                capture_dir, page, f"筛框后无框（{error}）",
+                out_root, page, f"筛框后无框（{error}）",
             )
 
     return [
@@ -1863,6 +1929,7 @@ def _run_stage2_single(stage: str, images: Path, out_root: Path,
     if stage == "ocr":
         active_pages = _stage2_dataset(
             images, out_root, pages, progress, overwrite=overwrite,
+            box_source=kwargs.get("box_source", "paddle"),
             drop_large_boxes=kwargs.get("drop_large_boxes", True),
             sfx_min_side_ratio=kwargs.get("sfx_min_side_ratio", SFX_MIN_SIDE_RATIO),
             sfx_min_side_page=kwargs.get("sfx_min_side_page", SFX_MIN_SIDE_PAGE),
@@ -1939,84 +2006,88 @@ def _run_stage2_single(stage: str, images: Path, out_root: Path,
 
 
 
-def _fallback_pages_for(capture_dir: Path, pages: list[str]) -> set[str]:
+def _page_manifests(out_root: Path, page: str) -> list[dict]:
+    """该页在**所有来源**下的 capture.json（按 CAPTURE_SOURCES 顺序）。"""
+    manifests = []
+    for source in CAPTURE_SOURCES:
+        manifest_path = _capture_source_dir(out_root, source) / page / "capture.json"
+        manifest = _load_capture(manifest_path) if manifest_path.is_file() else None
+        if manifest is not None:
+            manifests.append(manifest)
+    return manifests
+
+
+def _fallback_pages_for(out_root: Path, pages: list[str]) -> set[str]:
+    """任一来源用了 manga 保底的页。"""
     fallback = set()
     for page in pages:
-        manifest_path = capture_dir / page / "capture.json"
-        if not manifest_path.is_file():
-            continue
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            continue
-        if manifest.get("capture", {}).get("fallback_manga"):
+        if any(
+            m.get("capture", {}).get("fallback_manga")
+            for m in _page_manifests(out_root, page)
+        ):
             fallback.add(page)
     return fallback
 
 
-def _review_required_pages(capture_dir: Path, pages: list[str]) -> list[str]:
-    """Pages whose capture produced no blue pixels after three Ctrl+A
-    attempts.  Hard rule: these pages are NOT processed downstream until
-    the user reviews them and confirms (--confirm-no-boxes) they really
-    have no selection boxes."""
+def _review_required_pages(out_root: Path, pages: list[str]) -> list[str]:
+    """采集产出无框（三条路径：无蓝色像素 / 无文本 / 筛框后空）的页。
+
+    硬规则：这些页在人工确认（``--confirm-no-boxes``）前**不进下游**。
+    任一来源标了待审即算待审——审核状态与框来自哪条路径无关。
+    """
     review = []
     for page in pages:
-        manifest_path = capture_dir / page / "capture.json"
-        if not manifest_path.is_file():
-            continue
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            continue
-        capture = manifest.get("capture", {})
-        if capture.get("selection_review_required") and not capture.get(
-            "selection_review_confirmed"
-        ):
-            review.append(page)
+        for manifest in _page_manifests(out_root, page):
+            capture = manifest.get("capture", {})
+            if capture.get("selection_review_required") and not capture.get(
+                "selection_review_confirmed"
+            ):
+                review.append(page)
+                break
     return review
 
 
-def _confirm_no_boxes(capture_dir: Path, pages: list[str]) -> None:
-    """Mark pages as user-reviewed: they genuinely have no blue boxes and
-    may be closed (skipped downstream without further warnings)."""
+def _confirm_no_boxes(out_root: Path, pages: list[str]) -> None:
+    """标记为已人工复核：确实没有框，可以关闭（下游静默跳过）。"""
     for page in pages:
-        manifest_path = capture_dir / page / "capture.json"
-        if not manifest_path.is_file():
-            continue
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            continue
-        capture = manifest.setdefault("capture", {})
-        capture["selection_review_confirmed"] = True
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        for source in CAPTURE_SOURCES:
+            manifest_path = _capture_source_dir(out_root, source) / page / "capture.json"
+            manifest = _load_capture(manifest_path) if manifest_path.is_file() else None
+            if manifest is None:
+                continue
+            capture = manifest.setdefault("capture", {})
+            capture["selection_review_confirmed"] = True
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
 
-def _skip_pages(capture_dir: Path, pages: list[str]) -> set[str]:
-    """Pages with no usable capture (black / no-text / failed) are skipped
-    silently; fallback_manga pages stay active.  Review-required pages are
-    skipped but listed loudly for the user to audit."""
+def _skip_pages(out_root: Path, pages: list[str]) -> set[str]:
+    """无可用采集的页（黑页 / 无文本 / 采集失败 / 待审）静默或大声跳过。
+
+    **任一来源可用即不跳过**：另一条路径还留着好框，不该因为这条失败就丢掉。
+    """
     skipped = set()
     for page in pages:
-        manifest_path = capture_dir / page / "capture.json"
-        if not manifest_path.is_file():
+        manifests = _page_manifests(out_root, page)
+        if not manifests:
             continue
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            continue
-        capture = manifest.get("capture", {})
-        if capture.get("fallback_manga"):
-            continue
-        if not capture.get("complete"):
-            skipped.add(page)
-        elif (
-            capture.get("selection_review_required")
-            and not capture.get("selection_review_confirmed")
-        ):
+        usable = False
+        for manifest in manifests:
+            capture = manifest.get("capture", {})
+            if capture.get("fallback_manga"):
+                usable = True
+                continue
+            if not capture.get("complete"):
+                continue
+            if (
+                capture.get("selection_review_required")
+                and not capture.get("selection_review_confirmed")
+            ):
+                continue
+            usable = True
+        if not usable:
             skipped.add(page)
     return skipped
 
@@ -2571,7 +2642,7 @@ def main(argv=None) -> int:
         if not confirmed:
             print("no pages to confirm", file=sys.stderr)
             return 2
-        _confirm_no_boxes(out_root / "capture", confirmed)
+        _confirm_no_boxes(out_root, confirmed)
         print(f"confirmed no-blue-box pages: {', '.join(confirmed)}")
         return 0
     pages_set = _parse_pages(args.pages)
@@ -2607,10 +2678,10 @@ def main(argv=None) -> int:
         if not ok:
             print("capture failed", file=sys.stderr)
             return 2
-        skipped = _skip_pages(out_root / "capture", pages)
+        skipped = _skip_pages(out_root, pages)
         print(f"capture done: {len(pages)} pages ({len(skipped)} skipped: "
               f"black/no-text/failed) -> {out_root / 'check'}")
-        review = _review_required_pages(out_root / "capture", pages)
+        review = _review_required_pages(out_root, pages)
         if review:
             print("!! " + "=" * 60)
             print(f"!! 待人工审核（三次采集无蓝色像素）: {', '.join(review)}")
@@ -2623,7 +2694,7 @@ def main(argv=None) -> int:
             print("inspect the blue-box check images, then run: "
                   f"python one_click_translate.py --images \"{images}\" --process")
             return 0
-    review = _review_required_pages(out_root / "capture", pages)
+    review = _review_required_pages(out_root, pages)
     if review:
         print("!! " + "=" * 60)
         print(f"!! 待人工审核页（未确认，已跳过处理）: {', '.join(review)}")
@@ -2631,7 +2702,7 @@ def main(argv=None) -> int:
         print(f"!!   python one_click_translate.py --images \"{images}\" "
               f"--confirm-no-boxes {','.join(review)}")
         print("!! " + "=" * 60)
-    active_pages = [p for p in pages if p not in _skip_pages(out_root / "capture", pages)]
+    active_pages = [p for p in pages if p not in _skip_pages(out_root, pages)]
     if not active_pages:
         print("no capturable pages (all black)", file=sys.stderr)
         return 2

@@ -69,7 +69,7 @@ class PaddleBoxCaptureTest(unittest.TestCase):
                 self.images, self.out_root, None, **kwargs
             )
         manifest = json.loads(
-            (self.out_root / "capture" / "7" / "capture.json").read_text(encoding="utf-8")
+            (self.out_root / "capture" / "paddle" / "7" / "capture.json").read_text(encoding="utf-8")
         )
         return ok, manifest
 
@@ -89,7 +89,7 @@ class PaddleBoxCaptureTest(unittest.TestCase):
         self.assertFalse(manifest["capture"]["selection_review_required"])
         # 下游能原样消费：dataset 构建成功并产出岛
         dataset_dir = self.out_root / "dataset" / "7"
-        manifest_path = self.out_root / "capture" / "7" / "capture.json"
+        manifest_path = self.out_root / "capture" / "paddle" / "7" / "capture.json"
         islands = build_bluebox_dataset(manifest_path, dataset_dir, str(self.page))
         self.assertTrue(islands)
         written = json.loads(
@@ -365,7 +365,7 @@ class Stage2DatasetFilterPlumbingTest(unittest.TestCase):
         page = images / "1.jpg"
         # 1 个纵向长条 + 3 个正常小框：长条会被大拟音规则剔除
         Image.new("RGB", (400, 600), "white").save(page)
-        capture = root / "out" / "capture" / "1"
+        capture = root / "out" / "capture" / "paddle" / "1"
         capture.mkdir(parents=True)
         (capture / "capture.json").write_text(
             json.dumps({
@@ -424,7 +424,7 @@ class Stage2DatasetFilterPlumbingTest(unittest.TestCase):
         images.mkdir()
         page = images / "1.jpg"
         Image.new("RGB", (400, 600), "white").save(page)
-        capture = root / "out" / "capture" / "1"
+        capture = root / "out" / "capture" / "paddle" / "1"
         capture.mkdir(parents=True)
         (capture / "capture.json").write_text(
             json.dumps({
@@ -491,7 +491,7 @@ class FilteredEmptyReviewGateTest(unittest.TestCase):
         images.mkdir()
         page = images / "1.jpg"
         Image.new("RGB", (400, 600), "white").save(page)
-        capture = root / "out" / "capture" / "1"
+        capture = root / "out" / "capture" / "paddle" / "1"
         capture.mkdir(parents=True)
         manifest = capture / "capture.json"
         manifest.write_text(json.dumps({

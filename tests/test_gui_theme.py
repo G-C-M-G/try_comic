@@ -364,26 +364,41 @@ class ReviewPreviewSourceFallbackTests(unittest.TestCase):
     def _preview_path(self, tmp: Path, *, with_check: bool, with_photos: bool) -> str:
         """在临时 ROOT 下搭一个最小 outputs 目录，返回预览解析到的路径。
 
-        ``one_click_gui.ROOT`` 被打进 tmp，避免污染真实 outputs/。
+        新布局：采集与 check 图都按来源分目录（capture/{source}/、check/{source}/），
+        所以 Photos 帧只会在 capture/photos/ 下；Paddle 页没有 photos_* 帧，
+        预览应回退到 check 图（红框）。``one_click_gui.ROOT`` 打进 tmp，
+        避免污染真实 outputs/。
         """
         images = tmp / "book"
         images.mkdir(parents=True)
         out = tmp / "outputs" / "oneclick" / images.name
-        capture = out / "capture" / "7"
-        capture.mkdir(parents=True)
         src = images / "7.jpg"
         Image.new("RGB", (40, 60), "white").save(src)
-        (capture / "capture.json").write_text(
-            json.dumps({"source": {"path": str(src), "width": 40, "height": 60},
-                        "capture": {"box_source": "paddle", "complete": True}}),
-            encoding="utf-8",
-        )
-        if with_photos:
-            Image.new("RGB", (40, 60), "gray").save(capture / "photos_base.png")
+
+        def _write_manifest(source: str) -> Path:
+            page_dir = out / "capture" / source / "7"
+            page_dir.mkdir(parents=True, exist_ok=True)
+            (page_dir / "capture.json").write_text(
+                json.dumps({
+                    "source": {"path": str(src), "width": 40, "height": 60},
+                    "capture": {"box_source": source, "complete": True},
+                }),
+                encoding="utf-8",
+            )
+            return page_dir
+
         if with_check:
-            check = out / "check"
-            check.mkdir(parents=True, exist_ok=True)
-            Image.new("RGB", (40, 60), "red").save(check / "7.bluebox_check.png")
+            check_dir = out / "check" / "paddle"
+            check_dir.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (40, 60), "red").save(check_dir / "7.bluebox_check.png")
+
+        if with_photos:
+            # Photos 路径：帧与采集同在 capture/photos/
+            page_dir = _write_manifest("photos")
+            Image.new("RGB", (40, 60), "gray").save(page_dir / "photos_ocr.png")
+        else:
+            # Paddle 路径：只有 capture.json，没有任何 photos_* 帧
+            _write_manifest("paddle")
 
         with patch("one_click_gui.ROOT", tmp):
             window = _make_gui_window(tmp)

@@ -262,6 +262,12 @@ class Runner(QThread):
             self.finished_ok.emit(code == 0)
 
 
+# 框来源（顺序 = 读取优先级：paddle 优先）。
+# 采集结果按来源分开存放：capture/{source}/ 与 check/{source}/，
+# 所以界面上取图/取采集都要按来源逐个找。dataset/typeset 只有一套。
+_BOX_SOURCES = (("paddle", "PaddleOCR"), ("photos", "Photos"))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -779,12 +785,21 @@ class MainWindow(QMainWindow):
             # fall through to the original image below instead of showing
             # a blank preview.
         if self.mode_combo.currentData() == "check":
+            for source, _label in _BOX_SOURCES:
+                check = out / "check" / source / f"{page}.bluebox_check.png"
+                if check.is_file():
+                    return str(check)
             for name in (f"{page}.bluebox_check.png", f"{page}.jpg"):
                 check = out / "check" / name
                 if check.is_file():
                     return str(check)
-        manifest = out / "capture" / page / "capture.json"
-        if manifest.is_file():
+        manifest = None
+        for source, _label in _BOX_SOURCES:
+            candidate = out / "capture" / source / page / "capture.json"
+            if candidate.is_file():
+                manifest = candidate
+                break
+        if manifest is not None:
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8-sig"))
                 src = data.get("source", {}).get("path")
@@ -1411,22 +1426,31 @@ class MainWindow(QMainWindow):
         if not images:
             return None
         out = ROOT / "outputs" / "oneclick" / Path(images).name
-        page_dir = out / "capture" / page
+        page_dir = None
+        manifest = None
+        for source, _label in _BOX_SOURCES:
+            candidate = out / "capture" / source / page
+            if (candidate / "capture.json").is_file():
+                page_dir, manifest = candidate, candidate / "capture.json"
+                break
         frame = self.review_frame_combo.currentData()
         if frame == "check":
-            candidate = out / "check" / f"{page}.bluebox_check.png"
-            return str(candidate) if candidate.is_file() else None
-        path = page_dir / f"{frame}.png"
-        if path.is_file():
-            return str(path)
-        for candidate in (
-            page_dir / "photos_base.png",
-            out / "check" / f"{page}.bluebox_check.png",
-        ):
+            for source, _label in _BOX_SOURCES:
+                candidate = out / "check" / source / f"{page}.bluebox_check.png"
+                if candidate.is_file():
+                    return str(candidate)
+            return None
+        if page_dir is not None:
+            path = page_dir / f"{frame}.png"
+            if path.is_file():
+                return str(path)
+        for source, _label in _BOX_SOURCES:
+            candidate = out / "check" / source / f"{page}.bluebox_check.png"
             if candidate.is_file():
                 return str(candidate)
-        manifest = page_dir / "capture.json"
-        if manifest.is_file():
+        if page_dir is not None and (page_dir / "photos_base.png").is_file():
+            return str(page_dir / "photos_base.png")
+        if manifest is not None:
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8-sig"))
                 src = data.get("source", {}).get("path")
@@ -1458,8 +1482,6 @@ class MainWindow(QMainWindow):
             self.review_scene.addItem(self.review_pix)
             return
         path = Path(path)
-        page_dir = (ROOT / "outputs" / "oneclick" / Path(images).name / "capture" / page)
-        frame = self.review_frame_combo.currentData()
         if frame == "check":
             # 显式选"检出框"时直接给 check 图（Paddle 页只有它）
             path = out / "check" / f"{page}.bluebox_check.png"
@@ -1583,7 +1605,8 @@ class MainWindow(QMainWindow):
         import shutil
 
         for page in pages:
-            page_dir = out / page
+          for _source, _label in _BOX_SOURCES:
+            page_dir = out / _source / page
             if page_dir.is_dir():
                 try:
                     shutil.rmtree(page_dir)
@@ -1870,7 +1893,14 @@ class MainWindow(QMainWindow):
             name = path.name
             return (0, name) if name.isdigit() else (1, name.lower())
 
-        for page in sorted((p for p in out.iterdir() if p.is_dir()), key=_page_key):
+        entries = []
+        for source, _label in _BOX_SOURCES:
+            base = out / source
+            if not base.is_dir():
+                continue
+            for page in sorted((p for p in base.iterdir() if p.is_dir()), key=_page_key):
+                entries.append((page.name, page))
+        for page_name, page in entries:
             manifest = page / "capture.json"
             if not manifest.is_file():
                 continue
@@ -1888,7 +1918,7 @@ class MainWindow(QMainWindow):
                     reason = "无蓝色像素"
                 else:
                     reason = "采集失败"
-                review.append((page.name, reason))
+                review.append((page_name, reason))
         return review
 
     def _refresh_review(self) -> None:

@@ -69,13 +69,13 @@ def _stage2_kwargs(**overrides):
 class PurgeArtifactsTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
-        (self.root / "capture" / "1").mkdir(parents=True)
-        (self.root / "capture" / "1" / "capture.json").write_text("{}")
-        (self.root / "capture" / "2").mkdir(parents=True)
-        (self.root / "capture" / "2" / "capture.json").write_text("{}")
-        (self.root / "check").mkdir()
-        (self.root / "check" / "1.bluebox_check.png").write_bytes(b"x")
-        (self.root / "check" / "2.bluebox_check.png").write_bytes(b"x")
+        (self.root / "capture" / "photos" / "1").mkdir(parents=True)
+        (self.root / "capture" / "photos" / "1" / "capture.json").write_text("{}")
+        (self.root / "capture" / "photos" / "2").mkdir(parents=True)
+        (self.root / "capture" / "photos" / "2" / "capture.json").write_text("{}")
+        (self.root / "check" / "photos").mkdir(parents=True)
+        (self.root / "check" / "photos" / "1.bluebox_check.png").write_bytes(b"x")
+        (self.root / "check" / "photos" / "2.bluebox_check.png").write_bytes(b"x")
         (self.root / "dataset" / "1").mkdir(parents=True)
         (self.root / "dataset" / "1" / "islands.json").write_text("{}")
         _write_json(self.root / "ocr_readings.json", {
@@ -90,11 +90,11 @@ class PurgeArtifactsTests(unittest.TestCase):
             self.root, ["1"], capture=True, dataset=True,
             readings=True, translations=True,
         )
-        self.assertFalse((self.root / "capture" / "1").exists())
-        self.assertFalse((self.root / "check" / "1.bluebox_check.png").exists())
+        self.assertFalse((self.root / "capture" / "photos" / "1").exists())
+        self.assertFalse((self.root / "check" / "photos" / "1.bluebox_check.png").exists())
         self.assertFalse((self.root / "dataset" / "1").exists())
-        self.assertTrue((self.root / "capture" / "2").exists())
-        self.assertTrue((self.root / "check" / "2.bluebox_check.png").exists())
+        self.assertTrue((self.root / "capture" / "photos" / "2").exists())
+        self.assertTrue((self.root / "check" / "photos" / "2.bluebox_check.png").exists())
         readings = json.loads((self.root / "ocr_readings.json").read_text(encoding="utf-8"))
         self.assertEqual(readings, {"2:box:c": "う"})
         translations = json.loads((self.root / "translations.json").read_text(encoding="utf-8"))
@@ -102,7 +102,7 @@ class PurgeArtifactsTests(unittest.TestCase):
 
     def test_default_purge_touches_only_cache_keys(self):
         _purge_page_artifacts(self.root, ["1"])
-        self.assertTrue((self.root / "capture" / "1").exists())
+        self.assertTrue((self.root / "capture" / "photos" / "1").exists())
         self.assertTrue((self.root / "dataset" / "1").exists())
         readings = json.loads((self.root / "ocr_readings.json").read_text(encoding="utf-8"))
         self.assertEqual(sorted(readings), ["2:box:c"])
@@ -111,7 +111,7 @@ class PurgeArtifactsTests(unittest.TestCase):
 
     def test_purge_missing_page_is_idempotent(self):
         _purge_page_artifacts(self.root, ["99"], capture=True)
-        self.assertTrue((self.root / "capture" / "1").exists())
+        self.assertTrue((self.root / "capture" / "photos" / "1").exists())
 
     def test_purge_without_cache_files(self):
         (self.root / "ocr_readings.json").unlink()

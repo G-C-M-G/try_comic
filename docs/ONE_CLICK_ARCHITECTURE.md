@@ -67,6 +67,28 @@ Photos 并行窗口 (上3下3, 行距=窗口高150%)
 - **粒度**：输出"文本行"级框。对白页与 Photos 的按句切分接近；**大字/疏排页面
   Photos 会退化成逐字切分，Paddle 仍是整行**（实测见 开发记录，注意页 45 框 vs 13 框）
 
+### 3.0.0 目录布局（两来源的产物分开存放）
+
+```
+outputs/oneclick/{书名}/
+├── capture/paddle/{page}/capture.json     Paddle 检测的框
+├── capture/photos/{page}/capture.json     Photos 采的框（+ photos_base/ocr/selected 帧）
+├── check/paddle/{page}.bluebox_check.png  红框
+├── check/photos/{page}.bluebox_check.png  蓝框
+├── dataset/{page}/…                       单套，由本次运行选用的来源生成
+├── typeset/{page}.typeset.png             单套，同上
+├── translations.json / ocr_readings.json  单套，同上
+└── run.json / run.log
+```
+
+- **capture / check 按来源分层**：切来源不会覆盖对方的采集结果，两条路径可共存
+- **dataset / typeset / 缓存是单套**：由本次 `--box-source` 生成；换来源重跑即覆盖
+- stage2 读取时**优先本次指定的来源**，该来源没有这页则回退另一来源（并在日志里说明），
+  所以"用 paddle 跑 stage2、只采过 photos"也能继续
+- `BLUEBOX_REPORT.md` 的条目带来源标记（`[paddle] 第 N 页：…`）
+- 读写的路径解析集中在 `_capture_source_dir / _find_capture_page / _iter_capture_pages`
+  几个 helper 里，避免各处硬拼路径
+
 ### 3.0.1 两条框来源的规则对照
 
 **共用同一套阈值**（集中在 `manga_localizer/thresholds.py`，两边 import 同一份，
