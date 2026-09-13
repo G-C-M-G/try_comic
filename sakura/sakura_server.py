@@ -1,7 +1,10 @@
 import os
 import time
+from pathlib import Path
 
-os.environ["PATH"] = r"D:\workplace\opencode\try_comic\sakura\llama;" + os.environ.get("PATH", "")
+_SAKURA_DIR = Path(__file__).resolve().parent
+
+os.environ["PATH"] = str(_SAKURA_DIR / "llama") + os.pathsep + os.environ.get("PATH", "")
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -10,7 +13,7 @@ import asyncio
 
 from llama_cpp import Llama
 
-MODEL_PATH = r"D:\workplace\opencode\try_comic\sakura\models\sakura-7b-qwen2.5-v1.0-q6k.gguf"
+MODEL_PATH = str(_SAKURA_DIR / "models" / "sakura-7b-qwen2.5-v1.0-q6k.gguf")
 N_CTX = 2048
 # Partial GPU offload: the 7B Q6K model plus a 2048-token KV cache exceed
 # the 8GB laptop GPU at n_gpu_layers=99 (llama_decode -1 / CUDA pool

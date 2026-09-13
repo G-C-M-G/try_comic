@@ -90,7 +90,8 @@ venv/ + paddle_venv/  两套 Python 环境
 ```powershell
 # 备份（书级产物 + 配置；代码版本化靠 git）
 robocopy outputs\oneclick backups\<日期>\oneclick /E
-robocopy config backups\<日期>\config /E
+# /XF 排除明文密钥，避免 api_keys.json 随备份扩散
+robocopy config backups\<日期>\config /E /XF api_keys.json
 
 # 重新打包 exe（先关闭正在运行的 exe）
 venv\Scripts\python.exe -m PyInstaller "漫画翻译软件.spec" --noconfirm

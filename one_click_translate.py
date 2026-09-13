@@ -56,8 +56,25 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 from PIL import Image, ImageDraw
 
-IMAGES = Path(r"D:\workplace\opencode\try_comic\漫画翻译\原文\甲书")
 BLUEBOX_FILL = (0, 0, 0)  # fill colour outside blue boxes (--bluebox-fill)
+
+
+def _venv_python() -> Path:
+    """Interpreter for the capture/OCR subprocesses.
+
+    Prefers the repo-root venv (its dependency set differs from
+    paddle_venv).  Falls back to the running interpreter when venv/ is
+    absent so a plain checkout still works; a frozen build has no usable
+    interpreter and must fail loudly instead of spawning the exe itself.
+    """
+    venv_python = ROOT / "venv" / "Scripts" / "python.exe"
+    if venv_python.is_file():
+        return venv_python
+    if getattr(sys, "frozen", False):
+        raise RuntimeError(
+            "找不到 venv\\Scripts\\python.exe：打包版依赖仓库根目录的 venv/（见 README 环境一节）"
+        )
+    return Path(sys.executable)
 
 
 def _load_api_config() -> dict:
@@ -121,7 +138,7 @@ def stage1_capture(
         print(f"overwrite: purged old artifacts of {len(target)} page(s)")
 
     cmd = [
-        str(ROOT / "venv" / "Scripts" / "python.exe"),
+        str(_venv_python()),
         "-u",  # unbuffered: the child must flush layout/progress lines
                # immediately so a killed run leaves a meaningful trace in
                # run.log instead of an empty buffer that looks like the
@@ -610,7 +627,7 @@ for entry in crops:
 """
     crops_path = out_root / f"crops.{os.getpid()}.json"
     crops_path.write_text(json.dumps(crops, ensure_ascii=False), encoding="utf-8")
-    python = ROOT / "venv" / "Scripts" / "python.exe"
+    python = _venv_python()
     env = dict(__import__("os").environ)
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -1782,7 +1799,11 @@ def main(argv=None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="One-click manga translation")
-    parser.add_argument("--images", default=str(IMAGES), help="source image directory")
+    parser.add_argument(
+        "--images",
+        default=None,
+        help="source image directory (required; book name = directory name)",
+    )
     parser.add_argument("--pages", help="page list e.g. 1-24 or 1,3,5")
     parser.add_argument("--parallel", type=int, default=3, help="parallel Photos windows")
     parser.add_argument(
@@ -1847,6 +1868,14 @@ def main(argv=None) -> int:
         default=0.6,
         help="base seconds between overlay re-grabs while the "
              "selection is still rendering (default 0.6)",
+    )
+    parser.add_argument(
+        "--focus-clear-pct",
+        type=float,
+        default=4.0,
+        help="title-bar click offset right of the scan-text button "
+             "centre, as percent of window width (default 4.0; raise it "
+             "when the focus click still lands on the button)",
     )
     parser.add_argument("--capture-only", action="store_true",
                         help="stage 1 only (capture + blue-box check images)")
@@ -2024,6 +2053,11 @@ def main(argv=None) -> int:
     except ValueError:
         pass
 
+    if not args.images:
+        parser.error(
+            '--images is required (e.g. --images "C:\\path\\to\\原图书目录"); '
+            "书名取目录名"
+        )
     images = Path(args.images).resolve()
     out_root = ROOT / "outputs" / "oneclick" / images.name
     if args.confirm_no_boxes:

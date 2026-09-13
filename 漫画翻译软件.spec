@@ -1,8 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+
+# SPECPATH is provided by PyInstaller: the directory holding this spec file,
+# so the build works from any checkout location.
+SPEC_DIR = SPECPATH
 
 
 a = Analysis(
-    ['D:\\workplace\\opencode\\try_comic\\one_click_gui.py'],
+    [os.path.join(SPEC_DIR, 'one_click_gui.py')],
     pathex=[],
     binaries=[],
     datas=[],
@@ -35,5 +40,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['D:\\workplace\\opencode\\try_comic\\app.ico'],
+    icon=[os.path.join(SPEC_DIR, 'app.ico')],
 )
