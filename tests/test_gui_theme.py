@@ -7,7 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from one_click_gui import DARK, LIGHT, MainWindow
+from PIL import Image
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QListWidgetItem
+
+from one_click_gui import DARK, LIGHT, ROOT, MainWindow
 
 
 def _hex_to_rgb(value: str) -> tuple[int, int, int]:
@@ -340,3 +344,58 @@ class ReviewPreviewCurrentRowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewPreviewSourceFallbackTests(unittest.TestCase):
+    """审核页预览必须对 **Paddle 采集的页**也有图可看。
+
+    Paddle 路径的 capture/{page}/ 只有 capture.json（没有 photos_* 帧），
+    所以只找 photos_* 的旧逻辑会让预览全空。回退链应为：
+    选中帧 → photos_base → **check 图（红框）** → 原始源图。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _preview_path(self, tmp: Path, *, with_check: bool, with_photos: bool) -> str:
+        """在临时 ROOT 下搭一个最小 outputs 目录，返回预览解析到的路径。
+
+        ``one_click_gui.ROOT`` 被打进 tmp，避免污染真实 outputs/。
+        """
+        images = tmp / "book"
+        images.mkdir(parents=True)
+        out = tmp / "outputs" / "oneclick" / images.name
+        capture = out / "capture" / "7"
+        capture.mkdir(parents=True)
+        src = images / "7.jpg"
+        Image.new("RGB", (40, 60), "white").save(src)
+        (capture / "capture.json").write_text(
+            json.dumps({"source": {"path": str(src), "width": 40, "height": 60},
+                        "capture": {"box_source": "paddle", "complete": True}}),
+            encoding="utf-8",
+        )
+        if with_photos:
+            Image.new("RGB", (40, 60), "gray").save(capture / "photos_base.png")
+        if with_check:
+            check = out / "check"
+            check.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (40, 60), "red").save(check / "7.bluebox_check.png")
+
+        with patch("one_click_gui.ROOT", tmp):
+            window = _make_gui_window(tmp)
+            window.images_edit.setText(str(images))
+            return window._review_current_preview_path("7")
+
+    def test_paddle_page_falls_back_to_check_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._preview_path(Path(tmp), with_check=True, with_photos=False)
+        self.assertIn("bluebox_check", path)
+
+    def test_photos_page_prefers_photos_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._preview_path(Path(tmp), with_check=True, with_photos=True)
+        self.assertIn("photos_", path)

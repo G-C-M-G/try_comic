@@ -454,8 +454,13 @@ def stage1_capture(
         if not image_path.is_file():
             continue
         selection_blocks = capture.get("selection_blocks") or []
-        # Check image = the original page with blue boxes drawn directly on
-        # top (no dimming/filling): review shows true pixel brightness.
+        # Check image = the original page with the detected/selected boxes
+        # drawn on top (no dimming/filling): review shows true pixel
+        # brightness.  **颜色按框来源区分**：Photos 蓝框画蓝、Paddle 检测框画红
+        # —— 一眼看出这页的框来自哪条路径，审核页在两种来源下也都能看到
+        # "当时检出了什么"。文件名保持 bluebox_check.png 不变（工具链到处引用）。
+        box_source = str(capture.get("box_source") or "photos")
+        color = "#e6194b" if box_source == "paddle" else "#4363d8"
         image = Image.open(image_path).convert("RGB")
         draw = ImageDraw.Draw(image)
         for block in selection_blocks:
@@ -464,9 +469,9 @@ def stage1_capture(
             y1 = max(0, y1 - pad)
             x2 = min(image_size[0], x2 + pad)
             y2 = min(image_size[1], y2 + pad)
-            draw.rectangle([x1, y1, x2, y2], outline="#4363d8", width=3)
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
             draw.text((x1, min(image.height - 14, y2 + 2)), block["id"],
-                      fill="#4363d8")
+                      fill=color)
         image.save(check_dir / f"{page_dir.name}.bluebox_check.png")
     print(f"blue-box check images -> {check_dir}")
 

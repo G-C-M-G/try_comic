@@ -100,6 +100,17 @@ Photos 并行窗口 (上3下3, 行距=窗口高150%)
 | 微框过滤（边 < 6px 丢） | ✗ | ✓ |
 | 检出内容 | 只选"认得"的文字 → 漏拟音/小字 | 会检出拟音/效果字/小字 |
 
+### 3.0.1.1 check 图颜色按框来源（红=Paddle / 蓝=Photos）
+- check 图（`check/{page}.bluebox_check.png`，文件名保持不变，工具链到处引用）
+  由 stage1 共用尾段绘制，画的是 capture.json 的 `selection_blocks`（扩 6px）
+- **颜色按 `capture.box_source`**：Paddle 检测框画**红**（`#e6194b`）、Photos
+  蓝框画**蓝**（`#4363d8`）—— 一眼看出这页的框来自哪条路径
+- 注意：管线**只产这一张可视化**（原图 + 框）。"编组对比 / 填黑对比 / 检测对比"
+  是分析工具 `ocr_box_compare.py` 的产物，不是管线输出；dataset 目录里没有可视化
+- 审核页预览的回退链因此包含 check 图（否则 Paddle 页预览全空，因为 Paddle 的
+  `capture/{page}/` 只有 capture.json，没有 `photos_*` 帧）：
+  选中帧 → `photos_base` → **check 图** → 原始源图
+
 ### 3.0.2 筛框后无框 → 进审核页
 - 采集期有框、但在**下游被过滤光**的页（微框 / 整页大框 / 大拟音 / 微小岛
   <800px²），下游 `_stage2_dataset` 会调 `_mark_review_required` 往 capture.json

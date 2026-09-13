@@ -361,7 +361,7 @@ class MainWindow(QMainWindow):
         side_l.setContentsMargins(20, 24, 20, 24)
         brand = QLabel("漫画翻译软件", objectName="brand")
         side_l.addWidget(brand)
-        sub = label("Photos 蓝框流水线")
+        sub = label("框: PaddleOCR 检测 / Photos 蓝框 双路径 · AI 翻译嵌字")
         side_l.addWidget(sub)
         side_l.addSpacing(24)
         nav = QListWidget()
@@ -482,7 +482,28 @@ class MainWindow(QMainWindow):
         return card, lay
 
     def _build_capture_tab(self, browse: QPushButton) -> QFrame:
-        card, lay = self._card("采集（Photos 自动框选 → 蓝框检测）", help_text=CAPTURE_HELP)
+        card, lay = self._card("采集", help_text=CAPTURE_HELP)
+        self.capture_card = card
+        row0 = QHBoxLayout()
+        row0.addWidget(label("框来源"))
+        self.box_source_capture_combo = QComboBox()
+        self.box_source_capture_combo.addItem("PaddleOCR 全页检测（默认，离线快）", "paddle")
+        self.box_source_capture_combo.addItem("Photos 蓝框采集（窗口自动化）", "photos")
+        self.box_source_capture_combo.setToolTip(
+            "与「设置」页同一选项（双向同步）。\n"
+            "paddle：离线检测、不开 Photos 窗口，下面一排窗口参数不生效；\n"
+            "photos：原流程，需窗口自动化，下面的窗口参数才生效。"
+        )
+        row0.addWidget(self.box_source_capture_combo)
+        row0.addStretch(1)
+        self.capture_hint = label("")
+        row0.addWidget(self.capture_hint)
+        lay.addLayout(row0)
+        # 双向同步：采集页与设置页的下拉保持一致
+        # （设置页那个下拉在本页之后才构建，它的信号在设置页里连）
+        self.box_source_capture_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_box_source(self.box_source_capture_combo)
+        )
         row1 = QHBoxLayout()
         row1.addWidget(label("原图目录"))
         row1.addWidget(self.images_edit, 1)
@@ -499,6 +520,11 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.scale_spin)
         row2.addStretch(1)
         lay.addLayout(row2)
+        # Photos 专属参数（窗口布局）：Paddle 路径下禁用并说明
+        self.capture_photos_only = [
+            self.parallel_spin, self.scale_spin,
+            self.row_spacing_spin, self.right_gap_spin,
+        ]
         row2b = QHBoxLayout()
         row2b.addWidget(label("上下行距"))
         row2b.addWidget(self.row_spacing_spin)
@@ -526,6 +552,44 @@ class MainWindow(QMainWindow):
         self.capture_btn = btn
         self.stop_btn = stop_btn
         return card
+
+    def _sync_box_source(self, source_widget=None) -> None:
+        """采集页与设置页的框来源双向同步，并按来源启用/禁用窗口参数。
+
+        Paddle 路径不需要窗口（不开 Photos），并行窗口/显示缩放/行距/间隙
+        这些参数完全不生效——留着可点会让人误以为改了有用。
+        """
+        capture_combo = getattr(self, "box_source_capture_combo", None)
+        settings_combo = getattr(self, "box_source_combo", None)
+        if capture_combo is None or settings_combo is None:
+            # 两个页签都建好之前不做同步（采集页先于设置页构建）
+            return
+        target = settings_combo if source_widget is capture_combo else capture_combo
+        if source_widget is not None and target.currentData() != source_widget.currentData():
+            target.blockSignals(True)
+            index = target.findData(source_widget.currentData())
+            if index >= 0:
+                target.setCurrentIndex(index)
+            target.blockSignals(False)
+        source = (source_widget or settings_combo).currentData() or "paddle"
+        photos = source == "photos"
+        for widget in getattr(self, "capture_photos_only", []):
+            widget.setEnabled(photos)
+        hint = getattr(self, "capture_hint", None)
+        if hint is not None:
+            hint.setText(
+                "" if photos
+                else "Paddle 检测不需要窗口，下列窗口参数不生效"
+            )
+        card = getattr(self, "capture_card", None)
+        if card is not None:
+            titles = card.findChildren(QLabel, "cardTitle")
+            if titles:
+                titles[0].setText(
+                    "采集（当前框来源：{}）".format(
+                        "Photos 蓝框采集" if photos else "PaddleOCR 全页检测"
+                    )
+                )
 
     def _build_process_tab(self) -> QFrame:
         card, lay = self._card("处理（OCR → 翻译 → 擦字 → 嵌字）")
@@ -924,6 +988,9 @@ class MainWindow(QMainWindow):
         _row("AI OCR 模型", self.ai_ocr_model_edit)
         _row("AI OCR Key", self.ai_ocr_key_edit)
         _row("框来源（采集）", self.box_source_combo)
+        self.box_source_combo.currentIndexChanged.connect(
+            lambda _index: self._sync_box_source(self.box_source_combo)
+        )
         _row("OCR 引擎（采集，Photos 路径）", self.ocr_engine_combo)
         _row("读字引擎（嵌字前）", self.stage2_engine_combo)
         _row("OCR 设备（采集，Paddle）", self.paddle_device_combo)
@@ -992,6 +1059,7 @@ class MainWindow(QMainWindow):
         box_source = data.get("box_source")
         index = self.box_source_combo.findData(box_source) if box_source else -1
         self.box_source_combo.setCurrentIndex(index if index >= 0 else 0)
+        self._sync_box_source(self.box_source_combo)
         self.drop_large_boxes_check.setChecked(
             bool(data.get("drop_large_boxes", True)))
         stage2_engine = data.get("stage2_engine")
@@ -1267,8 +1335,10 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         top.addWidget(label("预览帧"))
         self.review_frame_combo = QComboBox()
-        self.review_frame_combo.addItem("扫描文本帧（有无文字）", "photos_ocr")
-        self.review_frame_combo.addItem("全选帧（有无蓝框）", "photos_selected")
+        self.review_frame_combo.addItem("扫描文本帧（Photos，有无文字）", "photos_ocr")
+        self.review_frame_combo.addItem("全选帧（Photos，有无蓝框）", "photos_selected")
+        self.review_frame_combo.addItem(
+            "检出框 check 图（Paddle 红框 / Photos 蓝框）", "check")
         top.addWidget(self.review_frame_combo)
         top.addStretch(1)
         right.addLayout(top)
@@ -1292,6 +1362,7 @@ class MainWindow(QMainWindow):
         manga = QPushButton("改用 manga 保底")
         manga.clicked.connect(self._review_manga_fallback)
         reidentify = QPushButton("重新识别（Paddle）")
+        reidentify.setProperty("danger", True)
         reidentify.setToolTip(
             "对所选页用 Paddle 检测重新识别框（离线、不开 Photos 窗口、快）。"
             "适用于：筛框后无框、检测框不准、或从 Photos 路径切过来。"
@@ -1329,6 +1400,42 @@ class MainWindow(QMainWindow):
                 pages.append(page)
         return pages
 
+    def _review_current_preview_path(self, page: str) -> str | None:
+        """审核页预览图路径：选中帧 → photos_base → check 图 → 原始源图。
+
+        只找 ``photos_*`` 会让 **Paddle 采集的页预览全空**（它的 capture/ 下
+        只有 capture.json），所以 check 图（Paddle 红框 / Photos 蓝框）是必经
+        一环——审核要看的正是"当时检出了什么"。
+        """
+        images = self.images_edit.text().strip()
+        if not images:
+            return None
+        out = ROOT / "outputs" / "oneclick" / Path(images).name
+        page_dir = out / "capture" / page
+        frame = self.review_frame_combo.currentData()
+        if frame == "check":
+            candidate = out / "check" / f"{page}.bluebox_check.png"
+            return str(candidate) if candidate.is_file() else None
+        path = page_dir / f"{frame}.png"
+        if path.is_file():
+            return str(path)
+        for candidate in (
+            page_dir / "photos_base.png",
+            out / "check" / f"{page}.bluebox_check.png",
+        ):
+            if candidate.is_file():
+                return str(candidate)
+        manifest = page_dir / "capture.json"
+        if manifest.is_file():
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+                src = data.get("source", {}).get("path")
+                if src and Path(src).is_file():
+                    return str(src)
+            except (OSError, ValueError):
+                pass
+        return None
+
     def _review_show_preview(self) -> None:
         # Always preview the CURRENT row, not the first selected item:
         # ``currentRowChanged`` fires before ``itemSelectionChanged`` updates
@@ -1344,24 +1451,18 @@ class MainWindow(QMainWindow):
         images = self.images_edit.text().strip()
         if not images:
             return
-        out = ROOT / "outputs" / "oneclick" / Path(images).name
-        page_dir = out / "capture" / page
+        path = self._review_current_preview_path(page)
+        if path is None:
+            self.review_scene.clear()
+            self.review_pix = QGraphicsPixmapItem()
+            self.review_scene.addItem(self.review_pix)
+            return
+        path = Path(path)
+        page_dir = (ROOT / "outputs" / "oneclick" / Path(images).name / "capture" / page)
         frame = self.review_frame_combo.currentData()
-        path = page_dir / f"{frame}.png"
-        if not path.is_file():
-            # Fallback chain: photos_base (original copy for failed pages)
-            # -> the original source image from the manifest.
-            path = page_dir / "photos_base.png"
-            if not path.is_file():
-                manifest = page_dir / "capture.json"
-                if manifest.is_file():
-                    try:
-                        data = json.loads(manifest.read_text(encoding="utf-8-sig"))
-                        src = data.get("source", {}).get("path")
-                        if src and Path(src).is_file():
-                            path = Path(src)
-                    except (OSError, ValueError):
-                        pass
+        if frame == "check":
+            # 显式选"检出框"时直接给 check 图（Paddle 页只有它）
+            path = out / "check" / f"{page}.bluebox_check.png"
         if not path.is_file():
             self.review_scene.clear()
             self.review_pix = QGraphicsPixmapItem()
