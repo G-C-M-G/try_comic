@@ -35,11 +35,22 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(sys.argv[3])
+DEVICE = sys.argv[4] if len(sys.argv) > 4 else "auto"
 PADDLE_CACHE = ROOT / "models" / "paddle"
 os.environ.setdefault("HOME", str(PADDLE_CACHE))
 os.environ.setdefault("USERPROFILE", str(PADDLE_CACHE))
 os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(PADDLE_CACHE))
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "1")
+
+if DEVICE == "auto":
+    # PaddleOCR 只认 cpu / gpu；auto 在此解析（与 paddle_ocr_worker._resolve_device 同语义）
+    try:
+        import paddle
+        DEVICE = ("gpu" if paddle.device.is_compiled_with_cuda()
+                  and paddle.device.cuda.device_count() > 0 else "cpu")
+    except Exception:
+        DEVICE = "cpu"
+    print(f"device auto -> {DEVICE}", flush=True)
 
 paths = json.load(open(sys.argv[1], encoding="utf-8"))
 out, err = {}, None
@@ -66,7 +77,7 @@ try:
         text_det_thresh=0.20,
         text_det_box_thresh=0.40,
         text_det_unclip_ratio=1.25,
-        device="cpu",
+        device=DEVICE,
         enable_mkldnn=False,
         **model_paths,
     )
@@ -100,7 +111,7 @@ if os.path.isfile(sys.argv[2]):
         prev = {}
 prev.update(out)
 with open(sys.argv[2], "w", encoding="utf-8") as f:
-    json.dump({"error": err, "results": prev}, f, ensure_ascii=False)
+    json.dump({"device": DEVICE, "error": err, "results": prev}, f, ensure_ascii=False)
 """
 
 
@@ -180,7 +191,7 @@ def _paddle_items_broken(items) -> bool:
     )
 
 
-def run_paddle(pages: list[str], book: Path, cache: Path) -> dict:
+def run_paddle(pages: list[str], book: Path, cache: Path, device: str = "auto") -> dict:
     sources = {page: str(book / "dataset" / page / "original.jpg") for page in pages}
     existing: dict = {}
     if cache.is_file():
@@ -193,7 +204,7 @@ def run_paddle(pages: list[str], book: Path, cache: Path) -> dict:
         payload = cache.with_name("paddle_jobs.json")
         payload.write_text(json.dumps(todo, ensure_ascii=False), encoding="utf-8")
         proc = subprocess.run(
-            [str(PADDLE_PYTHON), "-c", PADDLE_SCRIPT, str(payload), str(cache), str(ROOT)],
+            [str(PADDLE_PYTHON), "-c", PADDLE_SCRIPT, str(payload), str(cache), str(ROOT), device],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=3000,
         )
@@ -239,10 +250,11 @@ def annotate(original: Image.Image, boxes: list[dict], color) -> Image.Image:
 
 def compose(page: str, check_path: Path, original_path: Path,
             paddle_items: list, out_path: Path,
-            panel_width: int, ctd_items: list | None = None) -> None:
+            panel_width: int, ctd_items: list | None = None,
+            device_label: str = "auto") -> None:
     panels = [
         ("Photos 蓝框（人工框选，现流程基准）", Image.open(check_path).convert("RGB"), None),
-        ("PaddleOCR 3.7 全页自动检测（PP-OCRv6, CPU）",
+        (f"PaddleOCR 3.7 全页自动检测（PP-OCRv6, {device_label}）",
          Image.open(original_path).convert("RGB"), (paddle_items, (255, 40, 40))),
     ]
     if ctd_items is not None:
@@ -310,6 +322,8 @@ def _save_with_retry(image, out_path: Path, attempts: int = 5) -> None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--book", default="sample-book")
+    parser.add_argument("--device", default="auto",
+                        help="Paddle 设备：auto（有 GPU 用 GPU）/ cpu / gpu")
     parser.add_argument("--pages", default="", help="逗号分隔页码，空=全部")
     parser.add_argument("--out", default=None,
                         help="输出目录（默认 {书目录}/ocr_compare）")
@@ -336,10 +350,18 @@ def main(argv=None) -> int:
         return 2
     print(f"pages: {len(pages)} -> {out_dir}")
 
-    paddle_boxes = run_paddle(pages, book, cache_dir / "paddle_boxes.json")
+    paddle_boxes = run_paddle(pages, book, cache_dir / "paddle_boxes.json", args.device)
     paddle_err = None
     if isinstance(paddle_boxes, dict) and paddle_boxes.get("error"):
         paddle_err = paddle_boxes["error"]
+
+    device_label = "auto"
+    try:
+        device_label = json.loads(
+            (cache_dir / "paddle_boxes.json").read_text(encoding="utf-8")
+        ).get("device") or args.device
+    except (OSError, ValueError):
+        device_label = args.device
 
     ctd_all: dict = {}
     if args.ctd and (ROOT / "models" / "comic-text-detector-onnx" / "comic-text-detector.onnx").is_file():
@@ -419,7 +441,8 @@ def main(argv=None) -> int:
         compose(page, book / "check" / f"{page}.bluebox_check.png",
                 book / "dataset" / page / "original.jpg",
                 paddle_items,
-                out_dir / f"{page}_对比.png", args.width, ctd_items=ctd_items)
+                out_dir / f"{page}_对比.png", args.width, ctd_items=ctd_items,
+                device_label=device_label)
         print(f"compose {i}/{len(pages)} page {page}", flush=True)
 
     stats = per_page
@@ -437,6 +460,40 @@ def main(argv=None) -> int:
         recall = m["tp"] / (m["tp"] + m["fn"]) if m["tp"] + m["fn"] else 0.0
         print(f"  {name:<10} TP={m['tp']:<4} FP={m['fp']:<4} FN={m['fn']:<3} "
               f"精确率={precision:.1%} 召回率={recall:.1%}")
+    # 粒度诊断：上面的精确率把"引擎框覆盖多个蓝框"也算成假阳性。当引擎按行/
+    # 整句出框、而蓝框被切得过细（如整页大字被逐字切分）时，精确率会失真，
+    # 必须单独指出，否则会误判引擎"差"。
+    granularity = []
+    for page in pages:
+        paddle_items = [it for it in (paddle_boxes.get(page, [])
+                                      if isinstance(paddle_boxes, dict) else [])
+                        if "error" not in it]
+        blues = []
+        blocks_json = book / "dataset" / page / "selection_blocks.json"
+        if blocks_json.is_file():
+            data_blocks = json.loads(blocks_json.read_text(encoding="utf-8"))
+            blues = [b["image_bbox"] for b in (data_blocks.get("selection_blocks") or [])
+                     if not b.get("page_scale")]
+        if not blues or not paddle_items:
+            continue
+        merged = 0
+        for item in paddle_items:
+            cl, ct, cr, cb = _bbox(item["poly"])
+            covered = 0
+            for l, t, r, b in blues:
+                area = max(1, (r - l) * (b - t))
+                inter = max(0, min(cr, r) - max(cl, l)) * max(0, min(cb, b) - max(ct, t))
+                if inter / area >= 0.5:
+                    covered += 1
+            if covered >= 2:
+                merged += 1
+        if merged:
+            granularity.append((page, merged, len(paddle_items)))
+    if granularity:
+        print("\n=== 粒度诊断（引擎框覆盖了 ≥2 个蓝框 → 精确率会失真）===")
+        for page, merged, total in granularity:
+            print(f"  page {page}: {merged}/{total} 个引擎框各覆盖多个蓝框 "
+                  f"→ 该页蓝框切分比引擎更细，精确率不可直接采信")
     if paddle_err:
         print(f"paddle engine error: {paddle_err}", file=sys.stderr)
     return 0
