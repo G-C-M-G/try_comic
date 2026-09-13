@@ -867,10 +867,12 @@ for entry in crops:
     env = dict(__import__("os").environ)
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("TRANSFORMERS_OFFLINE", "1")
-    if not env.get("MANGA_OCR_GPU"):
-        # manga-ocr runs on the CPU by default: the Sakura translation
-        # model owns the GPU, and three parallel OCR subprocesses on CUDA
-        # exhaust its VRAM (llama_decode returns -1 / logits assert).
+    if env.get("MANGA_OCR_CPU") or str(env.get("MANGA_OCR_GPU", "")).lower() in {
+        "0", "false", "no"
+    }:
+        # 唯一需要 CPU 的场景是**本地 Sakura**：它按设计吃满 8GB 卡的显存，
+        # 两者同时驻留会让 llama_decode 失败（返回 -1 / logits assert）。
+        # 用远程 AI 翻译（DeepSeek 等）时 Sakura 不在跑，GPU 空闲，默认就用。
         env["CUDA_VISIBLE_DEVICES"] = "-1"
     proc = subprocess.Popen(
         [str(python), "-c", script, str(crops_path)],
