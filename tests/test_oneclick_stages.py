@@ -352,3 +352,40 @@ class Stage1OverwriteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TranslationsStoreMergeTests(unittest.TestCase):
+    """translations.json 必须**按页合并**写入。
+
+    回归：原实现是整文件替换，`--pages 1` 这类子集运行会把其余页的译文整本
+    抹掉（实测踩到——跑完单页验证后 31 页译文消失，后续嵌字只剩 1 页）。
+    """
+
+    def test_subset_store_keeps_other_pages(self):
+        from one_click_translate import _load_translations, _store_translations
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _store_translations(root, {
+                "1": {"island_001": "甲"},
+                "2": {"island_001": "乙"},
+                "3": {"island_001": "丙"},
+            })
+            # 只重写第 2 页（模拟 --pages 2）
+            _store_translations(root, {"2": {"island_001": "乙改"}})
+            saved = _load_translations(root)
+            self.assertEqual(sorted(saved), ["1", "2", "3"])
+            self.assertEqual(saved["2"]["island_001"], "乙改")
+            self.assertEqual(saved["1"]["island_001"], "甲")
+            self.assertEqual(saved["3"]["island_001"], "丙")
+
+    def test_page_rewrite_replaces_whole_page(self):
+        from one_click_translate import _load_translations, _store_translations
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _store_translations(root, {"1": {"island_001": "甲", "island_002": "乙"}})
+            # 该页重译后岛集合变了：整页替换，不留旧岛
+            _store_translations(root, {"1": {"island_001": "新甲"}})
+            saved = _load_translations(root)
+            self.assertEqual(saved["1"], {"island_001": "新甲"})

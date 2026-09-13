@@ -644,8 +644,18 @@ def _load_translations(out_root: Path) -> dict:
 
 
 def _store_translations(out_root: Path, translations: dict) -> None:
-    """Persist per-page translations (atomic whole-file replace)."""
-    _write_cache_json(out_root / "translations.json", translations)
+    """Persist per-page translations, **按页合并**（原子整文件写）。
+
+    只覆盖本次处理的页，其它页原样保留 —— 原先整文件替换，导致
+    ``--pages 1`` 或 ``--stage translate --pages X`` 这种子集运行会把其余页
+    的译文整本抹掉（实测踩到：跑单页验证后 31 页译文消失，后续嵌字只剩 1 页）。
+    需要"丢弃某页旧译文"时由 ``_purge_page_artifacts(translations=True)`` 先行
+    删除该页键，再写入新值，语义不受影响。
+    """
+    merged = dict(_load_translations(out_root))
+    for page, per_island in (translations or {}).items():
+        merged[str(page)] = dict(per_island or {})
+    _write_cache_json(out_root / "translations.json", merged)
 
 
 def _purge_page_artifacts(out_root: Path, pages: list[str], *,
@@ -2178,6 +2188,80 @@ def _parse_color(value: str) -> tuple[int, int, int] | None:
     return tuple(parts)  # type: ignore[return-value]
 
 
+# 擦字缓存版本号：擦字算法/配置语义变化时 +1，旧缓存自动失效
+ERASE_CACHE_VERSION = 1
+
+
+def _erase_cache_key(source_sha256: str, extra_regions: dict, min_island_area: float,
+                     config) -> str:
+    """擦字结果的缓存键：只包含**决定擦字输出**的全部输入。
+
+    原图内容 + 每岛擦字矩形 + 擦字配置 + 面积下限 + 算法版本。任一变化即失效，
+    所以改框/换图/改配置都不会串用旧结果。擦字是整条链里最贵的一步
+    （实测 12~13s/页，其中 FSR 修复占 ~87%），缓存后重跑嵌字（改排版、改编组、
+    重合并 PDF）不必再擦。
+    """
+    import hashlib
+
+    payload = {
+        "version": ERASE_CACHE_VERSION,
+        "source_sha256": source_sha256,
+        "regions": sorted(
+            (str(island_id), [int(v) for v in rect])
+            for island_id, rect in (extra_regions or {}).items()
+        ),
+        "min_island_area": float(min_island_area),
+        "config": {
+            "style_override": getattr(config, "style_override", "auto"),
+            "fill_ring_radius": getattr(config, "fill_ring_radius", None),
+            "inpaint_padding": getattr(config, "inpaint_padding", None),
+            "mask": str(getattr(config, "mask", "")),
+        },
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _erased_image_for(page_dir: Path, source, active_dataset, extra_regions,
+                      config, min_island_area: float):
+    """取擦字结果：命中缓存直接读，否则擦完写缓存。
+
+    缓存文件与键文件都是**可删的中间产物**：删了就重擦一次，结果一致。
+    """
+    import hashlib
+
+    from manga_localizer.island_erasure import erase_island_image
+
+    cache_png = page_dir / "erased.png"
+    cache_key_file = page_dir / "erased.key"
+    source_path = page_dir / "original.jpg"
+    try:
+        source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    except OSError:
+        source_sha256 = ""
+    key = _erase_cache_key(source_sha256, extra_regions, min_island_area, config)
+    if cache_png.is_file() and cache_key_file.is_file():
+        try:
+            if cache_key_file.read_text(encoding="utf-8").strip() == key:
+                with Image.open(cache_png) as cached:
+                    if cached.size == source.size:
+                        return cached.convert("RGB").copy()
+        except (OSError, ValueError):
+            pass
+
+    erased = erase_island_image(
+        source, active_dataset, config=config, min_island_area=min_island_area,
+        extra_regions=extra_regions,
+    ).image
+    try:
+        erased.save(cache_png)
+        cache_key_file.write_text(key, encoding="utf-8")
+    except OSError:
+        pass
+    return erased
+
+
 def erase_and_typeset_page_with(
     dataset_dir, typeset_dir, page, translations, directions, dropped_boxes=None,
     min_font_size: int | None = None,
@@ -2330,10 +2414,10 @@ def erase_and_typeset_page_with(
             min(base[0], moved[0]), min(base[1], moved[1]),
             max(base[2], moved[2]), max(base[3], moved[3]),
         )
-    erased = erase_island_image(
-        source, active_dataset, config=ErasureConfig(), min_island_area=800.0,
-        extra_regions=extra_regions,
-    ).image
+    erased = _erased_image_for(
+        dataset_dir / page, source, active_dataset, extra_regions,
+        ErasureConfig(), 800.0,
+    )
     result = typeset_island_page(
         erased, canonical_dataset, translations, blue_lines, config=config,
         direction_overrides=directions,
@@ -2618,8 +2702,9 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=1,
-        help="parallel translate+typeset page workers (default 1; max 3)",
+        default=3,
+        help="parallel translate+typeset page workers (default 3, the cap; "
+             "1 = serial). 擦字/嵌字按页并行，3 路约 3× 提速",
     )
     args = parser.parse_args(argv)
     global BLUEBOX_FILL
