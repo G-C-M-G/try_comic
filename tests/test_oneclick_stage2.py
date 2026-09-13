@@ -144,11 +144,10 @@ class BuildUnionOverridesTests(unittest.TestCase):
         ]
         overrides = build_union_overrides(dataset, boxes, pad=6)
         self.assertIn("island_001", overrides)
-        # Padded widths: A = 40+12=52, B = 60+12=72 (clamped to island
-        # right edge: B x2 = 120 -> 126 clamped to 100 -> width 46? No:
-        # island bbox [0,0,100,500], so x2 clamps to 100-0=100, width =
-        # (100) - (60-6=54) = 46.
-        self.assertEqual(overrides["island_001"]["glyph_width_limit"], 46.0)
+        # 字号上限取**未裁剪**的扩框尺寸（与岛 bbox 解耦）：A = 40+12 = 52，
+        # B = 60+12 = 72 → min = 52。掩膜仍用被岛裁剪的局部坐标（见下面
+        # area 断言），但字号上限不该随岛 bbox 变大而变大。
+        self.assertEqual(overrides["island_001"]["glyph_width_limit"], 52.0)
         # Padded heights: A = 300+12=312, B = 300+12=312 (y within island).
         self.assertEqual(overrides["island_001"]["glyph_height_limit"], 312.0)
         # Union area = padded boxes' pixel count.  A spans x[4,56],

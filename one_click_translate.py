@@ -1860,10 +1860,15 @@ def build_union_overrides(dataset, boxes, pad: int = 6) -> dict:
     """Per-island blue-box union masks (island-local coords).
 
     Each island's mask is the union of its blue boxes expanded by *pad* px
-    (clamped to the island bbox); ``area`` is the mask pixel count.  Glyph
-    size caps follow the PADDED box dimensions: vertical font size
+    (clamped to the island bbox); ``area`` is the mask pixel count.
+
+    Glyph size caps follow the padded box dimensions: vertical font size
     (glyph width) <= narrowest padded box width, horizontal font size
-    (glyph height) <= shortest padded box height.
+    (glyph height) <= shortest padded box height.  **These use the
+    UNCLAMPED padded size** -- the island-bbox clamp exists only to keep
+    the mask in island-local coordinates, and letting it feed the caps
+    would make the font size follow the island bbox (a bigger group rect
+    would silently enlarge the typeset text).
 
     ``bbox`` is the island's canonical "one box": the union of its blue
     boxes expanded by *pad* px per side, in IMAGE coordinates, unclamped.
@@ -1881,8 +1886,12 @@ def build_union_overrides(dataset, boxes, pad: int = 6) -> dict:
                 px2 = min(ix2 - ix1, x2 + pad - ix1)
                 py2 = min(iy2 - iy1, y2 + pad - iy1)
                 local_boxes.append((px1, py1, px2, py2))
-                box_w = px2 - px1
-                box_h = py2 - py1
+                # 字号上限取**未裁剪**的扩框尺寸：px/py 是给掩膜用的岛内局部
+                # 坐标，会被岛 bbox 裁掉边缘；若拿它算字号上限，就会产生
+                # "岛 bbox 一变、字号跟着变"的无关耦合（组外接矩形加个 pad
+                # 都会把字号顶上去）。字号上限只该反映框本身的尺寸。
+                box_w = (x2 + pad) - (x1 - pad)
+                box_h = (y2 + pad) - (y1 - pad)
                 if min_w is None or box_w < min_w:
                     min_w = box_w
                 if min_h is None or box_h < min_h:
