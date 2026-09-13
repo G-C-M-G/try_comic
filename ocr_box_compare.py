@@ -370,10 +370,12 @@ _GROUP_COLORS = [
 
 def compose_groups(original_path: Path, blocks: list[dict], out_path: Path,
                    panel_width: int, pad: int = 6,
-                   min_island_area: float = 800.0) -> tuple[int, int, int]:
+                   min_island_area: float = 800.0,
+                   gap_ratio: float = 0.6) -> tuple[int, int, int]:
     """原图 | 原图 + 编组（细框=原子框，粗彩框=组外接框）对比。
 
-    画的是 ``_group_boxes_by_overlap``（20% 间距 / 40% 重叠、±pad、横竖不互并）
+    画的是 ``_group_boxes_by_overlap``（间距比例 ``gap_ratio`` / 40% 重叠、
+    原始框上判、横竖不互并）
     的**实际产出的组**。**并且区分"能成岛的组"与"被微小岛过滤掉的组"**：
     后者画成灰色虚线并标注 —— 编组图只画"组"是不够的，``build_bluebox_dataset``
     还会按"组 bbox ±2px 后的面积 < min_island_area"把组丢掉，那种组下游不
@@ -390,7 +392,7 @@ def compose_groups(original_path: Path, blocks: list[dict], out_path: Path,
          "page_scale": False}
         for item in blocks if not item.get("page_scale") and item.get("id")
     ]
-    grouped = _group_boxes_by_overlap(usable, pad=pad)
+    grouped = _group_boxes_by_overlap(usable, pad=pad, gap_ratio=gap_ratio)
 
     dropped_tiny = 0
     annotated = original.copy()
@@ -430,7 +432,7 @@ def compose_groups(original_path: Path, blocks: list[dict], out_path: Path,
     label_h = 38
     panels = [
         ("原图（未编组）", original),
-        (f"编组结果：{len(usable)} 框 → {len(grouped)} 组"
+        (f"编组结果（间距比例 {gap_ratio:g}）：{len(usable)} 框 → {len(grouped)} 组"
          f"（成岛 {len(grouped) - dropped_tiny}，微小剔除 {dropped_tiny}）"
          f"；白细框=原子框扩 {pad}px", annotated),
     ]
@@ -483,6 +485,10 @@ def main(argv=None) -> int:
     parser.add_argument("--out", default=None,
                         help="输出目录（默认 {书目录}/ocr_compare）")
     parser.add_argument("--width", type=int, default=900, help="对比图面板宽度")
+    parser.add_argument(
+        "--gap-ratio", type=float, default=0.6,
+        help="编组间距比例：间距 < N×较小框宽/高 则合并（默认 0.6，原始框上判）",
+    )
     parser.add_argument(
         "--groups", action="store_true",
         help="额外产出编组对比图（原图 | 原图+编组），存到 {输出目录}/编组对比/",
@@ -652,7 +658,7 @@ def main(argv=None) -> int:
                 out_dir / f"{page}_对比.png", args.width, ctd_items=ctd_items,
                 device_label=device_label)
         if args.groups:
-            groups_dir = out_dir / "编组对比"
+            groups_dir = out_dir / f"编组对比_gap{args.gap_ratio:g}"
             groups_dir.mkdir(parents=True, exist_ok=True)
             if args.groups_boxes == "blue":
                 group_blocks = [
@@ -671,6 +677,7 @@ def main(argv=None) -> int:
                 n_boxes, n_groups, n_tiny = compose_groups(
                     book / "dataset" / page / "original.jpg", group_blocks,
                     groups_dir / f"{page}_编组对比.png", args.width, args.pad,
+                    gap_ratio=args.gap_ratio,
                 )
                 grouped_stats.append((page, n_boxes, n_groups, n_tiny))
         if args.masked:
