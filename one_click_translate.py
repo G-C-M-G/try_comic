@@ -56,9 +56,16 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 from PIL import Image, ImageDraw
 
+from manga_localizer.errors import ErasureError
+
 from manga_localizer.ai_ocr import DEFAULT_WORKERS as AI_OCR_DEFAULT_WORKERS
-from manga_localizer.text_rules import is_sfx_like, short_source
+from manga_localizer.text_rules import (
+    is_ocr_commentary,
+    is_sfx_like,
+    short_source,
+)
 from manga_localizer.thresholds import (
+    PAGE_FONT_CEILING_RATIO,
     SFX_MAX_FONT_SIZE,
     SHORT_SOURCE_MAX_CHARS,
     STROKE_OVERFLOW_MARGIN,
@@ -198,6 +205,34 @@ def _direction_baseline(
         min(bboxes[i][2] - bboxes[i][0], bboxes[i][3] - bboxes[i][1])
         for i in indices
     ]))
+
+
+def oversized_box_ids(
+    boxes: Sequence[dict], *,
+    ratio: float = SFX_MIN_SIDE_RATIO, min_group: int = 3,
+) -> set[str]:
+    """短边远超同方向基准的框（大概率拟声/效果字）。
+
+    它们**不参与合并**：把这种框和相邻的竖排框并成一组，组的外接矩形会变得很大、
+    字号也跟着撑大（实测页 7/11/19 的巨型字号都是这么来的）；而且原图里它本来就
+    是一个独立的超大文字，不该和别的列共享一个排版容器。
+    """
+    if len(boxes) < 3:
+        return set()
+    bboxes = [list(b["image_bbox"]) for b in boxes]
+    page_median = float(np.median(
+        [min(b[2] - b[0], b[3] - b[1]) for b in bboxes]
+    ))
+    locked: set[str] = set()
+    for box in boxes:
+        bb = box["image_bbox"]
+        key = "h" if (bb[2] - bb[0]) >= (bb[3] - bb[1]) else "v"
+        baseline = _direction_baseline(bboxes, key, min_group=min_group,
+                                       page_median=page_median)
+        short = min(bb[2] - bb[0], bb[3] - bb[1])
+        if baseline > 0 and short > ratio * baseline:
+            locked.add(str(box.get("id") or ""))
+    return locked
 
 
 def oversized_single_box_islands(
@@ -953,12 +988,21 @@ def run_manga(
         readings = _run_manga_subprocess(misses, out_root, progress)
     else:
         readings = {}
+    # 说明性输出不是读数：'图片中没有任何日文文本' 这类描述若当读数用，会一路
+    # 翻成中文塞进原框（实测两个岛）。命中即视为空 → 回退 manga-ocr；仍读不出
+    # 就按假选框丢弃、保留原图。
+    dropped_commentary = [
+        key for key, value in readings.items() if is_ocr_commentary(str(value))
+    ]
+    for key in dropped_commentary:
+        del readings[key]
+    if dropped_commentary and progress is not None:
+        progress.log(f"丢弃 {len(dropped_commentary)} 条 OCR 说明性输出（不是文字）")
     _store_readings_cache(out_root, readings)
     result = {}
     for crop in crops:
-        result[crop["id"]] = str(
-            readings.get(crop["id"]) or cached.get(crop["id"]) or ""
-        )
+        value = str(readings.get(crop["id"]) or cached.get(crop["id"]) or "")
+        result[crop["id"]] = "" if is_ocr_commentary(value) else value
     return result, fallback_ids
 
 
@@ -1046,6 +1090,7 @@ def _group_boxes_by_overlap(
     pad: int = 6,
     gap_ratio: float = 0.30,
     overlap_ratio: float = 0.40,
+    no_merge_ids: Sequence[str] = (),
 ) -> list[tuple[tuple[int, int, int, int], list[str]]]:
     """Group blue boxes (image-space) into OCR recognition units.
 
@@ -1103,13 +1148,19 @@ def _group_boxes_by_overlap(
     # 合并判据用**原始框**几何：编组回答的是"这些框是不是同一个文本单位"，
     # 应该只看文字本身的排布，不该被"给 OCR 的扩边量"影响（扩边是工程补偿，
     # 不是排版事实）。顺序因此是：筛框 → 编组（原始框）→ 再按扩框取外接矩形。
+    locked = {str(value) for value in no_merge_ids}
     for i in range(len(ordered)):
         a = ordered[i]
+        if locked and str(a.get("id") or "") in locked:
+            # 过大单框：各成一岛，绝不与相邻列合并（见 oversized_box_ids）
+            continue
         ax1, ay1, ax2, ay2 = a["image_bbox"]
         a_vertical = (ay2 - ay1) >= (ax2 - ax1)
         pa = (ax1, ay1, ax2, ay2)
         for j in range(i + 1, len(ordered)):
             b = ordered[j]
+            if locked and str(b.get("id") or "") in locked:
+                continue
             bx1, by1, bx2, by2 = b["image_bbox"]
             b_vertical = (by2 - by1) >= (bx2 - bx1)
             if a_vertical != b_vertical:
@@ -1255,7 +1306,18 @@ def build_bluebox_dataset(
                 )
 
     atomic_ids = {item["id"] for item in blocks if not item.get("page_scale")}
-    grouped = _group_boxes_by_overlap(blocks)
+    # 过大单框（短边 ≫ 同方向基准，大概率拟声/效果字）不参与合并：并进竖排组会
+    # 把容器和字号一起撑大（实测页 7/11/19），而且它本来就是独立的超大文字。
+    oversized = oversized_box_ids(
+        [item for item in blocks if not item.get("page_scale")],
+        ratio=sfx_min_side_ratio,
+    )
+    if oversized:
+        print(
+            f"page {Path(page_dir).name}: {len(oversized)} 个大单框不参与合并"
+            f"（短边 > {sfx_min_side_ratio}×同方向基准）"
+        )
+    grouped = _group_boxes_by_overlap(blocks, no_merge_ids=oversized)
     groups = [
         {
             "id": f"selg_{index:03d}",
@@ -1456,6 +1518,7 @@ def stage2_process(
     sfx_glossary_min_count: int = 2,
     sfx_max_font_size: int | None = None,
     short_source_max_chars: int = SHORT_SOURCE_MAX_CHARS,
+    page_font_ceiling_ratio: float = PAGE_FONT_CEILING_RATIO,
     progress: "ProgressFile | None" = None,
     overwrite: bool = False,
 ) -> bool:
@@ -1507,6 +1570,7 @@ def stage2_process(
         sfx_sources=page_texts, sfx_max_font_size=sfx_max_font_size,
         short_source_max_chars=short_source_max_chars,
         sfx_min_side_ratio=sfx_min_side_ratio,
+        page_font_ceiling_ratio=page_font_ceiling_ratio,
         font_name=font_name,
         stroke_divisor=stroke_divisor, row_gap_divisor=row_gap_divisor,
         column_gap_divisor=column_gap_divisor,
@@ -2016,6 +2080,7 @@ def _stage2_typeset(out_root: Path, images: Path, pages: list[str],
                     sfx_max_font_size: int | None = None,
                     short_source_max_chars: int = SHORT_SOURCE_MAX_CHARS,
                     sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
+                    page_font_ceiling_ratio: float = PAGE_FONT_CEILING_RATIO,
                     font_name: str = "", stroke_divisor: int | None = None,
                     row_gap_divisor: int | None = None,
                     column_gap_divisor: int | None = None,
@@ -2187,6 +2252,8 @@ def _run_stage2_single(stage: str, images: Path, out_root: Path,
             box_source=kwargs.get("box_source", "paddle"),
             drop_large_boxes=kwargs.get("drop_large_boxes", True),
             sfx_min_side_ratio=kwargs.get("sfx_min_side_ratio", SFX_MIN_SIDE_RATIO),
+        page_font_ceiling_ratio=kwargs.get(
+            "page_font_ceiling_ratio", PAGE_FONT_CEILING_RATIO),
             sfx_min_side_page=kwargs.get("sfx_min_side_page", SFX_MIN_SIDE_PAGE),
         )
         if not active_pages:
@@ -2529,6 +2596,7 @@ def erase_and_typeset_page_with(
     stroke_color: tuple[int, int, int] | None = None,
     background_color: tuple[int, int, int] | None = None,
     sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
+    page_font_ceiling_ratio: float = PAGE_FONT_CEILING_RATIO,
 ):
     import dataclasses
 
@@ -2693,14 +2761,55 @@ def erase_and_typeset_page_with(
     capped_islands |= oversized_single_box_islands(
         dataset, boxes, ratio=sfx_min_side_ratio,
     )
+    # 整页字号上限：≤ ratio × 该页常规字号（蓝框短边中位数）。各岛"各自撑满"
+    # 会让同页出现 2 倍级差（实测页 7：131px vs 基准 66px），这里按页压回来。
+    font_ceiling_px = None
+    if page_font_ceiling_ratio and page_font_ceiling_ratio > 0 and boxes:
+        import statistics as _statistics
+
+        baseline = float(_statistics.median([
+            min(b["image_bbox"][2] - b["image_bbox"][0],
+                b["image_bbox"][3] - b["image_bbox"][1])
+            for b in boxes
+        ]))
+        font_ceiling_px = max(1, int(round(page_font_ceiling_ratio * baseline)))
     result = typeset_island_page(
         erased, canonical_dataset, translations, blue_lines, config=config,
         direction_overrides=directions,
         union_overrides=union_overrides,
         capped_islands=capped_islands,
+        font_ceiling_px=font_ceiling_px,
     )
-    result.image.save(typeset_dir / f"{page}.typeset.png")
+    _save_typeset_png(result.image, typeset_dir / f"{page}.typeset.png")
     return result
+
+
+def _save_typeset_png(image, target: Path) -> None:
+    """原子写嵌字结果（临时文件 + 替换），并把人祸型失败说清楚。
+
+    直接 ``image.save(target)`` 在目标文件**被别的程序打开/内存映射**时会失败，
+    Windows 下报的是 ``[Errno 22] Invalid argument``（对已映射文件的写返回
+    ERROR_INVALID_PARAMETER），看起来像"文件名非法"，实际是"文件被占用"。
+    实测踩到：看图的程序开着 typeset PNG，重嵌字就失败（页 1/7/10）。
+    先写 ``*.tmp`` 再替换：占用时替换失败，报错里直接点明去看哪个文件。
+    """
+    import os
+
+    # 临时名保留 .png 结尾（PIL 按扩展名判格式，`*.png.tmp` 会 KeyError）
+    temporary = target.with_name(f"{target.stem}.tmp{target.suffix}")
+    try:
+        image.save(temporary, format="PNG")
+        os.replace(temporary, target)
+    except OSError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ErasureError(
+            f"写入 {target.name} 失败（{error}）。"
+            "最常见原因：这个 PNG 正被图片查看器/预览程序打开并占用 —— "
+            "关掉它再重跑该页即可。"
+        ) from error
 
 
 def main(argv=None) -> int:
@@ -2753,6 +2862,13 @@ def main(argv=None) -> int:
         help="拟声词嵌字字号上限（默认 %(default)s px）。拟声框在原图里往往"
              "又大又粗，字号跟框走会盖过对白；上限只封顶不放大（框小仍按框"
              "自适应）",
+    )
+    parser.add_argument(
+        "--page-font-ceiling-ratio", type=float,
+        default=PAGE_FONT_CEILING_RATIO,
+        help="整页字号上限：译文字号 ≤ N × 该页常规字号（= 该页蓝框短边中位数，"
+             "即页面主体文字尺寸）。默认 %(default)s，0 = 关闭。各岛各自撑满会"
+             "让同页出现 2 倍级差（实测页 7：131px vs 基准 66px）",
     )
     parser.add_argument(
         "--short-source-max-chars", type=int, default=SHORT_SOURCE_MAX_CHARS,
@@ -3125,6 +3241,7 @@ def main(argv=None) -> int:
         sfx_glossary_min_count=args.sfx_glossary_min_count,
         sfx_max_font_size=args.sfx_max_font_size,
         short_source_max_chars=args.short_source_max_chars,
+        page_font_ceiling_ratio=args.page_font_ceiling_ratio,
         resume=args.resume,
         no_pdf=args.no_pdf,
         min_font_size=args.min_font_size,

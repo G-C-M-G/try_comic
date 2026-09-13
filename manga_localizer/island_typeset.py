@@ -529,6 +529,7 @@ def _fit_size(
     glyph_width_limit: Optional[float] = None,
     glyph_height_limit: Optional[float] = None,
     sfx: bool = False,
+    ceiling_px: Optional[int] = None,
 ) -> Tuple[int, Sequence[TypesetColumnSlot], Optional[float], Tuple[str, ...]]:
     """Single-path fit: a centred block laid out inside the ISLAND bbox.
 
@@ -562,6 +563,9 @@ def _fit_size(
             MIN_FONT_SIZE_MIN,
             min(max_size, int(config.sfx_max_font_size)),
         )
+    if ceiling_px and ceiling_px > 0:
+        # 整页字号上限（相对该页常规字号）：同样只封顶不放大
+        max_size = max(MIN_FONT_SIZE_MIN, min(max_size, int(ceiling_px)))
 
     gw = max(1, x2 - x1)
     gh = max(1, y2 - y1)
@@ -660,6 +664,7 @@ def _compute_island_plan(
     config: TypesetConfig,
     union_overrides: Optional[Mapping[str, dict]] = None,
     sfx: bool = False,
+    ceiling_px: Optional[int] = None,
 ) -> dict:
     """Layout-only geometry for one island (no drawing, no pixel access).
 
@@ -680,6 +685,7 @@ def _compute_island_plan(
             glyph_width_limit=union.get("glyph_width_limit") if union else None,
             glyph_height_limit=union.get("glyph_height_limit") if union else None,
             sfx=sfx,
+            ceiling_px=ceiling_px,
         )
     except TypesettingError as error:
         return {
@@ -781,6 +787,7 @@ def typeset_island_page(
     direction_overrides: Optional[Mapping[str, str]] = None,
     union_overrides: Optional[Mapping[str, dict]] = None,
     capped_islands: Optional[Collection[str]] = None,
+    font_ceiling_px: Optional[int] = None,
 ) -> IslandTypesetResult:
     if erased.size != dataset.image_size:
         raise ErasureError(
@@ -825,6 +832,7 @@ def typeset_island_page(
             island, text, direction, config,
             union_overrides=union_overrides,
             sfx=island.id in capped_ids,
+            ceiling_px=font_ceiling_px,
         )
         if plan.get("block_bbox") is None:
             audits.append(

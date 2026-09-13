@@ -210,6 +210,10 @@ masked = 全页填充色 (BLUEBOX_FILL)
   的 `ai_ocr_url/model/api_key`）。视觉模型**读空的框回退 manga-ocr**
   （`_run_manga_subprocess`）——不是 Sakura，Sakura 是翻译层。手绘字/符号（♡）上视觉模型
   明显强于字符级 manga-ocr
+- **说明性输出不是读数**（`text_rules.is_ocr_commentary`）：视觉模型读不到字时会回一句
+  "图片中没有任何日文文本。它看起来像是…"，若当成读数就会一路翻成中文塞进原框
+  （实测页 8 / 页 14 各一个岛：70 字塞进 96×57 的框 → 12px 兜底、几乎看不见）。
+  命中即视为**空读数** → 回退 manga-ocr；仍读不出就按假选框丢弃、保留原图
 - **回退读数可疑 → 不翻译（保留原文）**：回退框的读数若命中 `text_rules.suspicious_short_kana`
   （纯假名/符号且 ≤6 字符），判为**假选框**写入 `dropped_boxes` → 不翻译、不擦字、不嵌字，
   页面保持原样。实书实测依据：`ぎゅっ♡` 被 manga-ocr 读成 `どうし/どんな/どうやっ`，
@@ -395,11 +399,24 @@ masked = 全页填充色 (BLUEBOX_FILL)
 - 字号可降到 **12px 绝对下限**（`MIN_FONT_SIZE_MIN`）以适配 B；仍放不下 → 12px 渲染，允许超出到 **150% 包络**（`MAX_GROUP_BBOX_OVERFLOW_RATIO=0.5`，标记 pending_review），再不行则渲染并裁剪（绝不把擦掉的岛留白）
 - **列间距/行距永不为 0**（`max(1, 字号//4)`），不靠压扁间距硬塞
 
+### 5.3.1 过大单框不参与合并（编组规则的一部分，见 5.0）
+- 短边 > `--sfx-min-side-ratio`（默认 1.5）× 同方向基准的框，**各成一岛、绝不与相邻列合并**
+  （`oversized_box_ids` + `_group_boxes_by_overlap(no_merge_ids=...)`）
+- 原因：这种框在原图里就是独立的超大文字（拟声/效果字），并进竖排组会把组的外接矩形
+  与字号一起撑大（实测页 7：3 框并成一组 → 131px 巨型字号；拆开后降到上限内）
+- 不合并之后它天然满足"单框岛"条件 → 字号被 `--sfx-max-font-size` 封顶
+- **改这条规则后必须重建 dataset**：`_stage2_dataset` 在 `islands.json` 比 `capture.json`
+  新时会跳过重建（防止无意义重算）。做法：删 `dataset/*/islands.json` + `selection_blocks.json`
+  再跑 `--process`（不用 `--overwrite`，那样会把译文/读数一起清掉）
+
 ### 5.4 字号约束（glyph 限制，扩框版）
 - **首选下限 28px**：优先使用 ≥28px；28px 放不下时继续降到 12px 绝对下限
 - **竖排**：字号（=字宽）≤ 蓝框**扩 6px 后**的最窄宽（`glyph_width_limit` = min 扩框宽）
 - **横排**：字号（=字高）≤ 蓝框**扩 6px 后**的最矮高（`glyph_height_limit` = min 扩框高）
-- **拟声词额外封顶 `--sfx-max-font-size`（默认 30px）**：判定依据是**日文原文**命中
+- **整页字号上限 `--page-font-ceiling-ratio`（默认 1.5）**：译文字号 ≤ N × 该页常规字号
+  （= 该页蓝框短边中位数）。每个岛各自"尽可能撑满"会让同一页出现 2 倍级差
+  （实测页 7：14 字组 131px vs 该页基准 66px）；只封顶不放大
+- **拟声词/过大单框/短原文额外封顶 `--sfx-max-font-size`（默认 30px）**：判定依据是**日文原文**命中
   `text_rules.is_sfx_like`（纯假名/符号 ≤6 字），判定集合由上游 `page_texts` 传入
   （`typeset_island_page(..., sfx_islands=...)`），**不靠译文猜**。只封顶不放大
   （生效值 = min(框自适应值, 上限)）：拟声框原图里又大又粗，字号跟框走会嵌出一个

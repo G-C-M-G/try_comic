@@ -621,3 +621,52 @@ class SfxGlossaryWiringTest(unittest.TestCase):
             {"1": {"a": "夹紧♡"}, "2": {"b": "夹紧♡"}},
         )
         self.assertNotEqual(before, load_glossary(target).sha256)
+
+
+class OversizedBoxNoMergeTest(unittest.TestCase):
+    """过大单框（短边 ≫ 同方向基准）不参与合并，各成一岛。
+
+    并进竖排组会把组的外接矩形和字号一起撑大（实测页 7/11/19 的巨型字号），
+    而且这种框在原图里本来就是独立的超大文字，不该和别的列共用一个排版容器。
+    不合并之后它自然满足"单框岛"条件 → 字号被 --sfx-max-font-size 封顶。
+    """
+
+    def _boxes(self, specs):
+        return [
+            {"id": f"sel_{index:03d}", "image_bbox": list(bbox), "page_scale": False}
+            for index, bbox in enumerate(specs, 1)
+        ]
+
+    def test_oversized_box_ids_flags_the_big_one(self):
+        from one_click_translate import oversized_box_ids
+
+        boxes = self._boxes([
+            (100, 100, 160, 300),   # 常规竖框：短边 60
+            (100, 320, 160, 520),
+            (100, 540, 160, 740),
+            (100, 760, 160, 960),
+            (400, 100, 560, 620),   # 大单框：短边 160 ≫ 1.5×60
+        ])
+        self.assertEqual(oversized_box_ids(boxes, ratio=1.5), {"sel_005"})
+
+    def test_locked_box_never_merges(self):
+        from one_click_translate import _group_boxes_by_overlap
+
+        # 两个竖框水平相邻且垂直重叠 80% —— 正常会合并
+        a = {"id": "sel_001", "image_bbox": [100, 100, 160, 300]}
+        b = {"id": "sel_002", "image_bbox": [162, 100, 222, 300]}
+        merged = _group_boxes_by_overlap([a, b])
+        self.assertEqual(len(merged), 1)
+        locked = _group_boxes_by_overlap([a, b], no_merge_ids=["sel_002"])
+        self.assertEqual(len(locked), 2)
+        self.assertEqual(sorted(len(ids) for _, ids in locked), [1, 1])
+
+    def test_group_build_locks_oversized_boxes(self):
+        """数据集构建阶段要用 oversized_box_ids 的结果锁住合并。"""
+        import inspect
+
+        from one_click_translate import build_bluebox_dataset
+
+        source = inspect.getsource(build_bluebox_dataset)
+        self.assertIn("oversized_box_ids", source)
+        self.assertIn("no_merge_ids=oversized", source)

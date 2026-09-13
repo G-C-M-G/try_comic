@@ -79,3 +79,29 @@ class ShortSourceTests(unittest.TestCase):
 
         self.assertFalse(short_source("", 6))
         self.assertFalse(short_source("   ", 6))
+
+
+class OcrCommentaryTests(unittest.TestCase):
+    """AI OCR 的说明性输出不是读数（实测：被当读数翻成中文塞进原框）。"""
+
+    def test_real_observed_samples(self):
+        from manga_localizer.text_rules import is_ocr_commentary
+
+        self.assertTrue(is_ocr_commentary("图片中没有任何日文文本。它看起来像是…"))
+        self.assertTrue(is_ocr_commentary("图片中没有文字。"))
+
+    def test_other_description_forms(self):
+        from manga_localizer.text_rules import is_ocr_commentary
+
+        self.assertTrue(is_ocr_commentary("无法辨认"))
+        self.assertTrue(is_ocr_commentary("以下是图片中的文字："))
+        self.assertTrue(is_ocr_commentary("no text in this image"))
+        self.assertTrue(is_ocr_commentary("There is no Japanese text here."))
+
+    def test_normal_readings_pass(self):
+        from manga_localizer.text_rules import is_ocr_commentary
+
+        self.assertFalse(is_ocr_commentary("ぎゅっ♡"))
+        self.assertFalse(is_ocr_commentary("これはテスト用の長文"))
+        self.assertFalse(is_ocr_commentary("图片中有一只猫"))   # 不是"没有文字"
+        self.assertFalse(is_ocr_commentary(""))

@@ -941,6 +941,15 @@ class MainWindow(QMainWindow):
             "按拟声词把字号封到「拟声词字号上限」。这个倍数同时用于采集期剔除\n"
             "超大拟音框（--sfx-min-side-ratio）。"
         )
+        self.page_ceiling_spin = QDoubleSpinBox()
+        self.page_ceiling_spin.setRange(0.0, 4.0)
+        self.page_ceiling_spin.setSingleStep(0.1)
+        self.page_ceiling_spin.setValue(1.5)
+        self.page_ceiling_spin.setToolTip(
+            "整页字号上限（默认 1.5，0 = 关闭）：译文字号不超过该页「常规字号」的 N 倍。\n"
+            "常规字号 = 该页蓝框短边中位数（页面主体文字的尺寸）。\n"
+            "各岛各自尽量撑满会让同一页出现 2 倍级差（实测页 7：131px vs 基准 66px）。"
+        )
         self.short_source_spin = QSpinBox()
         self.short_source_spin.setRange(0, 20)
         self.short_source_spin.setValue(0)
@@ -1070,6 +1079,7 @@ class MainWindow(QMainWindow):
         _row("拟声词字号上限（px）", self.sfx_font_spin)
         _row("拟声词进术语库门槛（次）", self.sfx_glossary_spin)
         _row("过大单框判定倍数（默认 2.0）", self.sfx_ratio_spin)
+        _row("整页字号上限（×常规字号）", self.page_ceiling_spin)
         _row("短原文封顶门槛（0=关）", self.short_source_spin)
         _row("AI OCR 并发（默认 12）", self.ai_ocr_workers_spin)
         _row("字体", self.font_combo)
@@ -1149,6 +1159,12 @@ class MainWindow(QMainWindow):
         self.short_source_spin.setValue(
             self._int_setting(data, "short_source_max_chars", 0)
         )
+        try:
+            self.page_ceiling_spin.setValue(
+                float(data.get("page_font_ceiling_ratio", 1.5))
+            )
+        except (TypeError, ValueError):
+            self.page_ceiling_spin.setValue(1.5)
         font = data.get("font_name", "msyh.ttc")
         index = self.font_combo.findData(font)
         self.font_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -1263,6 +1279,7 @@ class MainWindow(QMainWindow):
             "ai_ocr_workers": self.ai_ocr_workers_spin.value(),
             "sfx_min_side_ratio": self.sfx_ratio_spin.value(),
             "short_source_max_chars": self.short_source_spin.value(),
+            "page_font_ceiling_ratio": self.page_ceiling_spin.value(),
             "font_name": self.font_combo.currentData() or "msyh.ttc",
             "stroke_divisor": self.stroke_spin.value(),
             "row_gap_divisor": self.row_gap_spin.value(),
@@ -1814,6 +1831,9 @@ class MainWindow(QMainWindow):
         args += ["--sfx-max-font-size", str(self.sfx_font_spin.value())]
         args += ["--sfx-min-side-ratio", f"{self.sfx_ratio_spin.value():.2f}"]
         args += ["--short-source-max-chars", str(self.short_source_spin.value())]
+        args += [
+            "--page-font-ceiling-ratio", f"{self.page_ceiling_spin.value():.2f}",
+        ]
         args += [
             "--sfx-glossary-min-count", str(self.sfx_glossary_spin.value()),
         ]

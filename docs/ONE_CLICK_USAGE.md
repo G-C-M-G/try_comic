@@ -55,7 +55,7 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
                      （默认 4；点击仍落在按钮/弹窗上时调大，GUI 设置页同名旋钮）
                      （以上四个等待与偏移在 GUI 设置页「采集等待」分组可调）
 --keep-large-boxes  保留大号拟音/效果字框（默认剔除；仅 paddle 路径）
---sfx-min-side-ratio <n>  大拟音倍数阈值：框短边 > n×同方向基准（默认 2.0）
+--sfx-min-side-ratio <n>  大拟音倍数阈值：框短边 > n×同方向基准（默认 1.5，见下文说明）
 --sfx-min-side-page <n>   大拟音绝对下限：框短边 > n×页短边（默认 0.10）
 --capture-only      只跑 stage1（采集 + 核对图）
 --box-source {paddle,photos}  采集期框来源（默认 paddle）：
@@ -84,7 +84,15 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
                     短假名/符号（如 ぎゅっ♡）判为可疑 → 不翻译、保留原文
 --sfx-max-font-size <px>  拟声词嵌字字号上限（默认 30）。拟声框原图里又大又粗，字号跟框走
                     会盖过对白；只封顶不放大（框小仍按框自适应）。判定用日文原文
-                    （纯假名/符号 ≤6 字），正常台词不受影响
+                    （纯假名/符号 ≤6 字），正常台词不受影响。同一上限也用于"过大单框"
+--sfx-min-side-ratio <n>  过大单框判定倍数（默认 1.5）：未合并的单框短边 > n×同方向基准 →
+                    按拟声词封顶字号，且**该框不参与合并**（各成一岛）。这个倍数同时
+                    用于采集期剔除超大拟音框
+--page-font-ceiling-ratio <n>  整页字号上限（默认 1.5，0 = 关闭）：译文字号 ≤ n × 该页
+                    常规字号（= 该页蓝框短边中位数）。各岛各自撑满会让同页出现 2 倍级差
+--short-source-max-chars <n>  短原文封顶门槛（默认 0 = 关闭）：原文 ≤ n 字时字号也封顶。
+                    实测开启 6 会让 127 个岛面积比掉到 0.02~0.06（短原文的框本来就大），
+                    故默认关闭
 --sfx-glossary-min-count <n>  拟声词自动进术语库的门槛（默认 2，0 = 关闭）：同一原文 + 同一
                     译法出现 n 次才收录进 config/glossary.json，此后全书统一译法；
                     同一原文出现两种译法即自动撤出（不锁死可能错的译法）；
@@ -106,6 +114,9 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
 - `--overwrite` 会先清掉选中页的读数/译文再重做，所以它**会先把 `translations.json` /
   `ocr_readings.json` 备份成 `*.bak`**（打印路径）：中途失败（进程被杀/断网/额度不足）
   只会丢"没重做出来的"，不会连旧的也没了；回滚 = 把 `.bak` 改回原名。
+- **改分组/框规则后要重建 dataset**：`_stage2_dataset` 在 `islands.json` 比 `capture.json`
+  新时会跳过重建，所以改完规则删 `dataset/*/islands.json` + `selection_blocks.json`
+  再跑 `--process`（勿用 `--overwrite`，那会连译文/读数一起清掉）。
 - `--images` 指向哪：原图目录（推荐，书名 = 目录名）。只跑 `--process/--stage` 时
   也可以直接指 `outputs/oneclick/{书名}`（产物即输入）；指错目录时会给出提示而不是
   只报 "no images found"。**注意同一个书目录不要并发跑两个 `--overwrite`**，

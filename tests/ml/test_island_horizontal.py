@@ -328,3 +328,40 @@ class OversizedSingleBoxTests(unittest.TestCase):
                 capped_islands={"island_001"},
             )
             self.assertLessEqual(result.audits[0].font_size, 30)
+
+
+class PageFontCeilingTests(unittest.TestCase):
+    """整页字号上限：字号 ≤ N × 该页常规字号，只封顶不放大。
+
+    各岛各自"尽可能撑满"会让同一页出现 2 倍级差（实测页 7：14 字合并组
+    131px，而该页常规字号只有 66px），观感极不统一。
+    """
+
+    def _typeset(self, tmp, bbox, text, ceiling):
+        dataset = _dataset([("island_001", bbox)], tmp)
+        erased = Image.new("RGB", dataset.image_size, (250, 250, 250))
+        return typeset_island_page(
+            erased, dataset, {"island_001": text}, [],
+            config=TypesetConfig(),
+            direction_overrides={"island_001": "vertical"},
+            font_ceiling_px=ceiling,
+        ).audits[0]
+
+    def test_ceiling_caps_a_large_font(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            uncapped = self._typeset(tmp, (100, 100, 400, 700), "十四字的一句台词", None)
+            capped = self._typeset(tmp, (100, 100, 400, 700), "十四字的一句台词", 60)
+            self.assertGreater(uncapped.font_size, 60)
+            self.assertLessEqual(capped.font_size, 60)
+
+    def test_ceiling_never_enlarges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = self._typeset(tmp, (100, 100, 220, 300), "两字", None)
+            high = self._typeset(tmp, (100, 100, 220, 300), "两字", 9999)
+            self.assertEqual(plain.font_size, high.font_size)
+
+    def test_zero_or_none_disables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = self._typeset(tmp, (100, 100, 400, 700), "十四字的一句台词", None)
+            zero = self._typeset(tmp, (100, 100, 400, 700), "十四字的一句台词", 0)
+            self.assertEqual(plain.font_size, zero.font_size)

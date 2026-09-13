@@ -454,3 +454,48 @@ class PurgeBackupTests(unittest.TestCase):
     def test_pages_not_selected_untouched(self):
         self._purge(["2"])
         self.assertEqual(self._load("translations.json"), {"1": {"island_001": "甲"}})
+
+
+class TypesetPngSaveTests(unittest.TestCase):
+    """嵌字 PNG 写盘：原子替换 + 被占用时给出可执行的报错。
+
+    实测踩到：图片查看器开着 `typeset/*.typeset.png`，重嵌字写盘失败，Windows
+    报 `[Errno 22] Invalid argument`（对已内存映射文件的写返回
+    ERROR_INVALID_PARAMETER），看起来像"文件名非法"，其实是"文件被占用"。
+    """
+
+    def setUp(self):
+        import tempfile
+
+        from PIL import Image
+
+        self.dir = Path(tempfile.mkdtemp())
+        self.image = Image.new("RGB", (8, 8), "white")
+
+    def test_writes_target_and_leaves_no_tmp(self):
+        from one_click_translate import _save_typeset_png
+
+        target = self.dir / "1.typeset.png"
+        _save_typeset_png(self.image, target)
+        self.assertTrue(target.is_file())
+        self.assertEqual(list(self.dir.glob("*.tmp*")), [])
+
+    def test_overwrites_existing(self):
+        from one_click_translate import _save_typeset_png
+
+        target = self.dir / "1.typeset.png"
+        target.write_bytes(b"stale")
+        _save_typeset_png(self.image, target)
+        self.assertGreater(target.stat().st_size, 6)
+
+    def test_failure_raises_actionable_error_and_cleans_tmp(self):
+        from manga_localizer.errors import ErasureError
+        from one_click_translate import _save_typeset_png
+
+        # 用一个目录当目标：临时文件写得成，替换必然失败
+        target = self.dir / "2.typeset.png"
+        target.mkdir()
+        with self.assertRaises(ErasureError) as ctx:
+            _save_typeset_png(self.image, target)
+        self.assertIn("被图片查看器", str(ctx.exception))
+        self.assertEqual(list(self.dir.glob("*.tmp*")), [])
