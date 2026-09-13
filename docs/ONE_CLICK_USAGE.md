@@ -55,7 +55,7 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
                      （默认 4；点击仍落在按钮/弹窗上时调大，GUI 设置页同名旋钮）
                      （以上四个等待与偏移在 GUI 设置页「采集等待」分组可调）
 --keep-large-boxes  保留大号拟音/效果字框（默认剔除；仅 paddle 路径）
---sfx-min-side-ratio <n>  大拟音倍数阈值：框短边 > n×同方向基准（默认 2.5）
+--sfx-min-side-ratio <n>  大拟音倍数阈值：框短边 > n×同方向基准（默认 2.0）
 --sfx-min-side-page <n>   大拟音绝对下限：框短边 > n×页短边（默认 0.10）
 --capture-only      只跑 stage1（采集 + 核对图）
 --box-source {paddle,photos}  采集期框来源（默认 paddle）：

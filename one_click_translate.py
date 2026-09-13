@@ -122,7 +122,7 @@ def _is_black_page(image_path: Path, dark_ratio: float = 0.90) -> bool:
 
 def _filter_large_sfx(
     bboxes: list[list[int]], image_w: int, image_h: int, *,
-    ratio: float = 2.5, page_floor: float = 0.10, min_group: int = 3,
+    ratio: float = 2.0, page_floor: float = 0.10, min_group: int = 3,
 ) -> tuple[list[list[int]], list[tuple[list[int], int, str]]]:
     """剔除大号拟音/效果字框，返回 ``(保留, [(框, 短边px, 基准说明)])``。
 
@@ -174,7 +174,7 @@ def capture_boxes_with_paddle(
     images: Path, out_root: Path, pages: set[str] | None,
     *, device: str = "auto", box_area_ratio: float = 0.20,
     min_side: int = 6,
-    drop_large_boxes: bool = True, sfx_min_side_ratio: float = 2.5,
+    drop_large_boxes: bool = True, sfx_min_side_ratio: float = 2.0,
     sfx_min_side_page: float = 0.10,
 ) -> bool:
     """stage1 的另一种框来源：PaddleOCR 全页检测（默认）。
@@ -327,7 +327,7 @@ def stage1_capture(
     ocr_engine: str = "auto", paddle_device: str = "auto",
     box_source: str = "paddle",
     drop_large_boxes: bool = True,
-    sfx_min_side_ratio: float = 2.5,
+    sfx_min_side_ratio: float = 2.0,
     sfx_min_side_page: float = 0.10,
     row_spacing_px: int | None = None,
     right_gap_px: int = 0, scan_wait: float = 0.5,
@@ -2065,12 +2065,12 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--keep-large-boxes", action="store_true",
-        help="保留大号拟音/效果字框（默认剔除：短边 > 2.5×同方向基准且 "
+        help="保留大号拟音/效果字框（默认剔除：短边 > 2×同方向基准且 "
              "> 页短边 10%%）。该处理只作用于 --box-source paddle",
     )
     parser.add_argument(
-        "--sfx-min-side-ratio", type=float, default=2.5,
-        help="大拟音判定倍数：框短边 > N × 同方向基准（默认 2.5）",
+        "--sfx-min-side-ratio", type=float, default=2.0,
+        help="大拟音判定倍数：框短边 > N × 同方向基准（默认 2.0）",
     )
     parser.add_argument(
         "--sfx-min-side-page", type=float, default=0.10,

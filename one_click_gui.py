@@ -817,7 +817,7 @@ class MainWindow(QMainWindow):
         self.drop_large_boxes_check.setChecked(True)
         self.drop_large_boxes_check.setToolTip(
             "剔除大号拟音/效果字框（如 ドッ/ズズッ 这类风格化大字）：\n"
-            "判据 = 框短边 > 2.5×同方向基准 且 > 页短边 10%。\n"
+            "判据 = 框短边 > 2×同方向基准 且 > 页短边 10%。\n"
             "按方向分组比较（横比横、竖比竖），横排文字行不会被误删。"
         )
         self.paddle_device_combo = QComboBox()
