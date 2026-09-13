@@ -97,7 +97,10 @@ def stage1_capture(
     display_scale: int, row_gap_px: int | None, bottom_shift_up: int,
     layout_region: str = "", box_delta: int = 8, box_tolerance: float = 5.0,
     box_area_ratio: float = 0.20, overwrite: bool = False,
-    ocr_engine: str = "auto",
+    ocr_engine: str = "auto", row_spacing_px: int | None = None,
+    right_gap_px: int = 0, scan_wait: float = 0.5,
+    scan_settle: float = 1.3, select_wait: float = 0.45,
+    regrab_wait: float = 0.6,
 ) -> bool:
     """Parallel frames-only capture + blue-box check images.
 
@@ -141,6 +144,18 @@ def stage1_capture(
         cmd += ["--resume"]
     if row_gap_px is not None:
         cmd += ["--layout-row-gap", str(row_gap_px)]
+    if row_spacing_px is not None:
+        cmd += ["--layout-row-spacing", str(row_spacing_px)]
+    if right_gap_px:
+        cmd += ["--layout-right-gap", str(right_gap_px)]
+    if scan_wait != 0.5:
+        cmd += ["--scan-wait", str(scan_wait)]
+    if scan_settle != 1.3:
+        cmd += ["--scan-settle", str(scan_settle)]
+    if select_wait != 0.45:
+        cmd += ["--select-wait", str(select_wait)]
+    if regrab_wait != 0.6:
+        cmd += ["--regrab-wait", str(regrab_wait)]
     if bottom_shift_up:
         cmd += ["--layout-bottom-shift-up", str(bottom_shift_up)]
     if layout_region:
@@ -1791,6 +1806,48 @@ def main(argv=None) -> int:
         help="lift the last row of windows this many px off the bottom "
              "edge in --display-scale layout (default 0)",
     )
+    parser.add_argument(
+        "--layout-row-spacing",
+        type=int,
+        default=200,
+        help="vertical spacing between rows of windows (px) in "
+             "--display-scale layout (default 200)",
+    )
+    parser.add_argument(
+        "--layout-right-gap",
+        type=int,
+        default=100,
+        help="inset of the rightmost window from the right edge (px) in "
+             "--display-scale layout (default 100)",
+    )
+    parser.add_argument(
+        "--scan-wait",
+        type=float,
+        default=0.5,
+        help="seconds to wait after invoking the scan-text button "
+             "before the first grab (default 0.5)",
+    )
+    parser.add_argument(
+        "--scan-settle",
+        type=float,
+        default=1.3,
+        help="deadline (s) for the scan-text edge-chrome settle "
+             "re-grab (default 1.3)",
+    )
+    parser.add_argument(
+        "--select-wait",
+        type=float,
+        default=0.45,
+        help="base seconds to wait after Ctrl+A before grabbing "
+             "(multiplied per attempt, default 0.45)",
+    )
+    parser.add_argument(
+        "--regrab-wait",
+        type=float,
+        default=0.6,
+        help="base seconds between overlay re-grabs while the "
+             "selection is still rendering (default 0.6)",
+    )
     parser.add_argument("--capture-only", action="store_true",
                         help="stage 1 only (capture + blue-box check images)")
     mode = parser.add_mutually_exclusive_group()
@@ -1997,7 +2054,13 @@ def main(argv=None) -> int:
                             box_tolerance=args.box_tolerance,
                             box_area_ratio=args.box_area_ratio,
                             overwrite=args.overwrite,
-                            ocr_engine=args.ocr_engine)
+                            ocr_engine=args.ocr_engine,
+                            row_spacing_px=args.layout_row_spacing,
+                            right_gap_px=args.layout_right_gap,
+                            scan_wait=args.scan_wait,
+                            scan_settle=args.scan_settle,
+                            select_wait=args.select_wait,
+                            regrab_wait=args.regrab_wait)
         if not ok:
             print("capture failed", file=sys.stderr)
             return 2

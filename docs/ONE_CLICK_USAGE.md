@@ -45,6 +45,8 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
                     原图文件不缩放、坐标还原原分辨率；100 = 固定平铺旧布局）
 --layout-row-gap <px>        固定列间距（默认摊铺铺满；右列左移用更小值）
 --layout-bottom-shift-up <px> 第二行上移量（贴底基础上，默认 0）
+--layout-row-spacing <px>    上下两排窗口的垂直间距（默认 200）
+--layout-right-gap <px>      最右列窗口距右边缘的间隙（默认 100，防弹出菜单遮挡）
 --capture-only      只跑 stage1（采集 + 核对图）
 --process           只跑 stage2（后台处理），跳过采集
 --stage {ocr,translate,typeset}  只跑 stage2 的某一个阶段（--pages 选出该阶段页；前置产物必须已存在，缺前置的页会跳过并提示）

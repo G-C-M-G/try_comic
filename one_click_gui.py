@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGraphicsPixmapItem,
@@ -398,6 +399,18 @@ class MainWindow(QMainWindow):
         self.scale_spin = QSpinBox()
         self.scale_spin.setRange(10, 100)
         self.scale_spin.setValue(42)
+        self.row_spacing_spin = QSpinBox()
+        self.row_spacing_spin.setRange(0, 600)
+        self.row_spacing_spin.setValue(200)
+        self.row_spacing_spin.setToolTip(
+            "上下两排窗口的垂直间距（px），0 = 不传参（CLI 默认 200）"
+        )
+        self.right_gap_spin = QSpinBox()
+        self.right_gap_spin.setRange(0, 600)
+        self.right_gap_spin.setValue(100)
+        self.right_gap_spin.setToolTip(
+            "最右侧窗口距右边缘的间隙（px），0 = 贴边"
+        )
 
         self.tab_capture = self._build_capture_tab(browse)
         self.tab_process = self._build_process_tab()
@@ -484,12 +497,20 @@ class MainWindow(QMainWindow):
         row2.addSpacing(16)
         row2.addWidget(label("显示缩放%"))
         row2.addWidget(self.scale_spin)
-        row2.addSpacing(16)
-        self.capture_overwrite_check = QCheckBox("覆盖旧采集（重采选中页）")
-        self.capture_overwrite_check.setChecked(True)
-        row2.addWidget(self.capture_overwrite_check)
         row2.addStretch(1)
         lay.addLayout(row2)
+        row2b = QHBoxLayout()
+        row2b.addWidget(label("上下行距"))
+        row2b.addWidget(self.row_spacing_spin)
+        row2b.addSpacing(16)
+        row2b.addWidget(label("右边界间隙"))
+        row2b.addWidget(self.right_gap_spin)
+        row2b.addSpacing(16)
+        self.capture_overwrite_check = QCheckBox("覆盖旧采集（重采选中页）")
+        self.capture_overwrite_check.setChecked(True)
+        row2b.addWidget(self.capture_overwrite_check)
+        row2b.addStretch(1)
+        lay.addLayout(row2b)
         btn = QPushButton("开始采集")
         btn.setProperty("primary", True)
         btn.clicked.connect(self._start_capture)
@@ -543,14 +564,16 @@ class MainWindow(QMainWindow):
         self.resume_check = QCheckBox("断点续跑（跳过已有 typeset 的页）")
         self.resume_check.toggled.connect(
             lambda checked: self.overwrite_check.setChecked(False) if checked else None)
-        self.pdf_check = QCheckBox("生成 PDF（默认不生成，只出 typeset 图）")
         row.addWidget(self.overwrite_check)
         row.addSpacing(16)
         row.addWidget(self.resume_check)
-        row.addSpacing(24)
-        row.addWidget(self.pdf_check)
         row.addStretch(1)
         lay.addLayout(row)
+        row_pdf = QHBoxLayout()
+        self.pdf_check = QCheckBox("生成 PDF（默认不生成，只出 typeset 图）")
+        row_pdf.addWidget(self.pdf_check)
+        row_pdf.addStretch(1)
+        lay.addLayout(row_pdf)
         row2 = QHBoxLayout()
         row2.addWidget(label("填黑填充色"))
         self.fill_combo = QComboBox()
@@ -832,6 +855,27 @@ class MainWindow(QMainWindow):
         self.box_area_spin.setRange(5, 50)
         self.box_area_spin.setValue(20)
 
+        self.scan_wait_spin = QDoubleSpinBox()
+        self.scan_wait_spin.setRange(0.1, 5.0)
+        self.scan_wait_spin.setSingleStep(0.1)
+        self.scan_wait_spin.setDecimals(1)
+        self.scan_wait_spin.setValue(0.5)
+        self.scan_settle_spin = QDoubleSpinBox()
+        self.scan_settle_spin.setRange(0.3, 8.0)
+        self.scan_settle_spin.setSingleStep(0.1)
+        self.scan_settle_spin.setDecimals(1)
+        self.scan_settle_spin.setValue(1.3)
+        self.select_wait_spin = QDoubleSpinBox()
+        self.select_wait_spin.setRange(0.1, 5.0)
+        self.select_wait_spin.setSingleStep(0.1)
+        self.select_wait_spin.setDecimals(1)
+        self.select_wait_spin.setValue(0.45)
+        self.regrab_wait_spin = QDoubleSpinBox()
+        self.regrab_wait_spin.setRange(0.1, 5.0)
+        self.regrab_wait_spin.setSingleStep(0.1)
+        self.regrab_wait_spin.setDecimals(1)
+        self.regrab_wait_spin.setValue(0.6)
+
         def _row(text, widget):
             row = QHBoxLayout()
             row.addWidget(label(text))
@@ -852,6 +896,12 @@ class MainWindow(QMainWindow):
         cap_title = QLabel("采集", objectName="cardTitle")
         lay.addWidget(cap_title)
         region_row = _row("采集区域（宽×高，屏 2560×1600 留边界用 2400×1400）", self.region_edit)
+        wait_title = QLabel("采集等待（秒，默认值即可，采集异常时再调）", objectName="cardTitle")
+        lay.addWidget(wait_title)
+        _row("点扫描文本后等待（默认 0.5）", self.scan_wait_spin)
+        _row("扫描文本稳定上限（默认 1.3）", self.scan_settle_spin)
+        _row("Ctrl+A 后等待（默认 0.45）", self.select_wait_spin)
+        _row("选区重抓间隔（默认 0.6）", self.regrab_wait_spin)
         type_title = QLabel("嵌字", objectName="cardTitle")
         lay.addWidget(type_title)
         _row("字号下限（px）", self.min_font_spin)
@@ -929,6 +979,18 @@ class MainWindow(QMainWindow):
         self.box_delta_spin.setValue(self._int_setting(data, "box_delta", 8))
         self.box_tol_spin.setValue(self._int_setting(data, "box_tolerance", 5))
         self.box_area_spin.setValue(self._int_setting(data, "box_area_ratio", 20))
+        self.scan_wait_spin.setValue(self._float_setting(data, "scan_wait", 0.5))
+        self.scan_settle_spin.setValue(self._float_setting(data, "scan_settle", 1.3))
+        self.select_wait_spin.setValue(self._float_setting(data, "select_wait", 0.45))
+        self.regrab_wait_spin.setValue(self._float_setting(data, "regrab_wait", 0.6))
+
+    @staticmethod
+    def _float_setting(data: dict, key: str, default: float) -> float:
+        """Read a float setting without letting a malformed config crash."""
+        try:
+            return float(data.get(key, default))
+        except (TypeError, ValueError):
+            return default
 
     @staticmethod
     def _int_setting(data: dict, key: str, default: int) -> int:
@@ -1014,6 +1076,10 @@ class MainWindow(QMainWindow):
             "box_delta": self.box_delta_spin.value(),
             "box_tolerance": self.box_tol_spin.value(),
             "box_area_ratio": self.box_area_spin.value(),
+            "scan_wait": self.scan_wait_spin.value(),
+            "scan_settle": self.scan_settle_spin.value(),
+            "select_wait": self.select_wait_spin.value(),
+            "regrab_wait": self.regrab_wait_spin.value(),
         }
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         self._log("设置已保存（config/api_keys.json）")
@@ -1318,15 +1384,38 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.Yes:
             return
-        out = ROOT / "outputs" / "oneclick" / Path(self._images()) / "capture"
+        images = self._images()
+        # Close orphan Photos windows first: a stale window can hold the
+        # page's files open (so rmtree fails silently) or steal the
+        # capture focus; then stage1 runs with --overwrite, which clears
+        # the old artifacts itself (the GUI delete below is best-effort).
+        try:
+            import os as _os
+
+            from photos_capture import _close_residual_photos_windows
+
+            names = {
+                name for name in _os.listdir(images)
+                if name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+            }
+            _close_residual_photos_windows(names)
+        except Exception:
+            pass
+        out = ROOT / "outputs" / "oneclick" / Path(images) / "capture"
         import shutil
 
         for page in pages:
             page_dir = out / page
             if page_dir.is_dir():
-                shutil.rmtree(page_dir)
+                try:
+                    shutil.rmtree(page_dir)
+                except OSError as error:
+                    # The --overwrite flag on the stage1 command below
+                    # purges the same artifacts, so a locked file here
+                    # must not abort the recapture.
+                    self._log(f"警告: 删除 {page_dir} 失败（{error}），由 --overwrite 兜底")
         self._log(f"已清除 {len(pages)} 页数据，开始重新采集…")
-        args = [*self._base_args(), "--pages", ",".join(pages)]
+        args = [*self._base_args(), "--pages", ",".join(pages), "--overwrite"]
         self._run(args)
 
     # ---- tab switching ----
@@ -1472,6 +1561,16 @@ class MainWindow(QMainWindow):
         if not self._images():
             return
         args = [*self._base_args(), *self._detection_args()]
+        spacing = self.row_spacing_spin.value()
+        if spacing > 0:
+            args += ["--layout-row-spacing", str(spacing)]
+        right_gap = self.right_gap_spin.value()
+        if right_gap > 0:
+            args += ["--layout-right-gap", str(right_gap)]
+        args += ["--scan-wait", str(self.scan_wait_spin.value())]
+        args += ["--scan-settle", str(self.scan_settle_spin.value())]
+        args += ["--select-wait", str(self.select_wait_spin.value())]
+        args += ["--regrab-wait", str(self.regrab_wait_spin.value())]
         if self.capture_overwrite_check.isChecked():
             args.append("--overwrite")
         self._run(args)

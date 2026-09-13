@@ -25,19 +25,20 @@ def _blend(pixel, keep=_KEEP, alpha=_ALPHA, mask=_MASK):
 
 def _frames_with_blue_boxes(boxes, size=(300, 400)):
     """base/active/selected triplet with the measured overlay applied
-    inside every box (as Photos renders it over the ORIGINAL pixel).
+    inside every box (as Photos renders it over the SCAN-TEXT view).
 
     * base = the original (random-ish) image;
-    * active = the dimmed scan-text frame: active = base * keep everywhere;
+    * active = the dimmed scan-text frame: active = base * keep everywhere
+      (Photos 2026 dims the non-text areas of the scan-text view);
     * selected = active everywhere EXCEPT the box rects, which get the
-      exact blue overlay applied over the ORIGINAL pixels.
+      exact blue overlay applied over the ACTIVE (dimmed) pixels.
     """
     rng = np.random.default_rng(7)
     base = rng.integers(60, 230, size=(size[0], size[1], 3), dtype=np.uint8)
     active = (base.astype(np.float64) * _KEEP).astype(np.uint8)
     selected = active.astype(np.float64)
     for x, y, w, h in boxes:
-        selected[y:y + h, x:x + w] = blue_overlay_image(base[y:y + h, x:x + w])
+        selected[y:y + h, x:x + w] = blue_overlay_image(active[y:y + h, x:x + w])
     return base, active, selected.astype(np.uint8)
 
 
@@ -99,7 +100,7 @@ class SelectionBoxTests(unittest.TestCase):
         base, active, selected = _frames_with_blue_boxes([])
         # Make the entire selected frame a big overlay rectangle.
         selected = (active.astype(np.float64)).copy()
-        selected[:, :] = blue_overlay_image(base)
+        selected[:, :] = blue_overlay_image(active)
         blocks = detect_selection_boxes(active, selected.astype(np.uint8), base=base)
         self.assertEqual(blocks, [])
 
@@ -163,7 +164,7 @@ class BlueOverlayFormulaTests(unittest.TestCase):
         base[100:140, 150:210] = blue
         active = (base.astype(np.float64) * _KEEP).astype(np.uint8)
         selected = active.astype(np.float64)
-        selected[30:120, 50:72] = blue_overlay_image(base[30:120, 50:72])
+        selected[30:120, 50:72] = blue_overlay_image(active[30:120, 50:72])
         blocks = detect_selection_boxes(active, selected, base=base)
         self.assertEqual(len(blocks), 1)
         self.assertEqual(blocks[0].x, 50)

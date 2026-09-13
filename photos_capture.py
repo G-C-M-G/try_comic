@@ -367,6 +367,81 @@ def _capture_control_region(window, control) -> np.ndarray:
     return np.array(crop.convert("RGB"))
 
 
+def _move_mouse_off_button(window) -> None:
+    """Park the cursor at the window's top-left inside edge.
+
+    Photos 2026's floating "扫描文本" button is hover-revealed: a cursor
+    left on it (e.g. from a previous manual session) keeps the button
+    highlighted, and the screen grabs then include the button in the
+    frame.  Moving the cursor away right after invoking the button lets
+    the hover highlight fade so the grabbed frames stay clean -- and,
+    crucially, boxes underneath the button area are NOT lost (masking the
+    button out of the frame would erase them).
+    """
+    try:
+        import ctypes
+
+        x1, y1, _, _ = _window_rect_tuple(window)
+        ctypes.windll.user32.SetCursorPos(x1 + 24, y1 + 24)
+    except Exception:  # noqa: BLE001 - cosmetic, never fail the capture
+        pass
+
+
+def _click_focus_off_button(window) -> None:
+    """Move keyboard focus off the scan-text button via a title-bar click.
+
+    The hover reveal is only half the story: Photos keeps the button
+    highlighted while it holds FOCUS, and an ``invoke()`` (or the
+    ``set_foreground`` Ctrl+A) leaves focus on the button.  A click on
+    the window title bar relocates focus without touching the image area
+    (a click inside the frame could cancel the Ctrl+A selection).
+
+    The click lands ONE TWELFTH of the window width to the RIGHT of the
+    scan-text button's centre (falling back to the right eighth of the
+    title bar when the button control cannot be fetched): clear of the
+    back-arrow/navigation on the left and away from the bottom-center
+    button itself.  Best-effort: any failure leaves the capture flow
+    untouched.
+    """
+    try:
+        import ctypes
+
+        x1, y1, x2, _ = _window_rect_tuple(window)
+        window_w = x2 - x1
+        try:
+            button = _get_control(window, "OcrButton", 0.6)
+            rect = button.rectangle()
+            centre_x = rect.left + (rect.right - rect.left) // 2
+        except Exception:
+            # Button control unavailable: fall back to the right eighth.
+            centre_x = x2 - window_w // 8
+        ctypes.windll.user32.SetCursorPos(
+            centre_x + window_w // 25, y1 + 20
+        )
+        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+        time.sleep(0.2)
+    except Exception:  # noqa: BLE001 - cosmetic, never fail the capture
+        pass
+
+
+def _edge_chrome_fraction(frame: np.ndarray) -> float:
+    """Fraction of saturated (coloured) pixels along the frame edges.
+
+    Photos' scan-text recognition chrome (dim-mask borders, X buttons,
+    side bars) is saturated -- its channels spread wide -- while manga
+    pages are grayscale (R ≈ G ≈ B).  A non-trivial coloured edge
+    fraction means the recognition UI is still present/rendering, so the
+    scan-text view has not settled yet.
+    """
+    h, w = frame.shape[:2]
+    edge = 8
+    bands = (frame[:edge], frame[-edge:], frame[:, :edge], frame[:, -edge:])
+    region = np.concatenate([band.reshape(-1, 3) for band in bands], axis=0).astype(int)
+    spread = region.max(axis=1) - region.min(axis=1)
+    return float((spread > 40).mean())
+
+
 def _get_control(window, automation_id: str, timeout: float = 10):
     from pywinauto import Desktop
 
@@ -556,6 +631,13 @@ BLUE_OVERLAY_PAINT_DELTA = 2.0
 # dropped (not an atomic text box).
 WHOLE_PAGE_AREA_RATIO = 0.20
 
+# Scan-text chrome settle: a frame edge pixel counts as "coloured UI" when
+# its channel spread exceeds this (manga pages are grayscale, R≈G≈B, while
+# Photos' recognition borders/X buttons are saturated).  While more than
+# this fraction of the edge pixels is coloured, the scan-text view is
+# still settling and the grab is retried (up to ~1s total).
+EDGE_CHROME_THRESHOLD = 0.001
+
 
 def blue_overlay_image(base: np.ndarray) -> np.ndarray:
     """Expected all-selected frame under Photos' blue selection overlay.
@@ -568,6 +650,37 @@ def blue_overlay_image(base: np.ndarray) -> np.ndarray:
     out[..., 1] += BLUE_OVERLAY_OFFSET_G
     out[..., 2] += BLUE_OVERLAY_OFFSET_B
     return out
+
+
+def _overlay_still_rendering(selected: np.ndarray, active: np.ndarray | None) -> bool:
+    """True when the grabbed frame still holds partially-blended selection
+    blue -- the blue overlay is a composition layer Photos animates in,
+    and during the fade a grab finds SOME settled boxes while other rows
+    are still translucent and fail the strict formula (observed: the top
+    rows of a page render last).  Rough blue (B clearly above R) clearly
+    exceeding the formula-matched blue means the overlay has not settled
+    yet; ``active`` (the scan-text frame) unavailable falls back to "any
+    rough blue" so the re-grab still runs.  The expected overlay is built
+    from the scan-text frame -- Photos 2026 dims the non-text areas of
+    that view, so the selection blue blends over the DIM view, not the
+    original frame.
+    """
+    rough = (selected[:, :, 2] - selected[:, :, 0] > 40) & (selected[:, :, 2] > 100)
+    rough_frac = float(rough.mean())
+    if rough_frac < 0.002:
+        return False
+    if active is not None and active.shape == selected.shape:
+        expected = blue_overlay_image(active)
+        matched = (
+            np.abs(selected.astype(np.float64) - expected).max(axis=2)
+            <= BLUE_OVERLAY_TOLERANCE
+        )
+        settled_frac = float((rough & matched).mean())
+        # The strict formula already accepts the settled rows; only
+        # translucent leftovers beyond the accepted pixels warrant a
+        # re-grab (0.2% frame area of extra rough blue).
+        return rough_frac > settled_frac + 0.002
+    return True
 
 
 def detect_selection_boxes(
@@ -585,29 +698,30 @@ def detect_selection_boxes(
     box is one atomic OCR unit -- it must never be split.
 
     Single detection path: the selection overlay is Photos' blue RGB(0, 120, 211)
-    blended at 31.76% over the ORIGINAL pixel, i.e.
-    ``selected == blue_overlay_image(base)``.  Pixels that match the
-    formula within ``tolerance`` but were NOT repainted (blue artwork whose
-    overlay is ~the identity) are excluded by the paint-delta guard, so
-    only genuine selection boxes survive.  ``whole_page_ratio`` drops
-    connected regions covering more than that fraction of the frame.
+    blended at 31.76% over the SCAN-TEXT frame (``active`` = photos_ocr.png),
+    i.e. ``selected == blue_overlay_image(active)``.  Photos 2026 dims the
+    non-text areas of the scan-text view with a gray mask, so the overlay is
+    blended over the DIM view -- using the original ``base`` frame as the
+    baseline reconstructs a brighter expected overlay and drops the dimmed
+    rows (observed: the top rows of a page fail the old base-based formula).
+    ``base`` is kept only for signature compatibility and the no-baseline
+    guard.  Pixels that match the formula within ``tolerance`` but were NOT
+    repainted (blue artwork whose overlay is ~the identity) are excluded by
+    the paint-delta guard, so only genuine selection boxes survive.
+    ``whole_page_ratio`` drops connected regions covering more than that
+    fraction of the frame.
 
-    When ``base`` is missing the page is treated as a capture failure: the
-    formula needs the ORIGINAL-pixel baseline to reconstruct the expected
-    overlay, and guessing from the two frame differences alone would only
-    fabricate boxes on rendering noise.  An empty list is returned and the
-    review gate picks the page up.
+    When ``base`` is missing the page is treated as a capture failure: an
+    empty list is returned and the review gate picks the page up.
     """
     if active.shape != selected.shape:
         active, selected = _align_frames(active, selected)
     if base is None:
         return []
-    if base.shape != selected.shape:
-        base, selected = _align_frames(base, selected)
     gray_once = np.mean(active, axis=2).astype(np.float32)
-    expected = blue_overlay_image(base)
+    expected = blue_overlay_image(active)
     formula = np.abs(selected.astype(np.float64) - expected).max(axis=2) <= tolerance
-    painted = np.abs(selected.astype(np.float64) - base.astype(np.float64)).max(axis=2) > BLUE_OVERLAY_PAINT_DELTA
+    painted = np.abs(selected.astype(np.float64) - active.astype(np.float64)).max(axis=2) > BLUE_OVERLAY_PAINT_DELTA
     mask = cv2.morphologyEx(
         (formula & painted).astype(np.uint8) * 255,
         cv2.MORPH_OPEN,
@@ -756,18 +870,35 @@ def _capture_selection_boxes(
     box_delta: int = 8,
     box_tolerance: float = 5.0,
     box_area_ratio: float = 0.20,
+    select_wait: float = 0.45,
+    regrab_wait: float = 0.6,
 ) -> tuple[list[OverlayBlock], np.ndarray | None, str | None]:
     """Ctrl+A all scan-text ranges and grab the blue selection overlay.
 
     The focus + Ctrl+A sequence is serialized, then the blue frame is
     grabbed and verified: when no blue boxes appear (the overlay is still
-    rendering or focus was stolen), Ctrl+A is re-sent with an increasing
-    wait (0.25s / 0.65s / 1.05s) up to three attempts.  ``fixed_window_rect``
+    rendering or focus was stolen), the frame is re-grabbed, then
+    Ctrl+A is re-sent with an increasing wait (``select_wait`` /
+    2x / 3x) up to three attempts.  ``fixed_window_rect``
     (the pinned tile) is re-applied right before every grab: parallel
     windows may drift/resize while unfocused, and a drifted grab extends
     into the neighbour's tile.  Fails soft only after all attempts: the
     frame is still saved and the caller marks the page
     ``selection_missing`` so the batch is never blocked.
+
+    Ctrl+A goes through the OCR control itself (``type_keys``) with a
+    global ``send_keys`` fallback: the global variant only reaches the
+    foreground window, and in parallel capture the focused window can be
+    another Photos window, so the shortcut silently lands nowhere.
+
+    The blue overlay is a composition layer Photos animates in: a grab
+    during the fade still finds SOME boxes (usually the lower ones) while
+    the top rows are still translucent and fail the strict formula.
+    ``_overlay_still_rendering`` detects that partial state -- rough blue
+    clearly exceeding formula-matched blue -- and the frame is re-grabbed
+    (up to a few times, without re-sending Ctrl+A, which would toggle the
+    selection) until the overlay settles.  ``regrab_wait`` is the base
+    re-grab interval.
 
     ``box_delta`` is accepted for CLI compatibility but currently has no
     effect: detection is a single strict-formula path and there is no
@@ -778,23 +909,54 @@ def _capture_selection_boxes(
     last_selected = None
     error = None
     for attempt in range(3):
-        wait = 0.25 + 0.4 * attempt
+        wait = select_wait + select_wait * attempt
         try:
             with _INPUT_LOCK:
                 window.set_focus()
-                time.sleep(0.2)
+                time.sleep(0.25)
                 if fixed_window_rect is not None:
                     _ensure_window_rect(window, fixed_window_rect)
-                keyboard.send_keys("^a")
+                # Control-level input: switch focus to the OCR control and
+                # send Ctrl+A there.  The global send_keys only reaches the
+                # foreground window, and in parallel capture the focused
+                # window can be another Photos window, so the shortcut
+                # silently lands nowhere.
+                try:
+                    active_control.type_keys("^a", set_foreground=True)
+                except Exception:
+                    keyboard.send_keys("^a")
+                # Park the cursor off the hover-revealed scan-text button
+                # before every grab, so the button never appears in the
+                # frame (and the boxes under it are not masked away).
+                _move_mouse_off_button(window)
                 time.sleep(wait)
-                if fixed_window_rect is not None:
-                    _ensure_window_rect(window, fixed_window_rect)
-                selected = _capture_control_region(window, active_control)
-                blocks = detect_selection_boxes(
-                    active, selected, base=base,
-                    tolerance=box_tolerance,
-                    whole_page_ratio=box_area_ratio,
-                )
+
+                def _grab_and_detect():
+                    if fixed_window_rect is not None:
+                        _ensure_window_rect(window, fixed_window_rect)
+                    frame = _capture_control_region(window, active_control)
+                    boxes = detect_selection_boxes(
+                        active, frame, base=base,
+                        tolerance=box_tolerance,
+                        whole_page_ratio=box_area_ratio,
+                    )
+                    return frame, boxes
+
+                selected, blocks = _grab_and_detect()
+                # The overlay animates in: when the frame still holds
+                # translucent selection blue (rough blue clearly exceeds
+                # the formula-matched blue), keep re-grabbing without
+                # re-sending Ctrl+A (a second keypress can toggle the
+                # selection off).  Re-grab only while a render signal
+                # exists or the frame is genuinely empty -- a settled
+                # frame with boxes is returned immediately.
+                for _ in range(3):
+                    if blocks and not _overlay_still_rendering(
+                        selected, active
+                    ):
+                        break
+                    time.sleep(regrab_wait + 0.4 * _)
+                    selected, blocks = _grab_and_detect()
             if blocks:
                 if debug_dir:
                     os.makedirs(debug_dir, exist_ok=True)
@@ -1611,6 +1773,10 @@ def _capture_photos_fast_page(
     box_delta: int = 8,
     box_tolerance: float = 5.0,
     box_area_ratio: float = 0.20,
+    scan_wait: float = 0.5,
+    scan_settle: float = 1.3,
+    select_wait: float = 0.45,
+    regrab_wait: float = 0.6,
 ) -> tuple[dict, object]:
     try:
         """One fast-mask page capture; returns ``(manifest, window)`` for reuse.
@@ -1674,6 +1840,7 @@ def _capture_photos_fast_page(
             base, active, blocks, active_control = _prepare_overlay(
                 window, timeout, screen_capture=True,
                 fixed_window_rect=fixed_window_rect,
+                scan_wait=scan_wait, scan_settle=scan_settle,
             )
             if _display_matches(target_small, base):
                 overlay = (base, active, blocks, active_control)
@@ -1708,6 +1875,7 @@ def _capture_photos_fast_page(
             fixed_window_rect=fixed_window_rect,
             box_delta=box_delta, box_tolerance=box_tolerance,
             box_area_ratio=box_area_ratio,
+            select_wait=select_wait, regrab_wait=regrab_wait,
         )
         _tick("selection_boxes")
         selection_boxes_status = (
@@ -2559,6 +2727,8 @@ def _page_display_rects(
     right_limit: int | None = None,
     row_gap_px: int | None = None,
     bottom_shift_up: int = 0,
+    row_spacing_px: int | None = None,
+    right_gap_px: int = 0,
 ) -> tuple[dict[str, tuple[int, int, int, int]], int, float]:
     """Window rects at up to ``scale`` percent of each page's size,
     edge-aligned on the usable area.
@@ -2578,9 +2748,12 @@ def _page_display_rects(
     edge and the rightmost window hugs the right edge (``right_limit`` when
     given); columns keep at least ``gap`` px between windows
     (``row_gap_px`` fixes the column spacing instead of spreading).
-    ``bottom_shift_up`` lifts the last row that many pixels off the bottom
-    edge.  Rects never overlap and never cross the right limit or the
-    bottom edge.
+    ``row_spacing_px`` fixes the VERTICAL spacing between rows (default
+    ``gap``); ``right_gap_px`` insets the rightmost window from the right
+    edge by that many pixels (Photos pop-up menus can overlay a window
+    pinned flush to the edge); ``bottom_shift_up`` lifts the last row
+    that many pixels off the bottom edge.  Rects never overlap and never
+    cross the right limit or the bottom edge.
 
     NOTE: the window floor is a small absolute 320x240 -- NOT the 462x660
     hard minimum.  The 462x660 floor plus the measured Photos minimum
@@ -2598,7 +2771,10 @@ def _page_display_rects(
     requested = max(1, int(parallel))
     cols = max(1, int(max_per_row))
     usable_h = vh - 2 * margin
-    usable_w = (right - vx) - 2 * margin
+    usable_w = (right - vx) - 2 * margin - max(0, int(right_gap_px))
+    # Vertical spacing BETWEEN rows: fixed by ``row_spacing_px`` when
+    # given, else the default column gap.
+    v_gap = max(1, int(row_spacing_px)) if row_spacing_px is not None else gap
     min_width = max(1, int(min_width))
     min_height = max(1, int(min_height))
     if min_width > usable_w or min_height > usable_h:
@@ -2645,7 +2821,7 @@ def _page_display_rects(
             w, h = _win_dims(key, fraction)
             row_w[row] = max(row_w[row], w)
             row_h[row] = max(row_h[row], h)
-        if sum(row_h) + gap * (row_count - 1) > usable_h:
+        if sum(row_h) + v_gap * (row_count - 1) > usable_h:
             return False
         col_gap = max(1, int(row_gap_px)) if row_gap_px is not None else max(1, gap)
         for row in range(row_count):
@@ -2709,10 +2885,10 @@ def _page_display_rects(
     elif row_count == 2:
         top = vy + margin
         bottom = vy + vh - margin - row_heights[1] - bottom_shift_up
-        row_tops = [top, max(top + gap, bottom)]
+        row_tops = [top, max(top + v_gap, bottom)]
     else:
         total = sum(row_heights)
-        pitch = max(gap, (usable_h - total) // (row_count - 1)) if row_count > 1 else gap
+        pitch = max(v_gap, (usable_h - total) // (row_count - 1)) if row_count > 1 else v_gap
         cursor = vy + margin
         for height in row_heights:
             row_tops.append(cursor)
@@ -2873,6 +3049,10 @@ def _capture_one_page(
     box_tolerance: float = 5.0,
     box_area_ratio: float = 0.20,
     ocr_engine: str = "auto",
+    scan_wait: float = 0.5,
+    scan_settle: float = 1.3,
+    select_wait: float = 0.45,
+    regrab_wait: float = 0.6,
 ) -> tuple[dict, float | None]:
     """Capture one page with per-page retries.
 
@@ -2963,6 +3143,10 @@ def _capture_one_page(
                     box_delta=box_delta,
                     box_tolerance=box_tolerance,
                     box_area_ratio=box_area_ratio,
+                    scan_wait=scan_wait,
+                    scan_settle=scan_settle,
+                    select_wait=select_wait,
+                    regrab_wait=regrab_wait,
                 )
                 manifest["source"]["sha256"] = _sha256(image_path)
                 capture = manifest.setdefault("capture", {})
@@ -3089,6 +3273,12 @@ def capture_photos_fast_batch(
     box_delta: int = 8,
     box_tolerance: float = 5.0,
     box_area_ratio: float = 0.20,
+    row_spacing_px: int | None = None,
+    right_gap_px: int = 0,
+    scan_wait: float = 0.5,
+    scan_settle: float = 1.3,
+    select_wait: float = 0.45,
+    regrab_wait: float = 0.6,
 ) -> dict:
     """Batch fast capture: one Photos window per page, retried up to
     ``max_attempts`` times (a fresh window each attempt; first success
@@ -3156,6 +3346,8 @@ def capture_photos_fast_batch(
             right_limit=DISPLAY_RIGHT_LIMIT or None,
             row_gap_px=row_gap_px,
             bottom_shift_up=bottom_shift_up,
+            row_spacing_px=row_spacing_px,
+            right_gap_px=right_gap_px,
             screen_bounds=region_bounds,
         )
         effective_scale = round(scale_fraction * 100)
@@ -3202,6 +3394,10 @@ def capture_photos_fast_batch(
                 box_tolerance=box_tolerance,
                 box_area_ratio=box_area_ratio,
                 ocr_engine=ocr_engine,
+                scan_wait=scan_wait,
+                scan_settle=scan_settle,
+                select_wait=select_wait,
+                regrab_wait=regrab_wait,
             )
             with lock:
                 results.append(result)
@@ -3412,6 +3608,8 @@ def _display_matches(target_small: np.ndarray, probe) -> bool:
 def _prepare_overlay(
     window, timeout: float, screen_capture: bool = False,
     fixed_window_rect: tuple[int, int, int, int] | None = None,
+    scan_wait: float = 0.5,
+    scan_settle: float = 1.3,
 ):
     """Reset any previous OCR session and capture base/active frames.
 
@@ -3419,6 +3617,8 @@ def _prepare_overlay(
     white-outline OCR islands visible in ``active``.  With ``screen_capture``
     the frames are grabbed from the actual screen region so composition-layer
     overlays (gray scan-text mask, highlighted islands) are visible.
+    ``scan_wait`` is the initial wait after invoking the scan-text button;
+    ``scan_settle`` is the deadline for the edge-chrome settle re-grab.
     """
     # OCR mode replaces D2DImageControl with OcrControl.  Reset it first so a
     # previous run or manual Photos session cannot break automatic capture.
@@ -3434,6 +3634,21 @@ def _prepare_overlay(
         base = _capture(base_control)
     button = _get_control(window, "OcrButton")
     button.invoke()
+    # The scan-text button is hover-revealed; a cursor left on it (e.g.
+    # from a previous manual session) keeps it in the grabbed frames.
+    # Move it away so the hover highlight fades before the first grab.
+    _move_mouse_off_button(window)
+    # Focus also stays on the button after invoke(): click the title
+    # bar's left third to relocate focus away from it (a click inside
+    # the frame could cancel a later Ctrl+A selection).
+    _click_focus_off_button(window)
+    # The scan-text view (dim mask + recognition borders) renders
+    # asynchronously.  Wait ``scan_wait`` first, then extend in 0.5s steps
+    # while the frame edges still show coloured recognition chrome (manga
+    # pages are grayscale: saturated edges mean the Photos scan-text UI
+    # is still settling) -- ``scan_settle`` total is enough.
+    time.sleep(scan_wait)
+    settle_deadline = time.monotonic() + scan_settle
 
     deadline = time.monotonic() + (max(timeout, 30.0) if screen_capture else timeout)
     active = None
@@ -3455,6 +3670,15 @@ def _prepare_overlay(
             active = _capture_control_region(window, active_control)
         else:
             active = _capture(active_control)
+        if (
+            time.monotonic() < settle_deadline
+            and _edge_chrome_fraction(active) > EDGE_CHROME_THRESHOLD
+        ):
+            # Scan-text chrome (recognition borders, X buttons) is still
+            # settling: hold one more 0.5s step and re-grab, so the
+            # scan-text frame used downstream is fully rendered.
+            time.sleep(0.5)
+            continue
         if active.shape != base.shape:
             try:
                 active, base = _align_frames(active, base)
@@ -3725,6 +3949,48 @@ def main(argv: Sequence[str] | None = None) -> int:
                  "edge in --display-scale layout (default 0)",
         )
         parser.add_argument(
+            "--layout-row-spacing",
+            type=int,
+            default=200,
+            help="vertical spacing between rows of windows (px) in "
+                 "--display-scale layout (default 200)",
+        )
+        parser.add_argument(
+            "--layout-right-gap",
+            type=int,
+            default=100,
+            help="inset of the rightmost window from the right edge (px) "
+                 "in --display-scale layout (default 100)",
+        )
+        parser.add_argument(
+            "--scan-wait",
+            type=float,
+            default=0.5,
+            help="seconds to wait after invoking the scan-text button "
+                 "before the first grab (default 0.5)",
+        )
+        parser.add_argument(
+            "--scan-settle",
+            type=float,
+            default=1.3,
+            help="deadline (s) for the scan-text edge-chrome settle "
+                 "re-grab (default 1.3)",
+        )
+        parser.add_argument(
+            "--select-wait",
+            type=float,
+            default=0.45,
+            help="base seconds to wait after Ctrl+A before grabbing "
+                 "(multiplied per attempt, default 0.45)",
+        )
+        parser.add_argument(
+            "--regrab-wait",
+            type=float,
+            default=0.6,
+            help="base seconds between overlay re-grabs while the "
+                 "selection is still rendering (default 0.6)",
+        )
+        parser.add_argument(
             "--layout-region",
             default="",
             help="constrain the window layout to WxH px (e.g. 2400x1400 on a "
@@ -3782,10 +4048,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 display_scale=args.display_scale,
                 row_gap_px=args.layout_row_gap,
                 bottom_shift_up=args.layout_bottom_shift_up,
+                row_spacing_px=args.layout_row_spacing,
+                right_gap_px=args.layout_right_gap,
                 layout_region=args.layout_region,
                 box_delta=args.box_delta,
                 box_tolerance=args.box_tolerance,
                 box_area_ratio=args.box_area_ratio,
+                scan_wait=args.scan_wait,
+                scan_settle=args.scan_settle,
+                select_wait=args.select_wait,
+                regrab_wait=args.regrab_wait,
             )
         else:
             result = capture_photos_batch(
