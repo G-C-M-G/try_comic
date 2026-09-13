@@ -389,6 +389,11 @@ def main(argv=None) -> int:
                         help="输出目录（默认 {书目录}/ocr_compare）")
     parser.add_argument("--width", type=int, default=900, help="对比图面板宽度")
     parser.add_argument(
+        "--keep-large-boxes", action="store_true",
+        help="不做大拟音/效果字过滤（默认过滤，与 stage1 --box-source paddle "
+             "一致；关闭后可看到检测器原始框）",
+    )
+    parser.add_argument(
         "--masked", action="store_true",
         help="额外产出「原图+扩框 | 扩框填黑图」对比图，供人工判断覆盖与扩边"
              "（单独存到 {输出目录}/填黑对比/）",
@@ -455,6 +460,31 @@ def main(argv=None) -> int:
         xs = [p[0] for p in poly]
         ys = [p[1] for p in poly]
         return min(xs), min(ys), max(xs), max(ys)
+
+    # 与 stage1 的 --box-source paddle 保持一致：默认应用大拟音/效果字过滤，
+    # 使对比图与填黑图反映**管线实际使用的框**（否则看到的红框比真实多）。
+    filtered_pages: list[tuple[str, int, int]] = []
+    if not args.keep_large_boxes:
+        from one_click_translate import _filter_large_sfx
+
+        for page in pages:
+            items = [it for it in (paddle_boxes.get(page) or []) if "error" not in it]
+            if not items:
+                continue
+            original = book / "dataset" / page / "original.jpg"
+            if not original.is_file():
+                continue
+            with Image.open(original) as handle:
+                page_w, page_h = handle.size
+            bboxes = [list(_bbox(it["poly"])) for it in items]
+            kept, dropped = _filter_large_sfx(bboxes, page_w, page_h)
+            if not dropped:
+                continue
+            keep_set = {tuple(box) for box in kept}
+            paddle_boxes[page] = [
+                it for it, box in zip(items, bboxes) if tuple(box) in keep_set
+            ]
+            filtered_pages.append((page, len(dropped), len(items)))
 
     def _uncovered(blue_bbox, items):
         if not items:
@@ -589,6 +619,10 @@ def main(argv=None) -> int:
         for page, merged, total in granularity:
             print(f"  page {page}: {merged}/{total} 个引擎框各覆盖多个蓝框 "
                   f"→ 该页蓝框切分比引擎更细，精确率不可直接采信")
+    if filtered_pages:
+        print("\n=== 大拟音/效果字过滤（与 stage1 同规则）===")
+        for page, dropped, total in filtered_pages:
+            print(f"  page {page}: 剔除 {dropped}/{total} 个")
     if paddle_err:
         print(f"paddle engine error: {paddle_err}", file=sys.stderr)
     return 0
