@@ -143,7 +143,7 @@ class PaddleBoxCaptureTest(unittest.TestCase):
         # 两个竖排框纵向重叠、横向紧邻 → 同一组（20% 间距 / 40% 重叠规则）
         ok, manifest = self._capture([
             {"polygon": _poly(200, 60, 240, 300), "text": "あ", "confidence": 0.9},
-            {"polygon": _poly(260, 60, 300, 300), "text": "い", "confidence": 0.9},
+            {"polygon": _poly(248, 60, 288, 300), "text": "い", "confidence": 0.9},
         ])
         groups = manifest["capture"]["selection_groups"]
         self.assertEqual(len(groups), 1)
@@ -152,7 +152,7 @@ class PaddleBoxCaptureTest(unittest.TestCase):
     def test_group_helper_accepts_generated_blocks(self):
         blocks = [
             {"id": "sel_001", "image_bbox": [200, 60, 240, 300], "page_scale": False},
-            {"id": "sel_002", "image_bbox": [260, 60, 300, 300], "page_scale": False},
+            {"id": "sel_002", "image_bbox": [248, 60, 288, 300], "page_scale": False},
         ]
         grouped = _group_boxes_by_overlap(blocks)
         self.assertEqual(len(grouped), 1)

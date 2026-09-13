@@ -252,33 +252,39 @@ class GroupBoxesByOverlapTests(unittest.TestCase):
         groups = _group_boxes_by_overlap(boxes)
         self.assertEqual(len(groups), 1)
 
-    def test_vertical_boxes_within_12px_raw_gap_merge(self):
-        # Page-12 style: narrow columns 9px apart -- the 6px expansions
-        # overlap (negative padded gap), so the gap axis passes and the
-        # overlap decides.
+    def test_vertical_narrow_columns_within_ratio_merge(self):
+        # 窄列（20px 宽）间距 5px < 30% × 20px = 6px -> 并。
+        boxes = [
+            _box("a", 1084, 64, 1104, 220),
+            _box("b", 1109, 64, 1132, 174),
+        ]
+        groups = _group_boxes_by_overlap(boxes)
+        self.assertEqual(len(groups), 1)
+
+    def test_vertical_9px_gap_no_longer_merges_at_default_ratio(self):
+        # 同样的窄列把间距放到 9px：9 > 6 -> 不并。记录默认比例收紧后的边界
+        # （旧规则在扩边后几何上判，扩边白送 2×pad，等价阈值宽松得多）。
         boxes = [
             _box("a", 1084, 64, 1104, 220),
             _box("b", 1113, 64, 1136, 174),
         ]
         groups = _group_boxes_by_overlap(boxes)
-        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups), 2)
 
-    def test_vertical_gap_within_60_percent_raw_width_merges(self):
-        # 合并判据在**原始框**上：间距 15px < 60% × 较小框宽 (30px → 18px)。
+    def test_vertical_gap_within_ratio_merges(self):
+        # 合并判据在**原始框**上：间距 6px < 30% × 较小框宽 (30px → 9px)。
         boxes = [
             _box("a", 50, 30, 80, 200),
-            _box("b", 95, 40, 125, 220),
+            _box("b", 86, 40, 116, 220),
         ]
         groups = _group_boxes_by_overlap(boxes)
         self.assertEqual(len(groups), 1)
 
-    def test_vertical_gap_beyond_60_percent_raw_width_does_not_merge(self):
-        # 同一对框把间距拉到 20px：20 > 60% × 30px = 18px -> 不并。
-        # （旧规则在"扩边后"几何上判，扩边给间距加了 2×pad 的常量，
-        #  等价比例约 20%；改成原始框后重标定为 60%。）
+    def test_vertical_gap_beyond_ratio_does_not_merge(self):
+        # 同一对框把间距拉到 15px：15 > 30% × 30px = 9px -> 不并。
         boxes = [
             _box("a", 50, 30, 80, 200),
-            _box("b", 100, 40, 130, 220),
+            _box("b", 95, 40, 125, 220),
         ]
         groups = _group_boxes_by_overlap(boxes)
         self.assertEqual(len(groups), 2)

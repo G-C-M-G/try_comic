@@ -913,7 +913,7 @@ def _group_boxes_by_overlap(
     boxes: Sequence[dict],
     *,
     pad: int = 6,
-    gap_ratio: float = 0.60,
+    gap_ratio: float = 0.30,
     overlap_ratio: float = 0.40,
 ) -> list[tuple[tuple[int, int, int, int], list[str]]]:
     """Group blue boxes (image-space) into OCR recognition units.
@@ -931,18 +931,19 @@ def _group_boxes_by_overlap(
     padding (padding is an engineering allowance, not a layout fact):
 
     * two VERTICAL boxes merge when the raw horizontal gap is below
-      60% of the smaller box's width AND their vertical ranges overlap by
+      30% of the smaller box's width AND their vertical ranges overlap by
       more than 40% of the LARGER box's height;
     * two HORIZONTAL boxes merge when the raw vertical gap is below
-      60% of the smaller box's height AND their horizontal ranges overlap
+      30% of the smaller box's height AND their horizontal ranges overlap
       by more than 40% of the LARGER box's width;
     * mixed-orientation pairs never merge.
 
-    (60% on raw geometry replaces the earlier "20% on padded geometry":
+    (30% on raw geometry replaces the earlier "20% on padded geometry":
     padding used to add ~2*pad px to every gap -- a large constant
     relative to small boxes.  The raw form is scale-invariant.  Measured
-    sweep on 图源样张: any ratio in 0.4~0.6 gives near-identical
-    groupings, so the exact value is not critical.)
+    on 图源样张 (532 boxes): 0.6/0.5/0.4/0.3/0.2 -> 261/265/266/271/274
+    groups; lower ratios split multi-column sentences apart, and 0.3 was
+    chosen by review of the affected pages.)
 
     Returns ``[(group_bbox, [member_ids])]`` sorted top-to-bottom,
     right-to-left.  ``boxes`` must carry ``id`` and ``image_bbox``.

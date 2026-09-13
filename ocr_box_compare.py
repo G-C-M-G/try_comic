@@ -486,8 +486,8 @@ def main(argv=None) -> int:
                         help="输出目录（默认 {书目录}/ocr_compare）")
     parser.add_argument("--width", type=int, default=900, help="对比图面板宽度")
     parser.add_argument(
-        "--gap-ratio", type=float, default=0.6,
-        help="编组间距比例：间距 < N×较小框宽/高 则合并（默认 0.6，原始框上判）",
+        "--gap-ratio", type=float, default=0.3,
+        help="编组间距比例：间距 < N×较小框宽/高 则合并（默认 0.3，原始框上判）",
     )
     parser.add_argument(
         "--groups", action="store_true",
