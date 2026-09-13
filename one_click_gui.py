@@ -813,6 +813,13 @@ class MainWindow(QMainWindow):
             "paddle：离线检测、无窗口自动化、GPU 下 32 页约 7 秒；\n"
             "photos：原流程，需开 Photos 窗口并做焦点/时序控制。"
         )
+        self.drop_large_boxes_check = QCheckBox("剔除大拟音/效果字框（Paddle 路径）")
+        self.drop_large_boxes_check.setChecked(True)
+        self.drop_large_boxes_check.setToolTip(
+            "剔除大号拟音/效果字框（如 ドッ/ズズッ 这类风格化大字）：\n"
+            "判据 = 框短边 > 2.5×同方向基准 且 > 页短边 10%。\n"
+            "按方向分组比较（横比横、竖比竖），横排文字行不会被误删。"
+        )
         self.paddle_device_combo = QComboBox()
         self.paddle_device_combo.addItem("自动（有 GPU 就用，默认）", "auto")
         self.paddle_device_combo.addItem("GPU", "gpu")
@@ -920,6 +927,7 @@ class MainWindow(QMainWindow):
         _row("OCR 引擎（采集，Photos 路径）", self.ocr_engine_combo)
         _row("读字引擎（嵌字前）", self.stage2_engine_combo)
         _row("OCR 设备（采集，Paddle）", self.paddle_device_combo)
+        _row("大拟音过滤", self.drop_large_boxes_check)
         cap_title = QLabel("采集", objectName="cardTitle")
         lay.addWidget(cap_title)
         region_row = _row("采集区域（宽×高，屏 2560×1600 留边界用 2400×1400）", self.region_edit)
@@ -984,6 +992,8 @@ class MainWindow(QMainWindow):
         box_source = data.get("box_source")
         index = self.box_source_combo.findData(box_source) if box_source else -1
         self.box_source_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.drop_large_boxes_check.setChecked(
+            bool(data.get("drop_large_boxes", True)))
         stage2_engine = data.get("stage2_engine")
         index = self.stage2_engine_combo.findData(stage2_engine) if stage2_engine else -1
         self.stage2_engine_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -1094,6 +1104,7 @@ class MainWindow(QMainWindow):
             "ai_ocr_model": self.ai_ocr_model_edit.text().strip(),
             "ai_ocr_api_key": self.ai_ocr_key_edit.text().strip(),
             "box_source": self.box_source_combo.currentData(),
+            "drop_large_boxes": self.drop_large_boxes_check.isChecked(),
             "ocr_engine": self.ocr_engine_combo.currentData(),
             "paddle_device": self.paddle_device_combo.currentData(),
             "stage2_engine": self.stage2_engine_combo.currentData(),
@@ -1551,6 +1562,8 @@ class MainWindow(QMainWindow):
         box_source = self.box_source_combo.currentData()
         if box_source and box_source != "paddle":
             args += ["--box-source", box_source]
+        if not self.drop_large_boxes_check.isChecked():
+            args.append("--keep-large-boxes")
         engine = self.ocr_engine_combo.currentData()
         if engine and engine != "auto":
             args += ["--ocr-engine", engine]

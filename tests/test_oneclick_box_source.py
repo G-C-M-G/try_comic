@@ -161,3 +161,92 @@ class PaddleBoxCaptureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LargeSfxFilterTest(unittest.TestCase):
+    """大号拟音/效果字过滤（_filter_large_sfx）。
+
+    判据是"短边 vs 同方向基准"，所以要锁住的不是某个具体阈值，而是几条
+    容易写错的边界：横排不被误杀、样本不足时不乱删、分组确实按方向走。
+    """
+
+    PAGE = (1000, 1400)
+
+    def _v(self, x, y, w, h):
+        """竖排框（高 > 宽），短边 = w。"""
+        return [x, y, x + w, y + h]
+
+    def _h(self, x, y, w, h):
+        """横排框（宽 >= 高），短边 = h。"""
+        return [x, y, x + w, y + h]
+
+    def test_large_sfx_dropped_against_direction_baseline(self):
+        from one_click_translate import _filter_large_sfx
+
+        boxes = [self._v(100 + i * 60, 100, 40, 300) for i in range(8)]
+        big = self._h(100, 600, 500, 400)          # 短边 400 vs 竖排基准 40
+        kept, dropped = _filter_large_sfx(boxes + [big], *self.PAGE)
+        self.assertEqual(len(kept), 8)
+        self.assertEqual([d[0] for d in dropped], [big])
+
+    def test_wide_but_normal_horizontal_box_survives(self):
+        """横排"宽"不是罪：短边正常就该留下（按宽度筛会误杀）。"""
+        from one_click_translate import _filter_large_sfx
+
+        boxes = [self._v(100 + i * 60, 100, 40, 300) for i in range(8)]
+        wide = self._h(0, 600, 980, 45)            # 占满页宽，但短边 45 ≈ 正常字号
+        kept, dropped = _filter_large_sfx(boxes + [wide], *self.PAGE)
+        self.assertIn(wide, kept)
+        self.assertEqual(dropped, [])
+
+    def test_horizontal_compared_against_horizontal(self):
+        """横框够多时用横框自己的基准：同向的大字被删，正常横排不受竖排影响。"""
+        from one_click_translate import _filter_large_sfx
+
+        boxes = [self._v(100 + i * 40, 100, 30, 260) for i in range(10)]   # 竖排基准 30
+        h_small = [self._h(60, 700 + i * 80, 300, 60) for i in range(4)]   # 横排基准 60
+        h_big = self._h(60, 1200, 600, 260)                                # 短边 260 > 2.5×60
+        kept, dropped = _filter_large_sfx(boxes + h_small + [h_big], *self.PAGE)
+        self.assertIn(h_big, dropped[0])
+        self.assertEqual(len(kept), 14)
+
+    def test_small_page_never_raises_or_overdrops(self):
+        from one_click_translate import _filter_large_sfx
+
+        few = [self._v(10, 10, 40, 200), self._h(100, 300, 400, 380)]
+        kept, dropped = _filter_large_sfx(few, *self.PAGE)
+        self.assertEqual(kept, few)
+        self.assertEqual(dropped, [])
+
+    def test_absolute_page_floor_blocks_small_page_false_drop(self):
+        """少框页的兜底：短边 90 过了倍数条件（>2.5×30），但 < 页短边×0.10=100，
+        被绝对下限挡下，避免把普通大字当拟声词删掉。"""
+        from one_click_translate import _filter_large_sfx
+
+        boxes = [
+            self._v(10, 10, 30, 200), self._v(60, 10, 30, 200),
+            self._h(10, 300, 400, 90),             # 短边 90：过倍数、卡在下限
+        ]
+        kept, dropped = _filter_large_sfx(boxes, *self.PAGE)
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(kept), 3)
+
+    def test_page_floor_does_not_block_a_real_sfx(self):
+        """下限只挡"擦边"的；真·大拟声词远超下限，照样删。"""
+        from one_click_translate import _filter_large_sfx
+
+        boxes = [
+            self._v(10, 10, 30, 200), self._v(60, 10, 30, 200),
+            self._h(10, 300, 400, 300),            # 短边 300 ≫ 下限 100
+        ]
+        kept, dropped = _filter_large_sfx(boxes, *self.PAGE)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(dropped[0][1], 300)
+
+    def test_kept_boxes_stay_in_reading_order(self):
+        from one_click_translate import _filter_large_sfx
+
+        boxes = [self._v(500, 100, 40, 300), self._v(300, 100, 40, 300),
+                 self._v(100, 100, 40, 300)]
+        kept, _ = _filter_large_sfx(boxes, *self.PAGE)
+        self.assertEqual([b[0] for b in kept], [500, 300, 100])

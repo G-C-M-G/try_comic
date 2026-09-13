@@ -120,10 +120,62 @@ def _is_black_page(image_path: Path, dark_ratio: float = 0.90) -> bool:
     return float((arr < 32).mean()) > dark_ratio
 
 
+def _filter_large_sfx(
+    bboxes: list[list[int]], image_w: int, image_h: int, *,
+    ratio: float = 2.5, page_floor: float = 0.10, min_group: int = 3,
+) -> tuple[list[list[int]], list[tuple[list[int], int, str]]]:
+    """剔除大号拟音/效果字框，返回 ``(保留, [(框, 短边px, 基准说明)])``。
+
+    判据用 **min(w,h)（短边）** 而不是单边长度：文字行无论横竖，短边都≈字号，
+    逐页稳定；而大拟声词两个方向都大，短边会远超基准。**不能用宽度**——横排行
+    天然就宽（实测本册最宽的对白框 0.11 页宽，而竖排短边中位仅 0.038 页宽），
+    按宽度筛必然误伤横排。
+
+    **基准按方向分组**（横框比横框、竖框比竖框），避免两种字号混在一起互相
+    污染。但某方向样本 < ``min_group`` 时无法自证基准——此时回落到全页短边
+    中位数。这一步是必需的：漫画以竖排为主，待删的大拟声词往往就是该页**仅有**
+    的横框，若严格"横比横"，基准会等于离群值本身而全部漏删（实测页 32：横框
+    仅 1 个且就是那个 385px 的大字，基准 385 → 阈值 962 → 一个都删不掉）。
+
+    另需同时超过 ``page_floor × min(页宽, 页高)`` 的绝对下限，避免在只有
+    两三个框的小页上误删。
+    """
+    if len(bboxes) < 3:
+        return list(bboxes), []
+    short = [min(box[2] - box[0], box[3] - box[1]) for box in bboxes]
+    page_median = float(np.median(short))
+    floor_px = page_floor * min(image_w, image_h)
+
+    groups: dict[str, list[int]] = {"h": [], "v": []}
+    for index, box in enumerate(bboxes):
+        key = "h" if (box[2] - box[0]) >= (box[3] - box[1]) else "v"
+        groups[key].append(index)
+
+    kept: list[list[int]] = []
+    dropped: list[tuple[list[int], int, str]] = []
+    for key, indices in groups.items():
+        if len(indices) >= min_group:
+            baseline = float(np.median([short[i] for i in indices]))
+            basis = f"{'横' if key == 'h' else '竖'}框基准{baseline:.0f}px"
+        else:
+            baseline = page_median
+            basis = f"仅{len(indices)}个{'横' if key == 'h' else '竖'}框,回落全页基准{baseline:.0f}px"
+        for index in indices:
+            box = bboxes[index]
+            if short[index] > ratio * baseline and short[index] > floor_px:
+                dropped.append((box, short[index], basis))
+            else:
+                kept.append(box)
+    kept.sort(key=lambda box: (box[1], -box[2]))
+    return kept, dropped
+
+
 def capture_boxes_with_paddle(
     images: Path, out_root: Path, pages: set[str] | None,
     *, device: str = "auto", box_area_ratio: float = 0.20,
     min_side: int = 6,
+    drop_large_boxes: bool = True, sfx_min_side_ratio: float = 2.5,
+    sfx_min_side_page: float = 0.10,
 ) -> bool:
     """stage1 的另一种框来源：PaddleOCR 全页检测（默认）。
 
@@ -190,6 +242,21 @@ def capture_boxes_with_paddle(
             if (x2 - x1) * (y2 - y1) > box_area_ratio * image_area:
                 continue
             candidates.append((y1, -x2, [x1, y1, x2, y2]))
+
+        # 大号拟音/效果字过滤（判据与理由见 _filter_large_sfx 的 docstring）
+        dropped_large: list[tuple[list[int], int, str]] = []
+        if drop_large_boxes and len(candidates) >= 3:
+            kept, dropped_large = _filter_large_sfx(
+                [item[2] for item in candidates], image_w, image_h,
+                ratio=sfx_min_side_ratio, page_floor=sfx_min_side_page,
+            )
+            keep_ids = {tuple(box) for box in kept}
+            candidates = [item for item in candidates if tuple(item[2]) in keep_ids]
+        if dropped_large:
+            detail = "; ".join(f"{box} 短边{short}px（{basis}）"
+                               for box, short, basis in dropped_large)
+            print(f"[box-source=paddle] page {source_path.stem}: 过滤 "
+                  f"{len(dropped_large)} 个大拟音/效果字框 -> {detail}")
 
         # id 稳定分配：按阅读序（上→下，右→左），与 Photos 的编号习惯一致
         candidates.sort(key=lambda item: (item[0], item[1]))
@@ -259,6 +326,9 @@ def stage1_capture(
     box_area_ratio: float = 0.20, overwrite: bool = False,
     ocr_engine: str = "auto", paddle_device: str = "auto",
     box_source: str = "paddle",
+    drop_large_boxes: bool = True,
+    sfx_min_side_ratio: float = 2.5,
+    sfx_min_side_page: float = 0.10,
     row_spacing_px: int | None = None,
     right_gap_px: int = 0, scan_wait: float = 0.5,
     scan_settle: float = 1.3, select_wait: float = 0.45,
@@ -293,6 +363,9 @@ def stage1_capture(
         ok = capture_boxes_with_paddle(
             images, out_root, pages,
             device=paddle_device, box_area_ratio=box_area_ratio,
+            drop_large_boxes=drop_large_boxes,
+            sfx_min_side_ratio=sfx_min_side_ratio,
+            sfx_min_side_page=sfx_min_side_page,
         )
         if not ok:
             progress.fail("paddle box capture failed")
@@ -1991,6 +2064,19 @@ def main(argv=None) -> int:
              "edge in --display-scale layout (default 0)",
     )
     parser.add_argument(
+        "--keep-large-boxes", action="store_true",
+        help="保留大号拟音/效果字框（默认剔除：短边 > 2.5×同方向基准且 "
+             "> 页短边 10%%）。该处理只作用于 --box-source paddle",
+    )
+    parser.add_argument(
+        "--sfx-min-side-ratio", type=float, default=2.5,
+        help="大拟音判定倍数：框短边 > N × 同方向基准（默认 2.5）",
+    )
+    parser.add_argument(
+        "--sfx-min-side-page", type=float, default=0.10,
+        help="大拟音绝对下限：框短边 > N × 页短边（默认 0.10）",
+    )
+    parser.add_argument(
         "--box-source",
         default="paddle",
         choices=["paddle", "photos"],
@@ -2270,6 +2356,9 @@ def main(argv=None) -> int:
                             ocr_engine=args.ocr_engine,
                             paddle_device=args.paddle_device,
                             box_source=args.box_source,
+                            drop_large_boxes=not args.keep_large_boxes,
+                            sfx_min_side_ratio=args.sfx_min_side_ratio,
+                            sfx_min_side_page=args.sfx_min_side_page,
                             row_spacing_px=args.layout_row_spacing,
                             right_gap_px=args.layout_right_gap,
                             scan_wait=args.scan_wait,
