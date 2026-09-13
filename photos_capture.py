@@ -631,7 +631,8 @@ BLUE_OVERLAY_PAINT_DELTA = 2.0
 # Whole-page selection threshold: a connected blue region covering more
 # than this fraction of the frame is a whole-page misselection and is
 # dropped (not an atomic text box).
-WHOLE_PAGE_AREA_RATIO = 0.20
+# 整页大框过滤比例：与 Paddle 路径共用同一常量（manga_localizer.thresholds）
+from manga_localizer.thresholds import WHOLE_PAGE_AREA_RATIO
 
 # Scan-text chrome settle: a frame edge pixel counts as "coloured UI" when
 # its channel spread exceeds this (manga pages are grayscale, R≈G≈B, while

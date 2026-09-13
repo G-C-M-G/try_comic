@@ -56,6 +56,14 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 from PIL import Image, ImageDraw
 
+from manga_localizer.thresholds import (
+    SFX_MIN_SIDE_PAGE,
+    SFX_MIN_SIDE_RATIO,
+    WHOLE_PAGE_AREA_RATIO,
+    bbox_pad as source_bbox_pad,
+    glyph_margin as source_glyph_margin,
+)
+
 BLUEBOX_FILL = (0, 0, 0)  # fill colour outside blue boxes (--bluebox-fill)
 
 
@@ -172,10 +180,8 @@ def _filter_large_sfx(
 
 def capture_boxes_with_paddle(
     images: Path, out_root: Path, pages: set[str] | None,
-    *, device: str = "auto", box_area_ratio: float = 0.20,
+    *, device: str = "auto", box_area_ratio: float = WHOLE_PAGE_AREA_RATIO,
     min_side: int = 6,
-    drop_large_boxes: bool = True, sfx_min_side_ratio: float = 2.0,
-    sfx_min_side_page: float = 0.10,
 ) -> bool:
     """stage1 的另一种框来源：PaddleOCR 全页检测（默认）。
 
@@ -243,21 +249,8 @@ def capture_boxes_with_paddle(
                 continue
             candidates.append((y1, -x2, [x1, y1, x2, y2]))
 
-        # 大号拟音/效果字过滤（判据与理由见 _filter_large_sfx 的 docstring）
-        dropped_large: list[tuple[list[int], int, str]] = []
-        if drop_large_boxes and len(candidates) >= 3:
-            kept, dropped_large = _filter_large_sfx(
-                [item[2] for item in candidates], image_w, image_h,
-                ratio=sfx_min_side_ratio, page_floor=sfx_min_side_page,
-            )
-            keep_ids = {tuple(box) for box in kept}
-            candidates = [item for item in candidates if tuple(item[2]) in keep_ids]
-        if dropped_large:
-            detail = "; ".join(f"{box} 短边{short}px（{basis}）"
-                               for box, short, basis in dropped_large)
-            print(f"[box-source=paddle] page {source_path.stem}: 过滤 "
-                  f"{len(dropped_large)} 个大拟音/效果字框 -> {detail}")
-
+        # 大拟音/效果字过滤放在共用的数据集构建阶段（build_bluebox_dataset），
+        # 这样 Photos 与 Paddle 两条路径共用同一套规则；采集期只负责检出框。
         # id 稳定分配：按阅读序（上→下，右→左），与 Photos 的编号习惯一致
         candidates.sort(key=lambda item: (item[0], item[1]))
         blocks = [
@@ -323,12 +316,9 @@ def stage1_capture(
     images: Path, out_root: Path, pages: set[str] | None, parallel: int,
     display_scale: int, row_gap_px: int | None, bottom_shift_up: int,
     layout_region: str = "", box_delta: int = 8, box_tolerance: float = 5.0,
-    box_area_ratio: float = 0.20, overwrite: bool = False,
+    box_area_ratio: float = WHOLE_PAGE_AREA_RATIO, overwrite: bool = False,
     ocr_engine: str = "auto", paddle_device: str = "auto",
     box_source: str = "paddle",
-    drop_large_boxes: bool = True,
-    sfx_min_side_ratio: float = 2.0,
-    sfx_min_side_page: float = 0.10,
     row_spacing_px: int | None = None,
     right_gap_px: int = 0, scan_wait: float = 0.5,
     scan_settle: float = 1.3, select_wait: float = 0.45,
@@ -363,9 +353,6 @@ def stage1_capture(
         ok = capture_boxes_with_paddle(
             images, out_root, pages,
             device=paddle_device, box_area_ratio=box_area_ratio,
-            drop_large_boxes=drop_large_boxes,
-            sfx_min_side_ratio=sfx_min_side_ratio,
-            sfx_min_side_page=sfx_min_side_page,
         )
         if not ok:
             progress.fail("paddle box capture failed")
@@ -1073,14 +1060,21 @@ def _resolve_group_yields(rects, *, limit_ratio: float = 0.5,
 
 
 def build_bluebox_dataset(
-    manifest_path, page_dir, source_path, min_island_area: float = 800.0, pad: int = 0
+    manifest_path, page_dir, source_path, min_island_area: float = 800.0, pad: int = 0,
+    drop_large_boxes: bool = True,
+    sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
+    sfx_min_side_page: float = SFX_MIN_SIDE_PAGE,
 ) -> list[dict]:
     """islands.json purely from the Photos blue boxes (original image space).
 
     No highlight-island detection: the atomic blue boxes are re-grouped by
-    the two-axis 20% gap / 40% overlap rule (``_group_boxes_by_overlap``) --
-    every group is one island, padded ``pad`` px, and its own independent
-    bbox.
+    the two-axis gap/overlap rule (``_group_boxes_by_overlap``) -- every
+    group is one island, padded ``pad`` px, and its own independent bbox.
+
+    **两条框来源共用同一套过滤**（`manga_localizer.thresholds`）：整页大框
+    （面积 > 20% 页）在采集期已丢；这里再丢**大号拟音/效果字**（短边 >
+    2.0×同方向基准 且 > 页短边 10%）。放在共用阶段而非采集期，Photos 与
+    Paddle 两条路径才会得到同一结果。
     Raises ValueError when the page has no usable blue boxes -- the caller
     keeps the page untouched then.  Also writes selection_blocks.json
     (typeset column positions + the re-grouped groups) and a copy of the
@@ -1094,6 +1088,30 @@ def build_bluebox_dataset(
     source = payload.get("source", {})
     image_w = int(source["width"])
     image_h = int(source["height"])
+    # 共用的大拟音/效果字过滤（Photos 与 Paddle 同一规则；见 thresholds）
+    if drop_large_boxes and blocks:
+        atomic_boxes = [b for b in blocks if not b.get("page_scale")]
+        if len(atomic_boxes) >= 3:
+            kept_boxes, dropped_large = _filter_large_sfx(
+                [list(b["image_bbox"]) for b in atomic_boxes], image_w, image_h,
+                ratio=sfx_min_side_ratio, page_floor=sfx_min_side_page,
+            )
+            if dropped_large:
+                keep_set = {tuple(box) for box in kept_boxes}
+                removed = {
+                    b["id"] for b in atomic_boxes
+                    if tuple(b["image_bbox"]) not in keep_set
+                }
+                blocks = [
+                    b for b in blocks
+                    if b.get("page_scale") or b["id"] not in removed
+                ]
+                print(
+                    f"page {Path(page_dir).name}: 过滤 {len(dropped_large)} 个大拟音/"
+                    f"效果字框（短边 > {sfx_min_side_ratio}×同方向基准 且 > "
+                    f"{sfx_min_side_page:.0%} 页短边）"
+                )
+
     atomic_ids = {item["id"] for item in blocks if not item.get("page_scale")}
     grouped = _group_boxes_by_overlap(blocks)
     groups = [
@@ -1110,7 +1128,7 @@ def build_bluebox_dataset(
     # OCR 裁剪与擦字仍以原框为准，只有嵌字的布局框被挪开。
     boxes_by_id = {b["id"]: b for b in blocks}
     source_kind = str(payload.get("capture", {}).get("box_source") or "photos")
-    bbox_pad = 4 if source_kind == "paddle" else 6
+    bbox_pad = source_bbox_pad(source_kind)
     group_rects = []
     for group in groups:
         member_boxes = [boxes_by_id[mid]["image_bbox"] for mid in group["members"]
@@ -1276,6 +1294,9 @@ def stage2_process(
     ai_ocr_model: str = "",
     ai_ocr_api_key: str = "",
     stage2_engine: str = "manga-ocr",
+    drop_large_boxes: bool = True,
+    sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
+    sfx_min_side_page: float = SFX_MIN_SIDE_PAGE,
     resume: bool = False,
     no_pdf: bool = False,
     min_font_size: int | None = None,
@@ -1390,7 +1411,12 @@ def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
         if not manifest_path.is_file():
             continue
         try:
-            build_bluebox_dataset(manifest_path, page_dir, source)
+            build_bluebox_dataset(
+                manifest_path, page_dir, source,
+                drop_large_boxes=drop_large_boxes,
+                sfx_min_side_ratio=sfx_min_side_ratio,
+                sfx_min_side_page=sfx_min_side_page,
+            )
         except ValueError as error:
             # No usable blue boxes: nothing to process, the page stays
             # original (kept out of the OCR/translate/typeset loops).
@@ -2103,8 +2129,8 @@ def erase_and_typeset_page_with(
         )
     except (OSError, ValueError):
         _box_source = ""
-    glyph_margin = 5 if _box_source == "paddle" else 12
-    bbox_pad = 4 if _box_source == "paddle" else 6
+    glyph_margin = source_glyph_margin(_box_source)
+    bbox_pad = source_bbox_pad(_box_source)
     union_overrides = (
         build_union_overrides(dataset, boxes, pad=6, glyph_margin=glyph_margin,
                               bbox_pad=bbox_pad)
@@ -2227,11 +2253,11 @@ def main(argv=None) -> int:
              "> 页短边 10%%）。该处理只作用于 --box-source paddle",
     )
     parser.add_argument(
-        "--sfx-min-side-ratio", type=float, default=2.0,
+        "--sfx-min-side-ratio", type=float, default=SFX_MIN_SIDE_RATIO,
         help="大拟音判定倍数：框短边 > N × 同方向基准（默认 2.0）",
     )
     parser.add_argument(
-        "--sfx-min-side-page", type=float, default=0.10,
+        "--sfx-min-side-page", type=float, default=SFX_MIN_SIDE_PAGE,
         help="大拟音绝对下限：框短边 > N × 页短边（默认 0.10）",
     )
     parser.add_argument(
@@ -2514,9 +2540,6 @@ def main(argv=None) -> int:
                             ocr_engine=args.ocr_engine,
                             paddle_device=args.paddle_device,
                             box_source=args.box_source,
-                            drop_large_boxes=not args.keep_large_boxes,
-                            sfx_min_side_ratio=args.sfx_min_side_ratio,
-                            sfx_min_side_page=args.sfx_min_side_page,
                             row_spacing_px=args.layout_row_spacing,
                             right_gap_px=args.layout_right_gap,
                             scan_wait=args.scan_wait,
@@ -2568,6 +2591,9 @@ def main(argv=None) -> int:
         or os.environ.get("AI_OCR_API_KEY", "")
         or _config.get("ai_ocr_api_key", ""),
         stage2_engine=args.stage2_engine,
+        drop_large_boxes=not args.keep_large_boxes,
+        sfx_min_side_ratio=args.sfx_min_side_ratio,
+        sfx_min_side_page=args.sfx_min_side_page,
         resume=args.resume,
         no_pdf=args.no_pdf,
         min_font_size=args.min_font_size,
