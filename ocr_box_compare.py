@@ -362,6 +362,74 @@ def compose_masked(original_path: Path, boxes: list[dict], out_path: Path,
     _save_with_retry(board, out_path)
 
 
+_GROUP_COLORS = [
+    (230, 60, 60), (60, 140, 230), (40, 170, 90), (230, 150, 40),
+    (170, 80, 210), (0, 180, 180), (220, 90, 150), (120, 120, 60),
+]
+
+
+def compose_groups(original_path: Path, blocks: list[dict], out_path: Path,
+                   panel_width: int, pad: int = 6) -> tuple[int, int]:
+    """原图 | 原图 + 编组（细框=原子框，粗彩框=组外接框）对比。
+
+    画的是 ``_group_boxes_by_overlap``（20% 间距 / 40% 重叠、±pad、横竖不互并）
+    的**实际产出的组**，即下游嵌字的单位。返回 ``(框数, 组数)``。
+    """
+    from one_click_translate import _group_boxes_by_overlap
+
+    original = Image.open(original_path).convert("RGB")
+    usable = [
+        {"id": item["id"], "image_bbox": list(item["image_bbox"]),
+         "page_scale": False}
+        for item in blocks if not item.get("page_scale") and item.get("id")
+    ]
+    grouped = _group_boxes_by_overlap(usable, pad=pad)
+
+    annotated = original.copy()
+    draw = ImageDraw.Draw(annotated)
+    for index, (bbox, members) in enumerate(grouped):
+        color = _GROUP_COLORS[index % len(_GROUP_COLORS)]
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=6)
+        draw.text((x1 + 4, max(0, y1 - 24)),
+                  f"{index + 1}（{len(members)}框）", fill=color)
+    for item in usable:
+        x1, y1, x2, y2 = item["image_bbox"]
+        draw.rectangle(
+            [max(0, x1 - pad), max(0, y1 - pad), x2 + pad, y2 + pad],
+            outline=(255, 255, 255), width=2,
+        )
+
+    font = ImageFont.truetype(FONT_PATH, 26)
+    label_h = 38
+    panels = [
+        ("原图（未编组）", original),
+        (f"编组结果：{len(usable)} 框 → {len(grouped)} 组"
+         f"（彩色粗框=组外接框，白细框=原子框扩 {pad}px）", annotated),
+    ]
+    columns = []
+    for caption, image in panels:
+        scale = panel_width / image.width
+        resized = image.resize(
+            (panel_width, max(1, round(image.height * scale))), Image.LANCZOS
+        )
+        strip = Image.new("RGB", (panel_width, label_h), (24, 24, 24))
+        ImageDraw.Draw(strip).text((8, 4), caption, font=font, fill=(240, 240, 240))
+        column = Image.new("RGB", (panel_width, label_h + resized.height), (10, 10, 10))
+        column.paste(strip, (0, 0))
+        column.paste(resized, (0, label_h))
+        columns.append(column)
+    height = max(c.height for c in columns)
+    total_w = len(columns) * panel_width + 6 * (len(columns) - 1)
+    board = Image.new("RGB", (total_w, height), (10, 10, 10))
+    x = 0
+    for column in columns:
+        board.paste(column, (x, 0))
+        x += panel_width + 6
+    _save_with_retry(board, out_path)
+    return len(usable), len(grouped)
+
+
 def _save_with_retry(image, out_path: Path, attempts: int = 5) -> None:
     """原子写 + 重试：杀软扫描/预览句柄会造成 Windows 上的瞬时占用
     （OSError 22/13），单次失败不代表目标不可写。"""
@@ -388,6 +456,15 @@ def main(argv=None) -> int:
     parser.add_argument("--out", default=None,
                         help="输出目录（默认 {书目录}/ocr_compare）")
     parser.add_argument("--width", type=int, default=900, help="对比图面板宽度")
+    parser.add_argument(
+        "--groups", action="store_true",
+        help="额外产出编组对比图（原图 | 原图+编组），存到 {输出目录}/编组对比/",
+    )
+    parser.add_argument(
+        "--groups-boxes", default="blue", choices=["blue", "paddle"],
+        help="编组用哪套框：blue = Photos 蓝框（默认，即现流程的编组），"
+             "paddle = Paddle 检测框",
+    )
     parser.add_argument(
         "--keep-large-boxes", action="store_true",
         help="不做大拟音/效果字过滤（默认过滤，与 stage1 --box-source paddle "
@@ -464,6 +541,7 @@ def main(argv=None) -> int:
     # 与 stage1 的 --box-source paddle 保持一致：默认应用大拟音/效果字过滤，
     # 使对比图与填黑图反映**管线实际使用的框**（否则看到的红框比真实多）。
     filtered_pages: list[tuple[str, int, int]] = []
+    grouped_stats: list[tuple[str, int, int]] = []
     if not args.keep_large_boxes:
         from one_click_translate import _filter_large_sfx
 
@@ -546,6 +624,28 @@ def main(argv=None) -> int:
                 paddle_items,
                 out_dir / f"{page}_对比.png", args.width, ctd_items=ctd_items,
                 device_label=device_label)
+        if args.groups:
+            groups_dir = out_dir / "编组对比"
+            groups_dir.mkdir(parents=True, exist_ok=True)
+            if args.groups_boxes == "blue":
+                group_blocks = [
+                    {"id": f"b{index}", "image_bbox": list(bb)}
+                    for index, bb in enumerate(blues, 1)
+                ]
+            else:
+                group_blocks = [
+                    {"id": f"p{index}", "image_bbox": _bbox(item["poly"])}
+                    for index, item in enumerate(
+                        [it for it in (paddle_boxes.get(page, []) or [])
+                         if "error" not in it], 1
+                    )
+                ]
+            if group_blocks:
+                n_boxes, n_groups = compose_groups(
+                    book / "dataset" / page / "original.jpg", group_blocks,
+                    groups_dir / f"{page}_编组对比.png", args.width, args.pad,
+                )
+                grouped_stats.append((page, n_boxes, n_groups))
         if args.masked:
             masked_dir = out_dir / "填黑对比"
             masked_dir.mkdir(parents=True, exist_ok=True)
@@ -619,6 +719,14 @@ def main(argv=None) -> int:
         for page, merged, total in granularity:
             print(f"  page {page}: {merged}/{total} 个引擎框各覆盖多个蓝框 "
                   f"→ 该页蓝框切分比引擎更细，精确率不可直接采信")
+    if grouped_stats:
+        print("\n=== 编组（20% 间距 / 40% 重叠，横竖不互并）===")
+        for page, n_boxes, n_groups in grouped_stats:
+            print(f"  page {page}: {n_boxes} 框 -> {n_groups} 组")
+        total_boxes = sum(item[1] for item in grouped_stats)
+        total_groups = sum(item[2] for item in grouped_stats)
+        print(f"  合计: {total_boxes} 框 -> {total_groups} 组"
+              f"（平均 {total_boxes / max(1, total_groups):.2f} 框/组）")
     if filtered_pages:
         print("\n=== 大拟音/效果字过滤（与 stage1 同规则）===")
         for page, dropped, total in filtered_pages:
