@@ -302,6 +302,66 @@ def compose(page: str, check_path: Path, original_path: Path,
     _save_with_retry(board, out_path)
 
 
+def compose_masked(original_path: Path, boxes: list[dict], out_path: Path,
+                   panel_width: int, pad: int = 6,
+                   label: str = "paddle") -> None:
+    """原图（画出扩框后的框）| 扩框填黑图 —— 供人工判断覆盖与扩边是否合适。
+
+    左联画出 **扩 ``pad`` px 之后** 的框：它就是 OCR 实际保留的区域，
+    所以能直接看出"文字有没有被切到边缘""扩边够不够"。
+    右联是 OCR 真正的输入（框内贴原像素、框外填黑）。
+    """
+    from one_click_translate import BLUEBOX_FILL, build_bluebox_masked
+    import numpy as np
+
+    original = Image.open(original_path).convert("RGB")
+    blocks = [
+        {"id": item.get("id", f"b{index}"),
+         "image_bbox": item["image_bbox"], "page_scale": False}
+        for index, item in enumerate(boxes, 1)
+    ]
+    masked = build_bluebox_masked(
+        np.array(original), blocks, pad=pad,
+        fill=tuple(int(v) for v in BLUEBOX_FILL),
+    )
+
+    boxes_panel = original.copy()
+    draw = ImageDraw.Draw(boxes_panel)
+    for block in blocks:
+        x1, y1, x2, y2 = block["image_bbox"]
+        draw.rectangle(
+            [max(0, x1 - pad), max(0, y1 - pad), x2 + pad, y2 + pad],
+            outline=(255, 40, 40), width=3,
+        )
+
+    font = ImageFont.truetype(FONT_PATH, 26)
+    label_h = 38
+    panels = [
+        (f"原图 + 扩框（{label} 框各扩 {pad}px = OCR 实际保留范围）", boxes_panel),
+        (f"扩框填黑图（OCR 输入，可见区 = 扩框后区域）", Image.fromarray(masked)),
+    ]
+    columns = []
+    for caption, image in panels:
+        scale = panel_width / image.width
+        resized = image.resize(
+            (panel_width, max(1, round(image.height * scale))), Image.LANCZOS
+        )
+        strip = Image.new("RGB", (panel_width, label_h), (24, 24, 24))
+        ImageDraw.Draw(strip).text((8, 4), caption, font=font, fill=(240, 240, 240))
+        column = Image.new("RGB", (panel_width, label_h + resized.height), (10, 10, 10))
+        column.paste(strip, (0, 0))
+        column.paste(resized, (0, label_h))
+        columns.append(column)
+    height = max(c.height for c in columns)
+    total_w = len(columns) * panel_width + 6 * (len(columns) - 1)
+    board = Image.new("RGB", (total_w, height), (10, 10, 10))
+    x = 0
+    for column in columns:
+        board.paste(column, (x, 0))
+        x += panel_width + 6
+    _save_with_retry(board, out_path)
+
+
 def _save_with_retry(image, out_path: Path, attempts: int = 5) -> None:
     """原子写 + 重试：杀软扫描/预览句柄会造成 Windows 上的瞬时占用
     （OSError 22/13），单次失败不代表目标不可写。"""
@@ -328,6 +388,18 @@ def main(argv=None) -> int:
     parser.add_argument("--out", default=None,
                         help="输出目录（默认 {书目录}/ocr_compare）")
     parser.add_argument("--width", type=int, default=900, help="对比图面板宽度")
+    parser.add_argument(
+        "--masked", action="store_true",
+        help="额外产出「原图+扩框 | 扩框填黑图」对比图，供人工判断覆盖与扩边",
+    )
+    parser.add_argument(
+        "--masked-boxes", default="paddle", choices=["paddle", "blue"],
+        help="填黑图用哪套框（默认 paddle；blue = Photos 蓝框）",
+    )
+    parser.add_argument(
+        "--pad", type=int, default=6,
+        help="扩框像素（默认 6，与 stage2 的 OCR 裁剪一致）",
+    )
     parser.add_argument(
         "--ctd", action="store_true",
         help="追加 comic-text-detector 联（实测精确率仅 39.2%，过度识别严重，"
@@ -443,6 +515,26 @@ def main(argv=None) -> int:
                 paddle_items,
                 out_dir / f"{page}_对比.png", args.width, ctd_items=ctd_items,
                 device_label=device_label)
+        if args.masked:
+            if args.masked_boxes == "blue":
+                masked_boxes = [
+                    {"id": f"b{index}", "image_bbox": list(bb)}
+                    for index, bb in enumerate(blues, 1)
+                ]
+            else:
+                masked_boxes = [
+                    {"id": f"p{index}", "image_bbox": _bbox(item["poly"])}
+                    for index, item in enumerate(
+                        [it for it in (paddle_boxes.get(page, []) or [])
+                         if "error" not in it], 1
+                    )
+                ]
+            if masked_boxes:
+                compose_masked(
+                    book / "dataset" / page / "original.jpg", masked_boxes,
+                    out_dir / f"{page}_填黑对比.png", args.width, args.pad,
+                    label=("Photos 蓝框" if args.masked_boxes == "blue" else "PaddleOCR"),
+                )
         print(f"compose {i}/{len(pages)} page {page}", flush=True)
 
     stats = per_page
