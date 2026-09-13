@@ -184,3 +184,34 @@ class TypesetPageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StrokeOverflowTest(unittest.TestCase):
+    """描边是向外画的：裁剪掩膜必须按 STROKE_OVERFLOW_MARGIN 放宽。
+
+    否则贴着布局框排的最外圈描边会被"岛外零改动"的硬裁剪切掉 —— 表现就是
+    边缘的字缺一笔。
+    """
+
+    def test_stroke_near_box_edge_survives(self):
+        from manga_localizer.thresholds import STROKE_OVERFLOW_MARGIN
+
+        dataset = _dataset([_island((40, 40, 120, 260), area=8000.0)])
+        image = Image.new("RGB", (300, 400), (255, 255, 255))
+        translations = {"island_001": "测试文字"}
+        result = typeset_island_page(
+            image, dataset, translations, (), config=TypesetConfig()
+        )
+        island = dataset.islands[0]
+        x1, y1, x2, y2 = island.image_bbox
+        # 掩膜放宽带内允许落墨（不会因裁剪丢笔画）；再往外必须零改动
+        margin = STROKE_OVERFLOW_MARGIN
+        changed = result.changed_mask
+        outside = [
+            (x, y)
+            for x in range(max(0, x1 - margin - 6), x1 - margin)
+            for y in range(y1, y2)
+            if changed.getpixel((x, y))
+        ]
+        self.assertEqual(outside, [], "放宽带之外不应有改动")
+        self.assertGreater(result.audits[0].font_size, 0)

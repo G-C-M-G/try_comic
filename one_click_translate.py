@@ -57,6 +57,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from manga_localizer.thresholds import (
+    STROKE_OVERFLOW_MARGIN,
     SFX_MIN_SIDE_PAGE,
     SFX_MIN_SIDE_RATIO,
     WHOLE_PAGE_AREA_RATIO,
@@ -2197,8 +2198,15 @@ def erase_and_typeset_page_with(
     # Erase the WHOLE canonical box of every erasure-worthy island (plus
     # the detected glyph ink): whatever the typesetter draws inside the
     # box is always on erased art.
+    # 擦字范围 = canonical box **再放宽 STROKE_OVERFLOW_MARGIN**：文字描边向外
+    # 画，贴着框边时会伸出布局框（裁剪掩膜同样放宽），这一带必须先擦干净，
+    # 否则描边会画在原图笔画上。
+    _m = STROKE_OVERFLOW_MARGIN
     extra_regions = {
-        island_id: canonical[island_id]
+        island_id: (
+            canonical[island_id][0] - _m, canonical[island_id][1] - _m,
+            canonical[island_id][2] + _m, canonical[island_id][3] + _m,
+        )
         for island_id in erase_ids
         if island_id in canonical
     }

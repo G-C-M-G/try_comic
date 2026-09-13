@@ -43,6 +43,8 @@ from typing import Mapping, Optional, Sequence, Tuple
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
+from .thresholds import STROKE_OVERFLOW_MARGIN
+from .text_rules import normalize_ellipsis
 from .errors import ErasureError, TypesettingError
 from .island_contract import IslandDataset, IslandInfo
 from .island_dry_run import OcrLine
@@ -729,7 +731,9 @@ def typeset_island_page(
                 )
             )
             continue
-        text = str(translations.get(island.id) or "").strip()
+        # 省略号统一 3 点（两边路径共用同一规则；覆盖保留源文本的符号岛
+        # 与历史译文，重嵌字即生效）
+        text = normalize_ellipsis(str(translations.get(island.id) or "")).strip()
         if not text:
             audits.append(
                 IslandTypesetAudit(
@@ -785,7 +789,17 @@ def typeset_island_page(
     mask = Image.new("L", canvas.size, 0)
     draw = ImageDraw.Draw(mask)
     for island in dataset.islands:
-        draw.rectangle(island.image_bbox, fill=255)
+        # 掩膜按 STROKE_OVERFLOW_MARGIN 放宽：描边向外画，贴着框边时会伸出去，
+        # 不放宽就会被"岛外零改动"的硬裁剪切掉（边缘字缺笔）。这一带在 stage2
+        # 已被一并擦除（extra_regions 同样放宽），所以描边落在已擦除区域上，
+        # 不会覆盖原图像素。
+        x1, y1, x2, y2 = island.image_bbox
+        m = STROKE_OVERFLOW_MARGIN
+        draw.rectangle(
+            (max(0, x1 - m), max(0, y1 - m),
+             min(canvas.size[0], x2 + m), min(canvas.size[1], y2 + m)),
+            fill=255,
+        )
     # Hard island-exterior guarantee: nothing outside the island bboxes may
     # reach the output, so the final composite clips to the island union.
     canvas = Image.composite(canvas, erased, mask)

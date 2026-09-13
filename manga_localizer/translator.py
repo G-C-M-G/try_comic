@@ -11,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .errors import TranslationError, TranslationResponseError
+from .text_rules import normalize_ellipsis
 from .ocr_contract import OCRContract
 
 
@@ -797,7 +798,7 @@ def _clean_translation(text: str) -> str:
     cleaned = re.sub(r"^(?:译文|翻译|中文译文)\s*[:：]\s*", "", cleaned)
     if len(cleaned) >= 2 and cleaned[0] in "\"'“‘" and cleaned[-1] in "\"'”’":
         cleaned = cleaned[1:-1].strip()
-    cleaned = re.sub(r"(?:\.{2,}|．{2,}|…+)", "……", cleaned)
+    cleaned = normalize_ellipsis(cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
