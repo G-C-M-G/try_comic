@@ -488,9 +488,9 @@ def main(argv=None) -> int:
         help="额外产出编组对比图（原图 | 原图+编组），存到 {输出目录}/编组对比/",
     )
     parser.add_argument(
-        "--groups-boxes", default="blue", choices=["blue", "paddle"],
-        help="编组用哪套框：blue = Photos 蓝框（默认，即现流程的编组），"
-             "paddle = Paddle 检测框",
+        "--groups-boxes", default="paddle", choices=["paddle", "blue"],
+        help="编组用哪套框：paddle = Paddle 检测框（默认，与 stage1 的 "
+             "--box-source paddle 一致）；blue = Photos 蓝框（对比旧路径用）",
     )
     parser.add_argument(
         "--keep-large-boxes", action="store_true",
