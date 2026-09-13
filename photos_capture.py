@@ -1267,7 +1267,7 @@ def _run_paddle_whole_page(masked_path: str, device: str) -> list[dict]:
     return pages[0].get("predictions", []) if pages else []
 
 
-def _run_masked_ocr(masked_path: str, engine: str, paddle_device: str = "cpu") -> tuple[list[dict], str]:
+def _run_masked_ocr(masked_path: str, engine: str, paddle_device: str = "auto") -> tuple[list[dict], str]:
     """Run masked-page OCR with the selected engine.
 
     ``auto`` = current behaviour: Windows OCR first, PaddleOCR fallback.
@@ -1725,7 +1725,7 @@ def capture_photos_fast(
     debug_dir: str | None = None,
     screenshot: str | None = None,
     skip_fallback: bool = False,
-    paddle_device: str = "cpu",
+    paddle_device: str = "auto",
     ocr_engine: str = "auto",
     window=None,
     paddle: PaddleSession | None = None,
@@ -1765,7 +1765,7 @@ def _capture_photos_fast_page(
     debug_dir: str | None = None,
     screenshot: str | None = None,
     skip_fallback: bool = False,
-    paddle_device: str = "cpu",
+    paddle_device: str = "auto",
     ocr_engine: str = "auto",
     paddle: PaddleSession | None = None,
     keep_sfx: bool = True,
@@ -3264,7 +3264,7 @@ def capture_photos_fast_batch(
     pages: set[str] | None = None,
     timeout: float = 20,
     resume: bool = False,
-    paddle_device: str = "cpu",
+    paddle_device: str = "auto",
     close_window: bool = True,
     max_attempts: int = 3,
     ask_fallback: bool = True,
@@ -3906,7 +3906,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         parser.add_argument("--resume", action="store_true")
         parser.add_argument("--timeout", type=float, default=20)
-        parser.add_argument("--paddle-device", default="cpu")
+        parser.add_argument(
+            "--paddle-device", default="auto",
+            help="PaddleOCR 设备：auto（有 CUDA 版 paddle 且检测到 GPU 则用 "
+                 "GPU，否则 CPU）/ cpu / gpu；GPU 实测快 ~7.6 倍",
+        )
         parser.add_argument(
             "--max-attempts",
             type=int,
@@ -4113,7 +4117,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="auto",
         help="masked-page OCR engine (default auto: Windows OCR then Paddle fallback; forced engines fail loudly)",
     )
-    parser.add_argument("--paddle-device", default="cpu")
+    parser.add_argument(
+            "--paddle-device", default="auto",
+            help="PaddleOCR 设备：auto（有 CUDA 版 paddle 且检测到 GPU 则用 "
+                 "GPU，否则 CPU）/ cpu / gpu；GPU 实测快 ~7.6 倍",
+        )
     args = parser.parse_args(raw_args)
     if args.fast:
         result = capture_photos_fast(

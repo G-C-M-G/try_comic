@@ -55,7 +55,26 @@ def _inputs(path: Path, pages: set[str] | None) -> Iterable[Path]:
                 yield child
 
 
+def _resolve_device(device: str) -> str:
+    """``auto`` = 有 CUDA 版 paddle 且检测到 GPU 就用 GPU，否则 CPU。
+
+    显式传 ``gpu`` 时不做回退（用户明确要 GPU，失败应当可见）；``auto``
+    与 ``cpu`` 永远安全。GPU 实测比 CPU 快 ~7.6 倍（32 页 6.9s vs 52.3s）。
+    """
+    if device != "auto":
+        return device
+    try:
+        import paddle
+
+        if paddle.device.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0:
+            return "gpu"
+    except Exception:  # noqa: BLE001 - 探测失败一律回退 CPU
+        pass
+    return "cpu"
+
+
 def _build_engine(device: str) -> PaddleOCR:
+    device = _resolve_device(device)
     det_dir = PADDLE_CACHE / "official_models" / "PP-OCRv6_medium_det"
     rec_dir = PADDLE_CACHE / "official_models" / "PP-OCRv6_medium_rec"
     model_paths = {}
@@ -139,7 +158,7 @@ def _predict_page(engine: PaddleOCR, source_path: Path) -> tuple[str, list[dict]
 def run(
     input_path: str,
     output_path: str,
-    device: str = "cpu",
+    device: str = "auto",
     selected_pages: set[str] | None = None,
 ) -> dict:
     engine = _build_engine(device)
@@ -150,7 +169,7 @@ def run(
     output = {
         "schema_version": 1,
         "backend": "PaddleOCR PP-OCRv6 medium",
-        "device": device,
+        "device": _resolve_device(device),
         "pages": result_pages,
     }
     target = Path(output_path).resolve()
@@ -185,13 +204,13 @@ def _predict_crops(engine: PaddleOCR, manifest: dict) -> dict:
     return {
         "schema_version": 1,
         "backend": "PaddleOCR PP-OCRv6 medium (crops)",
-        "device": "cpu",
+        "device": _resolve_device("auto"),
         "source": source,
         "crops": crops,
     }
 
 
-def run_crops(manifest_path: str, output_path: str, device: str = "cpu") -> dict:
+def run_crops(manifest_path: str, output_path: str, device: str = "auto") -> dict:
     """OCR each requested crop box with preprocessing variants.
 
     The input manifest is JSON:
@@ -206,14 +225,14 @@ def run_crops(manifest_path: str, output_path: str, device: str = "cpu") -> dict
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     engine = _build_engine(device)
     output = _predict_crops(engine, manifest)
-    output["device"] = device
+    output["device"] = _resolve_device(device)
     target = Path(output_path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
     return output
 
 
-def serve(device: str = "cpu") -> int:
+def serve(device: str = "auto") -> int:
     """Persistent worker: read JSON requests from stdin, write results to stdout.
 
     Each line is one request::
@@ -259,7 +278,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Isolated PaddleOCR worker")
     parser.add_argument("input", nargs="?")
     parser.add_argument("output", nargs="?")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto",
+                        help="auto（有 GPU 就用）/ cpu / gpu")
     parser.add_argument("--pages")
     parser.add_argument(
         "--crops",

@@ -114,7 +114,8 @@ def stage1_capture(
     display_scale: int, row_gap_px: int | None, bottom_shift_up: int,
     layout_region: str = "", box_delta: int = 8, box_tolerance: float = 5.0,
     box_area_ratio: float = 0.20, overwrite: bool = False,
-    ocr_engine: str = "auto", row_spacing_px: int | None = None,
+    ocr_engine: str = "auto", paddle_device: str = "auto",
+    row_spacing_px: int | None = None,
     right_gap_px: int = 0, scan_wait: float = 0.5,
     scan_settle: float = 1.3, select_wait: float = 0.45,
     regrab_wait: float = 0.6, focus_clear_pct: float = 4.0,
@@ -156,6 +157,8 @@ def stage1_capture(
     ]
     if ocr_engine != "auto":
         cmd += ["--ocr-engine", ocr_engine]
+    if paddle_device != "auto":
+        cmd += ["--paddle-device", paddle_device]
     if not overwrite:
         # Skip pages that were already captured (unless overwriting).
         cmd += ["--resume"]
@@ -1830,6 +1833,13 @@ def main(argv=None) -> int:
              "edge in --display-scale layout (default 0)",
     )
     parser.add_argument(
+        "--paddle-device",
+        default="auto",
+        choices=["auto", "cpu", "gpu"],
+        help="PaddleOCR 设备（采集期 paddle 引擎）：auto 默认，有 CUDA 版 "
+             "paddle 且检测到 GPU 就用 GPU，否则 CPU；GPU 实测快约 7.6 倍",
+    )
+    parser.add_argument(
         "--layout-row-spacing",
         type=int,
         default=200,
@@ -2091,6 +2101,7 @@ def main(argv=None) -> int:
                             box_area_ratio=args.box_area_ratio,
                             overwrite=args.overwrite,
                             ocr_engine=args.ocr_engine,
+                            paddle_device=args.paddle_device,
                             row_spacing_px=args.layout_row_spacing,
                             right_gap_px=args.layout_right_gap,
                             scan_wait=args.scan_wait,

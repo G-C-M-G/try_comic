@@ -805,6 +805,14 @@ class MainWindow(QMainWindow):
         self.stage2_engine_combo = QComboBox()
         self.stage2_engine_combo.addItem("manga-ocr（本地，默认）", "manga-ocr")
         self.stage2_engine_combo.addItem("AI 视觉 OCR", "ai-ocr")
+        self.paddle_device_combo = QComboBox()
+        self.paddle_device_combo.addItem("自动（有 GPU 就用，默认）", "auto")
+        self.paddle_device_combo.addItem("GPU", "gpu")
+        self.paddle_device_combo.addItem("CPU", "cpu")
+        self.paddle_device_combo.setToolTip(
+            "PaddleOCR（采集期）运行设备。GPU 实测比 CPU 快约 7.6 倍；\n"
+            "注意与本地 Sakura 抢占显存（8GB 卡同时跑可能 OOM，此时选 CPU）。"
+        )
 
         self.region_edit = QLineEdit()
         self.region_edit.setPlaceholderText("2400x1400")
@@ -902,6 +910,7 @@ class MainWindow(QMainWindow):
         _row("AI OCR Key", self.ai_ocr_key_edit)
         _row("OCR 引擎（采集）", self.ocr_engine_combo)
         _row("读字引擎（嵌字前）", self.stage2_engine_combo)
+        _row("OCR 设备（采集，Paddle）", self.paddle_device_combo)
         cap_title = QLabel("采集", objectName="cardTitle")
         lay.addWidget(cap_title)
         region_row = _row("采集区域（宽×高，屏 2560×1600 留边界用 2400×1400）", self.region_edit)
@@ -966,6 +975,9 @@ class MainWindow(QMainWindow):
         stage2_engine = data.get("stage2_engine")
         index = self.stage2_engine_combo.findData(stage2_engine) if stage2_engine else -1
         self.stage2_engine_combo.setCurrentIndex(index if index >= 0 else 0)
+        device = data.get("paddle_device")
+        index = self.paddle_device_combo.findData(device) if device else -1
+        self.paddle_device_combo.setCurrentIndex(index if index >= 0 else 0)
         self.min_font_spin.setValue(self._int_setting(data, "min_font_size", 28))
         font = data.get("font_name", "msyh.ttc")
         index = self.font_combo.findData(font)
@@ -1070,6 +1082,7 @@ class MainWindow(QMainWindow):
             "ai_ocr_model": self.ai_ocr_model_edit.text().strip(),
             "ai_ocr_api_key": self.ai_ocr_key_edit.text().strip(),
             "ocr_engine": self.ocr_engine_combo.currentData(),
+            "paddle_device": self.paddle_device_combo.currentData(),
             "stage2_engine": self.stage2_engine_combo.currentData(),
             "layout_region": self.region_edit.text().strip() or "2400x1400",
             "min_font_size": self.min_font_spin.value(),
@@ -1525,6 +1538,9 @@ class MainWindow(QMainWindow):
         engine = self.ocr_engine_combo.currentData()
         if engine and engine != "auto":
             args += ["--ocr-engine", engine]
+        device = self.paddle_device_combo.currentData()
+        if device and device != "auto":
+            args += ["--paddle-device", device]
         stage2_engine = self.stage2_engine_combo.currentData()
         if stage2_engine and stage2_engine != "manga-ocr":
             args += ["--stage2-engine", stage2_engine]

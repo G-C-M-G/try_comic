@@ -266,7 +266,9 @@ class MaskedOcrEngineTests(unittest.TestCase):
             result, engine = _run_masked_ocr("masked.png", "auto")
         self.assertEqual(engine, "paddle")
         self.assertIs(result, predictions)
-        paddle.assert_called_once_with("masked.png", "cpu")
+        # 设备默认 auto（worker 侧解析：有 CUDA 版 paddle 且检测到 GPU 用
+        # GPU，否则 CPU）；调用方不传时按默认值透传
+        paddle.assert_called_once_with("masked.png", "auto")
 
     def test_forced_windows_ocr_uses_windows_only(self):
         from photos_capture import _run_masked_ocr
