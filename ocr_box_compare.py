@@ -369,15 +369,22 @@ _GROUP_COLORS = [
 
 
 def compose_groups(original_path: Path, blocks: list[dict], out_path: Path,
-                   panel_width: int, pad: int = 6) -> tuple[int, int]:
+                   panel_width: int, pad: int = 6,
+                   min_island_area: float = 800.0) -> tuple[int, int, int]:
     """原图 | 原图 + 编组（细框=原子框，粗彩框=组外接框）对比。
 
     画的是 ``_group_boxes_by_overlap``（20% 间距 / 40% 重叠、±pad、横竖不互并）
-    的**实际产出的组**，即下游嵌字的单位。返回 ``(框数, 组数)``。
+    的**实际产出的组**。**并且区分"能成岛的组"与"被微小岛过滤掉的组"**：
+    后者画成灰色虚线并标注 —— 编组图只画"组"是不够的，``build_bluebox_dataset``
+    还会按"组 bbox ±2px 后的面积 < min_island_area"把组丢掉，那种组下游不
+    OCR/不翻译/不嵌字；把它画成正常彩色框会让人以为它会被处理。
+
+    返回 ``(框数, 组数, 被微小岛过滤的组数)``。
     """
     from one_click_translate import _group_boxes_by_overlap
 
     original = Image.open(original_path).convert("RGB")
+    image_w, image_h = original.size
     usable = [
         {"id": item["id"], "image_bbox": list(item["image_bbox"]),
          "page_scale": False}
@@ -385,14 +392,33 @@ def compose_groups(original_path: Path, blocks: list[dict], out_path: Path,
     ]
     grouped = _group_boxes_by_overlap(usable, pad=pad)
 
+    dropped_tiny = 0
     annotated = original.copy()
     draw = ImageDraw.Draw(annotated)
+    label_font = ImageFont.truetype(FONT_PATH, 22)
+
+    def _label(x: int, y: int, text: str, color) -> None:
+        """带深色底衬的标签——纯彩字在浅色页面上几乎看不见。"""
+        box = draw.textbbox((0, 0), text, font=label_font)
+        w, h = box[2] - box[0], box[3] - box[1]
+        top = max(0, y)
+        draw.rectangle([x, top, x + w + 8, top + h + 6], fill=(20, 20, 20))
+        draw.text((x + 4, top + 2), text, font=label_font, fill=color)
+
     for index, (bbox, members) in enumerate(grouped):
-        color = _GROUP_COLORS[index % len(_GROUP_COLORS)]
         x1, y1, x2, y2 = (int(v) for v in bbox)
+        padded_x1, padded_y1 = max(0, x1 - 2), max(0, y1 - 2)
+        padded_x2, padded_y2 = min(image_w, x2 + 2), min(image_h, y2 + 2)
+        padded_area = max(0, padded_x2 - padded_x1) * max(0, padded_y2 - padded_y1)
+        if padded_area < min_island_area:
+            dropped_tiny += 1
+            draw.rectangle([x1, y1, x2, y2], outline=(150, 150, 150), width=4)
+            _label(x1, y1 - 28, f"{index + 1} 微小 {padded_area:.0f}px² 已剔除",
+                   (255, 190, 90))
+            continue
+        color = _GROUP_COLORS[index % len(_GROUP_COLORS)]
         draw.rectangle([x1, y1, x2, y2], outline=color, width=6)
-        draw.text((x1 + 4, max(0, y1 - 24)),
-                  f"{index + 1}（{len(members)}框）", fill=color)
+        _label(x1, y1 - 28, f"{index + 1}（{len(members)}框）", color)
     for item in usable:
         x1, y1, x2, y2 = item["image_bbox"]
         draw.rectangle(
@@ -405,7 +431,8 @@ def compose_groups(original_path: Path, blocks: list[dict], out_path: Path,
     panels = [
         ("原图（未编组）", original),
         (f"编组结果：{len(usable)} 框 → {len(grouped)} 组"
-         f"（彩色粗框=组外接框，白细框=原子框扩 {pad}px）", annotated),
+         f"（成岛 {len(grouped) - dropped_tiny}，微小剔除 {dropped_tiny}）"
+         f"；白细框=原子框扩 {pad}px", annotated),
     ]
     columns = []
     for caption, image in panels:
@@ -427,7 +454,7 @@ def compose_groups(original_path: Path, blocks: list[dict], out_path: Path,
         board.paste(column, (x, 0))
         x += panel_width + 6
     _save_with_retry(board, out_path)
-    return len(usable), len(grouped)
+    return len(usable), len(grouped), dropped_tiny
 
 
 def _save_with_retry(image, out_path: Path, attempts: int = 5) -> None:
@@ -541,7 +568,7 @@ def main(argv=None) -> int:
     # 与 stage1 的 --box-source paddle 保持一致：默认应用大拟音/效果字过滤，
     # 使对比图与填黑图反映**管线实际使用的框**（否则看到的红框比真实多）。
     filtered_pages: list[tuple[str, int, int]] = []
-    grouped_stats: list[tuple[str, int, int]] = []
+    grouped_stats: list[tuple[str, int, int, int]] = []
     if not args.keep_large_boxes:
         from one_click_translate import _filter_large_sfx
 
@@ -641,11 +668,11 @@ def main(argv=None) -> int:
                     )
                 ]
             if group_blocks:
-                n_boxes, n_groups = compose_groups(
+                n_boxes, n_groups, n_tiny = compose_groups(
                     book / "dataset" / page / "original.jpg", group_blocks,
                     groups_dir / f"{page}_编组对比.png", args.width, args.pad,
                 )
-                grouped_stats.append((page, n_boxes, n_groups))
+                grouped_stats.append((page, n_boxes, n_groups, n_tiny))
         if args.masked:
             masked_dir = out_dir / "填黑对比"
             masked_dir.mkdir(parents=True, exist_ok=True)
@@ -721,12 +748,15 @@ def main(argv=None) -> int:
                   f"→ 该页蓝框切分比引擎更细，精确率不可直接采信")
     if grouped_stats:
         print("\n=== 编组（20% 间距 / 40% 重叠，横竖不互并）===")
-        for page, n_boxes, n_groups in grouped_stats:
-            print(f"  page {page}: {n_boxes} 框 -> {n_groups} 组")
+        for page, n_boxes, n_groups, n_tiny in grouped_stats:
+            extra = f"（其中 {n_tiny} 组因面积 <800px² 被剔除）" if n_tiny else ""
+            print(f"  page {page}: {n_boxes} 框 -> {n_groups} 组{extra}")
         total_boxes = sum(item[1] for item in grouped_stats)
         total_groups = sum(item[2] for item in grouped_stats)
+        total_tiny = sum(item[3] for item in grouped_stats)
         print(f"  合计: {total_boxes} 框 -> {total_groups} 组"
-              f"（平均 {total_boxes / max(1, total_groups):.2f} 框/组）")
+              f"（平均 {total_boxes / max(1, total_groups):.2f} 框/组）"
+              f"，微小剔除 {total_tiny} 组")
     if filtered_pages:
         print("\n=== 大拟音/效果字过滤（与 stage1 同规则）===")
         for page, dropped, total in filtered_pages:
