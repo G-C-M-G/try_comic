@@ -694,7 +694,7 @@ class MainWindow(QMainWindow):
         )
 
     def _build_preview_tab(self) -> QFrame:
-        card, lay = self._card("预览（原图 / 带蓝框 check 图）")
+        card, lay = self._card("预览（原图 / 检出框 check 图 / 译文）")
         tool = QHBoxLayout()
         self.prev_page_btn = QPushButton("上一页")
         self.next_page_btn = QPushButton("下一页")
@@ -703,7 +703,7 @@ class MainWindow(QMainWindow):
         self.page_total_label = label(" / —")
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("原图", "original")
-        self.mode_combo.addItem("带蓝框", "check")
+        self.mode_combo.addItem("检出框（Paddle 红 / Photos 蓝）", "check")
         self.mode_combo.addItem("译文（typeset 结果）", "typeset")
         self.fit_btn = QPushButton("适应窗口")
         for w in (self.prev_page_btn, self.next_page_btn):
