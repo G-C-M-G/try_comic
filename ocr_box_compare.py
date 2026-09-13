@@ -390,7 +390,8 @@ def main(argv=None) -> int:
     parser.add_argument("--width", type=int, default=900, help="对比图面板宽度")
     parser.add_argument(
         "--masked", action="store_true",
-        help="额外产出「原图+扩框 | 扩框填黑图」对比图，供人工判断覆盖与扩边",
+        help="额外产出「原图+扩框 | 扩框填黑图」对比图，供人工判断覆盖与扩边"
+             "（单独存到 {输出目录}/填黑对比/）",
     )
     parser.add_argument(
         "--masked-boxes", default="paddle", choices=["paddle", "blue"],
@@ -516,6 +517,8 @@ def main(argv=None) -> int:
                 out_dir / f"{page}_对比.png", args.width, ctd_items=ctd_items,
                 device_label=device_label)
         if args.masked:
+            masked_dir = out_dir / "填黑对比"
+            masked_dir.mkdir(parents=True, exist_ok=True)
             if args.masked_boxes == "blue":
                 masked_boxes = [
                     {"id": f"b{index}", "image_bbox": list(bb)}
@@ -532,7 +535,7 @@ def main(argv=None) -> int:
             if masked_boxes:
                 compose_masked(
                     book / "dataset" / page / "original.jpg", masked_boxes,
-                    out_dir / f"{page}_填黑对比.png", args.width, args.pad,
+                    masked_dir / f"{page}_填黑对比.png", args.width, args.pad,
                     label=("Photos 蓝框" if args.masked_boxes == "blue" else "PaddleOCR"),
                 )
         print(f"compose {i}/{len(pages)} page {page}", flush=True)
