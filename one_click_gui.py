@@ -932,6 +932,23 @@ class MainWindow(QMainWindow):
             "实测 1 路 1.91s/框 → 8 路 0.20s/框（9×）→ 16 路 0.10s/框（19×），"
             "24 路反而退化。\n机器或账号更给力可以调高，撞服务端限流（429）就调小。"
         )
+        self.sfx_ratio_spin = QDoubleSpinBox()
+        self.sfx_ratio_spin.setRange(1.0, 5.0)
+        self.sfx_ratio_spin.setSingleStep(0.1)
+        self.sfx_ratio_spin.setValue(2.0)
+        self.sfx_ratio_spin.setToolTip(
+            "过大单框判定倍数（默认 2.0）：未合并的单框，短边 > N×同方向平均 →\n"
+            "按拟声词把字号封到「拟声词字号上限」。这个倍数同时用于采集期剔除\n"
+            "超大拟音框（--sfx-min-side-ratio）。"
+        )
+        self.short_source_spin = QSpinBox()
+        self.short_source_spin.setRange(0, 20)
+        self.short_source_spin.setValue(0)
+        self.short_source_spin.setToolTip(
+            "短原文封顶门槛（默认 0 = 关闭）：原文（日文）≤ N 字时字号也封顶。\n"
+            "注意实测：开启 6 会让 127 个岛面积比掉到 0.02~0.06（短原文的框本来\n"
+            "就大，字号跟框走才对），所以默认关闭。"
+        )
         self.sfx_glossary_spin = QSpinBox()
         self.sfx_glossary_spin.setRange(0, 20)
         self.sfx_glossary_spin.setValue(2)
@@ -1052,7 +1069,9 @@ class MainWindow(QMainWindow):
         _row("字号下限（px）", self.min_font_spin)
         _row("拟声词字号上限（px）", self.sfx_font_spin)
         _row("拟声词进术语库门槛（次）", self.sfx_glossary_spin)
-        _row("AI OCR 并发（默认 8）", self.ai_ocr_workers_spin)
+        _row("过大单框判定倍数（默认 2.0）", self.sfx_ratio_spin)
+        _row("短原文封顶门槛（0=关）", self.short_source_spin)
+        _row("AI OCR 并发（默认 12）", self.ai_ocr_workers_spin)
         _row("字体", self.font_combo)
         _row("描边粗细（字号÷N，大=细，默认 10）", self.stroke_spin)
         _row("行间距（横排，字号÷N，默认 4）", self.row_gap_spin)
@@ -1120,6 +1139,15 @@ class MainWindow(QMainWindow):
         )
         self.ai_ocr_workers_spin.setValue(
             self._int_setting(data, "ai_ocr_workers", 12)
+        )
+        try:
+            self.sfx_ratio_spin.setValue(
+                float(data.get("sfx_min_side_ratio", 2.0))
+            )
+        except (TypeError, ValueError):
+            self.sfx_ratio_spin.setValue(2.0)
+        self.short_source_spin.setValue(
+            self._int_setting(data, "short_source_max_chars", 0)
         )
         font = data.get("font_name", "msyh.ttc")
         index = self.font_combo.findData(font)
@@ -1233,6 +1261,8 @@ class MainWindow(QMainWindow):
             "sfx_max_font_size": self.sfx_font_spin.value(),
             "sfx_glossary_min_count": self.sfx_glossary_spin.value(),
             "ai_ocr_workers": self.ai_ocr_workers_spin.value(),
+            "sfx_min_side_ratio": self.sfx_ratio_spin.value(),
+            "short_source_max_chars": self.short_source_spin.value(),
             "font_name": self.font_combo.currentData() or "msyh.ttc",
             "stroke_divisor": self.stroke_spin.value(),
             "row_gap_divisor": self.row_gap_spin.value(),
@@ -1782,6 +1812,8 @@ class MainWindow(QMainWindow):
         args += ["--box-area-ratio", str(self.box_area_spin.value() / 100.0)]
         args += ["--min-font-size", str(self.min_font_spin.value())]
         args += ["--sfx-max-font-size", str(self.sfx_font_spin.value())]
+        args += ["--sfx-min-side-ratio", f"{self.sfx_ratio_spin.value():.2f}"]
+        args += ["--short-source-max-chars", str(self.short_source_spin.value())]
         args += [
             "--sfx-glossary-min-count", str(self.sfx_glossary_spin.value()),
         ]
