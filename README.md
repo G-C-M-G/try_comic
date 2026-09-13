@@ -84,6 +84,7 @@ venv/ + paddle_venv/  两套 Python 环境
 - `docs/BLUEBOX_CAPTURE.md` 蓝框检测原理
 - `docs/SENTENCE_GROUPING_DESIGN.md` 分句/分组设计
 - `docs/LESSONS.md` 经验教训
+- `开发记录` 开发日志（演进史、不变量、债务、选型结论——新人从这里读完再动手）
 
 ## 备份与清理
 
