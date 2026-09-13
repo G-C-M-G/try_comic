@@ -339,3 +339,131 @@ class GroupYieldTest(unittest.TestCase):
         self.assertTrue(islands)
         # 同一组内的相邻列应被合并，因此这里不触发让位；键存在与否都合法
         self.assertIsInstance(islands[0].get("typeset_shift", [0, 0]), list)
+
+
+class Stage2DatasetFilterPlumbingTest(unittest.TestCase):
+    """_stage2_dataset 必须能吃下大拟音过滤参数并传给 build_bluebox_dataset。
+
+    这是被真实事故逼出来的用例：参数只加到了 stage2_process 的签名，而真正
+    调 build_bluebox_dataset 的是 _stage2_dataset，于是运行时报 NameError
+    （单元测试当时没走到这条路径，全绿）。此处用最小 capture 目录把它钉住。
+    """
+
+    def test_dataset_build_receives_filter_options(self):
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+
+        from one_click_translate import _stage2_dataset
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        images = root / "images"
+        images.mkdir()
+        page = images / "1.jpg"
+        # 1 个纵向长条 + 3 个正常小框：长条会被大拟音规则剔除
+        Image.new("RGB", (400, 600), "white").save(page)
+        capture = root / "out" / "capture" / "1"
+        capture.mkdir(parents=True)
+        (capture / "capture.json").write_text(
+            json.dumps({
+                "source": {"path": str(page), "width": 400, "height": 600},
+                "capture": {
+                    "box_source": "paddle",
+                    "complete": True,
+                    "selection_blocks": [
+                        {"id": "sel_001", "image_bbox": [10, 10, 110, 300],
+                         "page_scale": False},
+                        {"id": "sel_002", "image_bbox": [100, 10, 140, 120],
+                         "page_scale": False},
+                        {"id": "sel_003", "image_bbox": [160, 10, 200, 120],
+                         "page_scale": False},
+                        {"id": "sel_004", "image_bbox": [220, 10, 260, 120],
+                         "page_scale": False},
+                    ],
+                },
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        class _Progress:
+            def log(self, *_args, **_kwargs):
+                pass
+
+            def progress(self, *_args, **_kwargs):
+                pass
+
+            def set_stage(self, *_args, **_kwargs):
+                pass
+
+        pages = _stage2_dataset(
+            images, root / "out", ["1"], _Progress(), overwrite=False,
+            drop_large_boxes=True, sfx_min_side_ratio=2.0, sfx_min_side_page=0.10,
+        )
+        self.assertEqual(pages, ["1"])
+        written = json.loads(
+            (root / "out" / "dataset" / "1" / "selection_blocks.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(len(written["selection_blocks"]), 3)
+        self.assertNotIn("sel_001", {b["id"] for b in written["selection_blocks"]})
+
+    def test_filter_can_be_disabled(self):
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+
+        from one_click_translate import _stage2_dataset
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        images = root / "images"
+        images.mkdir()
+        page = images / "1.jpg"
+        Image.new("RGB", (400, 600), "white").save(page)
+        capture = root / "out" / "capture" / "1"
+        capture.mkdir(parents=True)
+        (capture / "capture.json").write_text(
+            json.dumps({
+                "source": {"path": str(page), "width": 400, "height": 600},
+                "capture": {
+                    "box_source": "photos",
+                    "complete": True,
+                    "selection_blocks": [
+                        {"id": "sel_001", "image_bbox": [10, 10, 110, 300],
+                         "page_scale": False},
+                        {"id": "sel_002", "image_bbox": [100, 10, 140, 120],
+                         "page_scale": False},
+                        {"id": "sel_003", "image_bbox": [160, 10, 200, 120],
+                         "page_scale": False},
+                        {"id": "sel_004", "image_bbox": [220, 10, 260, 120],
+                         "page_scale": False},
+                    ],
+                },
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        class _Progress:
+            def log(self, *_args, **_kwargs):
+                pass
+
+            def progress(self, *_args, **_kwargs):
+                pass
+
+            def set_stage(self, *_args, **_kwargs):
+                pass
+
+        pages = _stage2_dataset(
+            images, root / "out", ["1"], _Progress(), overwrite=False,
+            drop_large_boxes=False,
+        )
+        self.assertEqual(pages, ["1"])
+        written = json.loads(
+            (root / "out" / "dataset" / "1" / "selection_blocks.json").read_text(encoding="utf-8")
+        )
+        # 关掉过滤：Photos 路径也不剔除，4 个框全在
+        self.assertEqual(len(written["selection_blocks"]), 4)

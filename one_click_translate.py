@@ -1334,8 +1334,12 @@ def stage2_process(
 
         progress = ProgressFile(out_root)
 
-    active_pages = _stage2_dataset(images, out_root, pages, progress,
-                                   overwrite=overwrite)
+    active_pages = _stage2_dataset(
+        images, out_root, pages, progress, overwrite=overwrite,
+        drop_large_boxes=drop_large_boxes,
+        sfx_min_side_ratio=sfx_min_side_ratio,
+        sfx_min_side_page=sfx_min_side_page,
+    )
     page_texts, page_directions, dropped_boxes = _stage2_ocr(
         out_root, active_pages, progress=progress, overwrite=overwrite,
         ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
@@ -1360,7 +1364,10 @@ def stage2_process(
 
 def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
                     progress: "ProgressFile", *,
-                    overwrite: bool = False) -> list[str]:
+                    overwrite: bool = False,
+                    drop_large_boxes: bool = True,
+                    sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
+                    sfx_min_side_page: float = SFX_MIN_SIDE_PAGE) -> list[str]:
     """Build islands from capture (one island per blue-box selection
     group).  Returns the pages that ended up with a dataset (active)."""
     from island_extract import build_fallback_dataset
@@ -1815,8 +1822,12 @@ def _run_stage2_single(stage: str, images: Path, out_root: Path,
     progress = ProgressFile(out_root)
     dataset_dir = out_root / "dataset"
     if stage == "ocr":
-        active_pages = _stage2_dataset(images, out_root, pages, progress,
-                                       overwrite=overwrite)
+        active_pages = _stage2_dataset(
+            images, out_root, pages, progress, overwrite=overwrite,
+            drop_large_boxes=kwargs.get("drop_large_boxes", True),
+            sfx_min_side_ratio=kwargs.get("sfx_min_side_ratio", SFX_MIN_SIDE_RATIO),
+            sfx_min_side_page=kwargs.get("sfx_min_side_page", SFX_MIN_SIDE_PAGE),
+        )
         if not active_pages:
             print("no pages with a dataset to OCR (capture first)")
             progress.done(ok=True)
