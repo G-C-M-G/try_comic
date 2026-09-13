@@ -1,0 +1,18 @@
+# Root-venv OCR stack beyond requirements.txt: manga-ocr engine (stage2 读字)
+# and Windows.Media.Ocr projections (windows_ocr.py 采集期引擎).
+#
+# torch 装的是 CUDA 12.6 构建，PyPI 默认源没有，先单独装：
+#   pip install torch==2.13.0+cu126 torchvision==0.28.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+# （仅 CPU 跑 manga-ocr 也可直接 pip install torch，速度换省事）
+# 然后再装本文件：
+#   pip install -r requirements-manga-ocr.txt
+manga-ocr==0.1.16
+transformers==5.14.1
+winrt-runtime==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+winrt-Windows.Globalization==3.2.1
+winrt-Windows.Graphics.Imaging==3.2.1
+winrt-Windows.Media.Ocr==3.2.1
+winrt-Windows.Storage==3.2.1
+winrt-Windows.Storage.Streams==3.2.1

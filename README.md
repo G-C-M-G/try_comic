@@ -101,6 +101,7 @@ venv\Scripts\python.exe -m PyInstaller "漫画翻译软件.spec" --noconfirm
 ```
 
 ## 环境
-- `venv/`：应用 + Windows OCR + manga-ocr（root venv，PySide6/PIL/numpy/jsonschema/winrt/manga_ocr/opencv-contrib）
-- `paddle_venv/`：PaddleOCR（paddleocr 3.7 + paddle 3.3，模型在 `models/paddle`）
+- `venv/`：应用 + Windows OCR + manga-ocr（root venv，PySide6/PIL/numpy/jsonschema/winrt/manga_ocr/opencv-contrib）；
+  完整依赖 = `requirements.txt` + `requirements-manga-ocr.txt`（manga-ocr/winrt，torch 装法见文件头注释）
+- `paddle_venv/`：PaddleOCR（paddleocr 3.7 + paddle 3.3，模型在 `models/paddle`，清单 `requirements-paddle-ocr.txt`）
 - `sakura/`：翻译模型（本地接口 http://127.0.0.1:8080/v1）
