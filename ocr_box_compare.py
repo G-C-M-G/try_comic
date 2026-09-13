@@ -1,14 +1,16 @@
-"""OCR 引擎横向对比：PaddleOCR / Tesseract 全页自动检测 vs Photos 蓝框。
+"""OCR 引擎横向对比：PaddleOCR / Tesseract / comic-text-detector 全页自动检测 vs Photos 蓝框。
 
 用法（root venv）：
     venv/Scripts/python.exe ocr_box_compare.py --pages 1          # 单页试跑
     venv/Scripts/python.exe ocr_box_compare.py                    # 全部有产物的页
 
-对每一页生成三联对比图（蓝框 check / PaddleOCR 框 / Tesseract 框），
-默认输出到 {书目录}/ocr_compare/（横排三联）。
+对每一页生成对比图（蓝框 check / PaddleOCR / Tesseract / CTD 四联，
+缺哪个引擎的模型/结果就少一联），默认输出到 {书目录}/ocr_compare/（横排）。
 PaddleOCR 部分经 subprocess 用 paddle_venv 跑（与 paddle_ocr_worker 同
 配置，CPU）；Tesseract 部分直接调 D:/tools 的 CLI
-（jpn + jpn_vert, psm 11, conf≥30）。两引擎结果均缓存，可增量重跑。
+（jpn + jpn_vert, psm 11, conf≥30）；comic-text-detector 走本地 ONNX
+（models/comic-text-detector-onnx，seg 掩膜连通域提框）。
+各引擎结果均落盘 var/ocr_compare/ 缓存，可增量重跑。
 """
 
 from __future__ import annotations
@@ -99,6 +101,75 @@ prev.update(out)
 with open(sys.argv[2], "w", encoding="utf-8") as f:
     json.dump({"error": err, "results": prev}, f, ensure_ascii=False)
 """
+
+
+_CTD = {"session": None, "mode": None}
+
+
+def _ctd_session():
+    if _CTD["session"] is None:
+        import onnxruntime as ort
+
+        model = ROOT / "models" / "comic-text-detector-onnx" / "comic-text-detector.onnx"
+        if not model.is_file():
+            raise FileNotFoundError(f"CTD 模型不存在: {model}")
+        _CTD["session"] = ort.InferenceSession(str(model), providers=["CPUExecutionProvider"])
+    return _CTD["session"]
+
+
+def _ctd_seg(image: Image.Image, mode: str):
+    import numpy as np
+
+    x = np.asarray(image, np.float32) / 255.0
+    if mode == "imagenet":
+        x = (x - np.array([0.485, 0.456, 0.406], np.float32)) / np.array(
+            [0.229, 0.224, 0.225], np.float32)
+    pixel = x.transpose(2, 0, 1)[None]
+    return _ctd_session().run(["seg"], {"images": pixel})[0][0, 0]
+
+
+def _ctd_pick_mode(image_path: Path) -> str:
+    """官方没给推理代码，预处理模式用首页实测标定：取文字占比在合理区间的那个。"""
+    if _CTD["mode"] is None:
+        image = Image.open(image_path).convert("RGB").resize((1024, 1024), Image.BICUBIC)
+        fractions = {}
+        for mode in ("imagenet", "unit"):
+            seg = _ctd_seg(image, mode)
+            fractions[mode] = float((seg > 0.4).mean())
+            print(f"ctd calib {mode}: fg={fractions[mode]:.3f} "
+                  f"seg range [{seg.min():.3f},{seg.max():.3f}]", flush=True)
+        # 漫画页文字占比通常在百分之几；网点/画面误入会显著抬高前景占比
+        _CTD["mode"] = min(fractions, key=lambda m: abs(fractions[m] - 0.05))
+        print(f"ctd calib -> mode={_CTD['mode']}", flush=True)
+    return _CTD["mode"]
+
+
+def ctd_boxes(image_path: Path, threshold: float = 0.4) -> list[dict]:
+    """comic-text-detector 的 seg 掩膜 → 膨胀融合 → 连通域 → 原图坐标框。"""
+    import cv2
+    import numpy as np
+
+    mode = _ctd_pick_mode(image_path)
+    image = Image.open(image_path).convert("RGB").resize((1024, 1024), Image.BICUBIC)
+    seg = _ctd_seg(image, mode)
+    mask = ((seg > threshold).astype(np.uint8)) * 255
+    mask = cv2.dilate(mask, np.ones((9, 9), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    width, height = Image.open(image_path).size
+    sx, sy = width / 1024.0, height / 1024.0
+    boxes = []
+    for i in range(1, count):
+        px, py, pw, ph, area = (int(v) for v in stats[i])
+        if area < 80 or pw < 8 or ph < 8:
+            continue
+        boxes.append({
+            "poly": [[int(px * sx), int(py * sy)],
+                     [int((px + pw) * sx), int(py * sy)],
+                     [int((px + pw) * sx), int((py + ph) * sy)],
+                     [int(px * sx), int((py + ph) * sy)]],
+            "score": 1.0, "text": "",
+        })
+    return boxes
 
 
 def _paddle_items_broken(items) -> bool:
@@ -203,14 +274,19 @@ def annotate(original: Image.Image, boxes: list[dict], color) -> Image.Image:
 
 def compose(page: str, check_path: Path, original_path: Path,
             paddle_items: list, tess_items: list, out_path: Path,
-            panel_width: int) -> None:
+            panel_width: int, ctd_items: list | None = None) -> None:
     panels = [
         ("Photos 蓝框（人工框选，现流程基准）", Image.open(check_path).convert("RGB"), None),
-        ("PaddleOCR 3.7 全页自动检测（lang=japan, CPU）",
+        ("PaddleOCR 3.7 全页自动检测（PP-OCRv6, CPU）",
          Image.open(original_path).convert("RGB"), (paddle_items, (255, 40, 40))),
         ("Tesseract 5 全页自动检测（jpn + jpn_vert, psm 11, conf≥30）",
          Image.open(original_path).convert("RGB"), (tess_items, (0, 150, 255))),
     ]
+    if ctd_items is not None:
+        panels.append(
+            ("comic-text-detector 全页自动检测（seg→连通域, ONNX）",
+             Image.open(original_path).convert("RGB"), (ctd_items, (0, 175, 0))),
+        )
     font = ImageFont.truetype(FONT_PATH, 26)
     label_h = 38
     gap = 6
@@ -292,31 +368,74 @@ def main(argv=None) -> int:
             print(f"tesseract {i}/{len(pages)} page {page}: "
                   f"{len(tess_all[page])} boxes", flush=True)
 
-    stats = {"page": [], "blue": [], "paddle": [], "tess": []}
+    ctd_all: dict = {}
+    if (ROOT / "models" / "comic-text-detector-onnx" / "comic-text-detector.onnx").is_file():
+        ctd_cache = cache_dir / "ctd_boxes.json"
+        ctd_all = json.loads(ctd_cache.read_text(encoding="utf-8")) if ctd_cache.is_file() else {}
+        for i, page in enumerate(pages, 1):
+            if page in ctd_all:
+                continue
+            ctd_all[page] = ctd_boxes(book / "dataset" / page / "original.jpg")
+            ctd_cache.write_text(json.dumps(ctd_all, ensure_ascii=False),
+                                 encoding="utf-8")
+            print(f"ctd {i}/{len(pages)} page {page}: "
+                  f"{len(ctd_all[page])} boxes", flush=True)
+    else:
+        print("ctd: 模型未下载（models/comic-text-detector-onnx），跳过该联")
+
+    def _bbox(poly):
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    def _uncovered(blue_bbox, items):
+        if not items:
+            return True
+        l, t, r, b = blue_bbox
+        area = max(1, (r - l) * (b - t))
+        best = 0.0
+        for item in items:
+            cl, ct, cr, cb = _bbox(item["poly"])
+            inter = max(0, min(cr, r) - max(cl, l)) * max(0, min(cb, b) - max(ct, t))
+            best = max(best, inter / area)
+        return best < 0.3
+
+    stats = {"page": [], "blue": [], "paddle": [], "tess": [], "ctd": [],
+             "miss_paddle": [], "miss_ctd": []}
     for i, page in enumerate(pages, 1):
         paddle_items = paddle_boxes.get(page, []) if isinstance(paddle_boxes, dict) else []
         tess_items = tess_all.get(page, [])
-        blue_count = 0
+        ctd_items = ctd_all.get(page)
+        blues = []
         blocks_json = book / "dataset" / page / "selection_blocks.json"
         if blocks_json.is_file():
             data = json.loads(blocks_json.read_text(encoding="utf-8"))
-            blocks = data.get("selection_blocks") or []
-            blue_count = sum(1 for b in blocks if not b.get("page_scale"))
+            blues = [b["image_bbox"] for b in (data.get("selection_blocks") or [])
+                     if not b.get("page_scale")]
         stats["page"].append(page)
-        stats["blue"].append(blue_count)
+        stats["blue"].append(len(blues))
         stats["paddle"].append(sum(1 for it in paddle_items if "error" not in it))
         stats["tess"].append(sum(1 for it in tess_items))
+        stats["ctd"].append(len(ctd_items or []))
+        stats["miss_paddle"].append(sum(1 for bb in blues
+                                        if _uncovered(bb, paddle_items)))
+        stats["miss_ctd"].append(sum(1 for bb in blues
+                                     if _uncovered(bb, ctd_items or [])))
         compose(page, book / "check" / f"{page}.bluebox_check.png",
                 book / "dataset" / page / "original.jpg",
                 paddle_items, tess_items,
-                out_dir / f"{page}_对比.png", args.width)
+                out_dir / f"{page}_对比.png", args.width, ctd_items=ctd_items)
         print(f"compose {i}/{len(pages)} page {page}", flush=True)
 
-    print("\n=== 每页框数（蓝框 / PaddleOCR / Tesseract）===")
-    for page, b, p, t in zip(stats["page"], stats["blue"], stats["paddle"], stats["tess"]):
-        print(f"  page {page:>4}: {b:>3} / {p:>3} / {t:>3}")
+    print("\n=== 每页框数（蓝框 / PaddleOCR / Tesseract / CTD | 蓝框漏检 P / C）===")
+    for page, b, p, t, c, mp, mc in zip(stats["page"], stats["blue"],
+                                        stats["paddle"], stats["tess"],
+                                        stats["ctd"], stats["miss_paddle"],
+                                        stats["miss_ctd"]):
+        print(f"  page {page:>4}: {b:>3} / {p:>3} / {t:>3} / {c:>3} | {mp} {mc}")
     print(f"total: blue={sum(stats['blue'])} paddle={sum(stats['paddle'])} "
-          f"tess={sum(stats['tess'])}")
+          f"tess={sum(stats['tess'])} ctd={sum(stats['ctd'])}")
+    print(f"blue 漏检: paddle={sum(stats['miss_paddle'])} ctd={sum(stats['miss_ctd'])}")
     if paddle_err:
         print(f"paddle engine error: {paddle_err}", file=sys.stderr)
     return 0
