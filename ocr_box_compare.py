@@ -1,16 +1,18 @@
-"""OCR 引擎横向对比：PaddleOCR / Tesseract / comic-text-detector 全页自动检测 vs Photos 蓝框。
+"""OCR 引擎横向对比：PaddleOCR / comic-text-detector 全页自动检测 vs Photos 蓝框。
 
 用法（root venv）：
     venv/Scripts/python.exe ocr_box_compare.py --pages 1          # 单页试跑
     venv/Scripts/python.exe ocr_box_compare.py                    # 全部有产物的页
 
-对每一页生成对比图（蓝框 check / PaddleOCR / Tesseract / CTD 四联，
-缺哪个引擎的模型/结果就少一联），默认输出到 {书目录}/ocr_compare/（横排）。
+对每一页生成对比图（蓝框 check / PaddleOCR / CTD 三联，CTD 模型缺失时
+自动退为两联），默认输出到 {书目录}/ocr_compare/（横排）。
 PaddleOCR 部分经 subprocess 用 paddle_venv 跑（与 paddle_ocr_worker 同
-配置，CPU）；Tesseract 部分直接调 D:/tools 的 CLI
-（jpn + jpn_vert, psm 11, conf≥30）；comic-text-detector 走本地 ONNX
+配置，CPU）；comic-text-detector 走本地 ONNX
 （models/comic-text-detector-onnx，seg 掩膜连通域提框）。
 各引擎结果均落盘 var/ocr_compare/ 缓存，可增量重跑。
+
+Tesseract 曾在候选之列，实测过检 8.5 倍（4328 框，全是字符碎片）被淘汰，
+已从本工具移除（见 开发记录 选型一节）。
 """
 
 from __future__ import annotations
@@ -24,7 +26,6 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent
-TESSERACT = Path(r"D:\tools\Tesseract-OCR\tesseract.exe")
 PADDLE_PYTHON = ROOT / "paddle_venv" / "Scripts" / "python.exe"
 FONT_PATH = r"C:\Windows\Fonts\msyh.ttc"
 
@@ -221,42 +222,6 @@ def discover_pages(book: Path) -> list[str]:
     return sorted(with_original & with_check, key=lambda name: natural_keys(name))
 
 
-def tesseract_boxes(image: Path, psm: int = 11, min_conf: float = 30.0) -> list[dict]:
-    boxes: list[dict] = []
-    for lang in ("jpn", "jpn_vert"):
-        cmd = [str(TESSERACT), str(image), "stdout", "-l", lang, "--psm", str(psm), "tsv"]
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=180,
-            )
-        except subprocess.TimeoutExpired:
-            print(f"tesseract timeout: {image.name} {lang}", file=sys.stderr)
-            continue
-        if proc.returncode != 0:
-            print(f"tesseract rc={proc.returncode}: {image.name} {lang}: "
-                  f"{(proc.stderr or '').strip()[:200]}", file=sys.stderr)
-            continue
-        for line in (proc.stdout or "").splitlines()[1:]:
-            parts = line.split("\t")
-            if len(parts) < 12:
-                continue
-            try:
-                conf = float(parts[10])
-            except ValueError:
-                continue
-            text = parts[11].strip()
-            if conf < min_conf or not text:
-                continue
-            left, top, width, height = (int(parts[6]), int(parts[7]),
-                                        int(parts[8]), int(parts[9]))
-            if width <= 0 or height <= 0:
-                continue
-            boxes.append({"box": [left, top, width, height], "lang": lang,
-                          "text": text, "conf": conf})
-    return boxes
-
-
 def annotate(original: Image.Image, boxes: list[dict], color) -> Image.Image:
     canvas = original.copy()
     draw = ImageDraw.Draw(canvas)
@@ -273,14 +238,12 @@ def annotate(original: Image.Image, boxes: list[dict], color) -> Image.Image:
 
 
 def compose(page: str, check_path: Path, original_path: Path,
-            paddle_items: list, tess_items: list, out_path: Path,
+            paddle_items: list, out_path: Path,
             panel_width: int, ctd_items: list | None = None) -> None:
     panels = [
         ("Photos 蓝框（人工框选，现流程基准）", Image.open(check_path).convert("RGB"), None),
         ("PaddleOCR 3.7 全页自动检测（PP-OCRv6, CPU）",
          Image.open(original_path).convert("RGB"), (paddle_items, (255, 40, 40))),
-        ("Tesseract 5 全页自动检测（jpn + jpn_vert, psm 11, conf≥30）",
-         Image.open(original_path).convert("RGB"), (tess_items, (0, 150, 255))),
     ]
     if ctd_items is not None:
         panels.append(
@@ -324,7 +287,24 @@ def compose(page: str, check_path: Path, original_path: Path,
     for column in columns:
         board.paste(column, (x, 0))
         x += panel_width + gap
-    board.save(out_path, quality=88)
+    _save_with_retry(board, out_path)
+
+
+def _save_with_retry(image, out_path: Path, attempts: int = 5) -> None:
+    """原子写 + 重试：杀软扫描/预览句柄会造成 Windows 上的瞬时占用
+    （OSError 22/13），单次失败不代表目标不可写。"""
+    temporary = out_path.with_name(f".{out_path.name}.{__import__('os').getpid()}.tmp")
+    last_error: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            image.save(temporary, format="PNG")
+            temporary.replace(out_path)
+            return
+        except OSError as error:
+            last_error = error
+            __import__("time").sleep(0.3 * (attempt + 1))
+    temporary.unlink(missing_ok=True)
+    raise OSError(f"cannot save {out_path}: {last_error}")
 
 
 def main(argv=None) -> int:
@@ -334,7 +314,6 @@ def main(argv=None) -> int:
     parser.add_argument("--out", default=None,
                         help="输出目录（默认 {书目录}/ocr_compare）")
     parser.add_argument("--width", type=int, default=900, help="对比图面板宽度")
-    parser.add_argument("--skip-tesseract", action="store_true")
     args = parser.parse_args(argv)
 
     book = ROOT / "outputs" / "oneclick" / args.book
@@ -356,17 +335,6 @@ def main(argv=None) -> int:
     paddle_err = None
     if isinstance(paddle_boxes, dict) and paddle_boxes.get("error"):
         paddle_err = paddle_boxes["error"]
-    tess_cache = cache_dir / "tesseract_boxes.json"
-    tess_all = json.loads(tess_cache.read_text(encoding="utf-8")) if tess_cache.is_file() else {}
-    if not args.skip_tesseract:
-        for i, page in enumerate(pages, 1):
-            if page in tess_all:
-                continue
-            tess_all[page] = tesseract_boxes(book / "dataset" / page / "original.jpg")
-            tess_cache.write_text(json.dumps(tess_all, ensure_ascii=False),
-                                  encoding="utf-8")
-            print(f"tesseract {i}/{len(pages)} page {page}: "
-                  f"{len(tess_all[page])} boxes", flush=True)
 
     ctd_all: dict = {}
     if (ROOT / "models" / "comic-text-detector-onnx" / "comic-text-detector.onnx").is_file():
@@ -400,11 +368,10 @@ def main(argv=None) -> int:
             best = max(best, inter / area)
         return best < 0.3
 
-    stats = {"page": [], "blue": [], "paddle": [], "tess": [], "ctd": [],
+    stats = {"page": [], "blue": [], "paddle": [], "ctd": [],
              "miss_paddle": [], "miss_ctd": []}
     for i, page in enumerate(pages, 1):
         paddle_items = paddle_boxes.get(page, []) if isinstance(paddle_boxes, dict) else []
-        tess_items = tess_all.get(page, [])
         ctd_items = ctd_all.get(page)
         blues = []
         blocks_json = book / "dataset" / page / "selection_blocks.json"
@@ -415,7 +382,6 @@ def main(argv=None) -> int:
         stats["page"].append(page)
         stats["blue"].append(len(blues))
         stats["paddle"].append(sum(1 for it in paddle_items if "error" not in it))
-        stats["tess"].append(sum(1 for it in tess_items))
         stats["ctd"].append(len(ctd_items or []))
         stats["miss_paddle"].append(sum(1 for bb in blues
                                         if _uncovered(bb, paddle_items)))
@@ -423,18 +389,17 @@ def main(argv=None) -> int:
                                      if _uncovered(bb, ctd_items or [])))
         compose(page, book / "check" / f"{page}.bluebox_check.png",
                 book / "dataset" / page / "original.jpg",
-                paddle_items, tess_items,
+                paddle_items,
                 out_dir / f"{page}_对比.png", args.width, ctd_items=ctd_items)
         print(f"compose {i}/{len(pages)} page {page}", flush=True)
 
-    print("\n=== 每页框数（蓝框 / PaddleOCR / Tesseract / CTD | 蓝框漏检 P / C）===")
-    for page, b, p, t, c, mp, mc in zip(stats["page"], stats["blue"],
-                                        stats["paddle"], stats["tess"],
-                                        stats["ctd"], stats["miss_paddle"],
-                                        stats["miss_ctd"]):
-        print(f"  page {page:>4}: {b:>3} / {p:>3} / {t:>3} / {c:>3} | {mp} {mc}")
+    print("\n=== 每页框数（蓝框 / PaddleOCR / CTD | 蓝框漏检 P / C）===")
+    for page, b, p, c, mp, mc in zip(stats["page"], stats["blue"],
+                                     stats["paddle"], stats["ctd"],
+                                     stats["miss_paddle"], stats["miss_ctd"]):
+        print(f"  page {page:>4}: {b:>3} / {p:>3} / {c:>3} | {mp} {mc}")
     print(f"total: blue={sum(stats['blue'])} paddle={sum(stats['paddle'])} "
-          f"tess={sum(stats['tess'])} ctd={sum(stats['ctd'])}")
+          f"ctd={sum(stats['ctd'])}")
     print(f"blue 漏检: paddle={sum(stats['miss_paddle'])} ctd={sum(stats['miss_ctd'])}")
     if paddle_err:
         print(f"paddle engine error: {paddle_err}", file=sys.stderr)
