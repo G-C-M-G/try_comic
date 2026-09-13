@@ -5,9 +5,10 @@
     venv/Scripts/python.exe ocr_box_compare.py                    # 全部有产物的页
 
 对每一页生成三联对比图（蓝框 check / PaddleOCR 框 / Tesseract 框），
-输出到 --out 目录（默认桌面 图源样张_ocr对比）。
-PaddleOCR 部分经 subprocess 用 paddle_venv 跑（lang=japan, CPU）；
-Tesseract 部分直接调 D:/tools 的 CLI（jpn + jpn_vert, psm 11, conf≥30）。
+默认输出到 {书目录}/ocr_compare/（横排三联）。
+PaddleOCR 部分经 subprocess 用 paddle_venv 跑（与 paddle_ocr_worker 同
+配置，CPU）；Tesseract 部分直接调 D:/tools 的 CLI
+（jpn + jpn_vert, psm 11, conf≥30）。两引擎结果均缓存，可增量重跑。
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parent
 TESSERACT = Path(r"D:\tools\Tesseract-OCR\tesseract.exe")
 PADDLE_PYTHON = ROOT / "paddle_venv" / "Scripts" / "python.exe"
-DEFAULT_OUT = Path(r"C:\Users\YLP\Desktop\图源样张_ocr对比")
 FONT_PATH = r"C:\Windows\Fonts\msyh.ttc"
 
 PADDLE_SCRIPT = r"""
@@ -255,13 +255,14 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--book", default="sample-book")
     parser.add_argument("--pages", default="", help="逗号分隔页码，空=全部")
-    parser.add_argument("--out", default=str(DEFAULT_OUT))
+    parser.add_argument("--out", default=None,
+                        help="输出目录（默认 {书目录}/ocr_compare）")
     parser.add_argument("--width", type=int, default=900, help="对比图面板宽度")
     parser.add_argument("--skip-tesseract", action="store_true")
     args = parser.parse_args(argv)
 
     book = ROOT / "outputs" / "oneclick" / args.book
-    out_dir = Path(args.out)
+    out_dir = Path(args.out) if args.out else book / "ocr_compare"
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = ROOT / "var" / "ocr_compare"
     cache_dir.mkdir(parents=True, exist_ok=True)
