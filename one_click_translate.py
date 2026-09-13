@@ -1363,6 +1363,33 @@ def stage2_process(
     )
 
 
+def _mark_review_required(capture_dir: Path, page: str, reason: str) -> None:
+    """把一页标记为"待人工审核"（写进 capture.json，审核页据此列出）。
+
+    用于**筛框之后**才发现无框可用的页：这类页在采集期是有框的，所以不会
+    被采集期的审核标记覆盖到，必须在这里补记，否则会被静默跳过。
+    """
+    manifest_path = Path(capture_dir) / page / "capture.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return
+    capture = manifest.setdefault("capture", {})
+    capture["selection_review_required"] = True
+    capture["selection_review_reason"] = reason
+    capture["selection_empty_after_filter"] = True
+    try:
+        temporary = manifest_path.with_name(manifest_path.name + ".tmp")
+        temporary.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(manifest_path)
+    except OSError:
+        pass
+
+
 def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
                     progress: "ProgressFile", *,
                     overwrite: bool = False,
@@ -1428,7 +1455,13 @@ def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
         except ValueError as error:
             # No usable blue boxes: nothing to process, the page stays
             # original (kept out of the OCR/translate/typeset loops).
+            # **但要把这页送进审核页**：筛框（微框/整页大框/大拟音）之后可能
+            # 一个框都不剩，静默跳过会让人以为"这页没问题"。标记审核，人工
+            # 在审核页可选择"重新识别（Paddle）"或"重采（Photos）"。
             print(f"{page}: {error}")
+            _mark_review_required(
+                capture_dir, page, f"筛框后无框（{error}）",
+            )
 
     return [
         page for page in pages

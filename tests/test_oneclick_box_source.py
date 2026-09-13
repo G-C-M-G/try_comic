@@ -467,3 +467,79 @@ class Stage2DatasetFilterPlumbingTest(unittest.TestCase):
         )
         # 关掉过滤：Photos 路径也不剔除，4 个框全在
         self.assertEqual(len(written["selection_blocks"]), 4)
+
+
+class FilteredEmptyReviewGateTest(unittest.TestCase):
+    """筛框后一个框都不剩的页要进审核页，不能静默跳过。
+
+    这类页在采集期是有框的（所以采集期的审核标记不会覆盖到），框是在下游
+    被过滤光的；不补标记就会被当成"这页没问题"跳过。
+    """
+
+    def _run(self, blocks, **kwargs):
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+
+        from one_click_translate import _stage2_dataset
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        images = root / "images"
+        images.mkdir()
+        page = images / "1.jpg"
+        Image.new("RGB", (400, 600), "white").save(page)
+        capture = root / "out" / "capture" / "1"
+        capture.mkdir(parents=True)
+        manifest = capture / "capture.json"
+        manifest.write_text(json.dumps({
+            "source": {"path": str(page), "width": 400, "height": 600},
+            "capture": {
+                "box_source": "paddle",
+                "complete": True,
+                "selection_blocks": blocks,
+            },
+        }, ensure_ascii=False), encoding="utf-8")
+
+        class _Progress:
+            def log(self, *_a, **_k): pass
+            def progress(self, *_a, **_k): pass
+            def set_stage(self, *_a, **_k): pass
+
+        pages = _stage2_dataset(images, root / "out", ["1"], _Progress(),
+                                overwrite=False, **kwargs)
+        return pages, json.loads(manifest.read_text(encoding="utf-8"))
+
+    def test_all_boxes_filtered_marks_review(self):
+        # 让"框全被过滤掉"：用 20×20 的碎框、彼此相距 30px（不合并），
+        # 每组成岛后 bbox = 框 + 组矩形 pad 6×2 = 28×28 = 784px² < 800 → 被微小岛过滤
+        # 丢掉 → 该页一个可用框都不剩。
+        # （注：大拟音过滤基于中位数，永远不会把框删光；能"筛空"的是微小岛
+        # 过滤这类阈值过滤，所以测试走这条。）
+        blocks = [
+            {"id": "sel_001", "image_bbox": [10, 10, 26, 26], "page_scale": False},
+            {"id": "sel_002", "image_bbox": [60, 10, 76, 26], "page_scale": False},
+            {"id": "sel_003", "image_bbox": [110, 10, 126, 26], "page_scale": False},
+            {"id": "sel_004", "image_bbox": [160, 10, 176, 26], "page_scale": False},
+        ]
+        pages, manifest = self._run(blocks)
+        capture = manifest["capture"]
+        self.assertFalse(capture.get("selection_review_confirmed", False))
+        self.assertEqual(pages, [], "无框页不应进入下游")
+        self.assertTrue(capture.get("selection_empty_after_filter"))
+        self.assertTrue(capture.get("selection_review_required"))
+        self.assertIn("筛框后无框", capture.get("selection_review_reason", ""))
+
+    def test_page_with_surviving_boxes_not_flagged(self):
+        # 4 个正常小框（短边 40，中位 40 → 都不超标）→ 不成岛也无审核标记
+        blocks = [
+            {"id": "sel_001", "image_bbox": [10, 10, 50, 120], "page_scale": False},
+            {"id": "sel_002", "image_bbox": [60, 10, 100, 120], "page_scale": False},
+            {"id": "sel_003", "image_bbox": [110, 10, 150, 120], "page_scale": False},
+            {"id": "sel_004", "image_bbox": [160, 10, 200, 120], "page_scale": False},
+        ]
+        pages, manifest = self._run(blocks)
+        self.assertEqual(pages, ["1"])
+        self.assertFalse(manifest["capture"].get("selection_empty_after_filter", False))

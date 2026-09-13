@@ -100,6 +100,18 @@ Photos 并行窗口 (上3下3, 行距=窗口高150%)
 | 微框过滤（边 < 6px 丢） | ✗ | ✓ |
 | 检出内容 | 只选"认得"的文字 → 漏拟音/小字 | 会检出拟音/效果字/小字 |
 
+### 3.0.2 筛框后无框 → 进审核页
+- 采集期有框、但在**下游被过滤光**的页（微框 / 整页大框 / 大拟音 / 微小岛
+  <800px²），下游 `_stage2_dataset` 会调 `_mark_review_required` 往 capture.json
+  写 `selection_review_required` + `selection_review_reason` +
+  `selection_empty_after_filter`
+- 为什么必须补标记：这类页在采集期是有框的，采集期的审核标记覆盖不到；
+  不补就会静默跳过，让人误以为"这页没问题"
+- 审核页据此列出（原因显示「筛框后无框」），人工可二选一：
+  - **重新识别（Paddle）** → `--box-source paddle --overwrite`：离线重检测，不开窗口、快
+  - **重采所选（Photos）** → `--box-source photos --overwrite`：开 Photos 窗口重采（原流程）
+- 两个按钮各自**显式覆盖框来源**，互不干扰（`_recapture_pages(box_source=...)`）
+
 ### 3.1 Photos 蓝框采集（`--box-source photos`）
 
 - 并行 6 窗口：上 3 下 3，紧贴四边对齐（上贴顶、下贴底、左贴左、右贴右），窗口最小间距 32px（漂移容差）

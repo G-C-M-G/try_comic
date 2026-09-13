@@ -1291,17 +1291,24 @@ class MainWindow(QMainWindow):
         confirm.clicked.connect(self._confirm_review)
         manga = QPushButton("改用 manga 保底")
         manga.clicked.connect(self._review_manga_fallback)
-        recapture = QPushButton("重采所选")
+        reidentify = QPushButton("重新识别（Paddle）")
+        reidentify.setToolTip(
+            "对所选页用 Paddle 检测重新识别框（离线、不开 Photos 窗口、快）。"
+            "适用于：筛框后无框、检测框不准、或从 Photos 路径切过来。"
+        )
+        reidentify.clicked.connect(self._review_reidentify)
+        recapture = QPushButton("重采所选（Photos）")
         recapture.setProperty("danger", True)
+        recapture.setToolTip("对所选页开 Photos 窗口重新采集（原流程，慢但框紧贴文字）")
         recapture.clicked.connect(self._review_recapture)
         recapture_all = QPushButton("全部重采")
         recapture_all.setProperty("danger", True)
         recapture_all.setToolTip(
-            "清除所有待审核页的 capture 目录并重新采集"
+            "清除所有待审核页的 capture 目录并按当前框来源重新采集"
         )
         recapture_all.clicked.connect(self._review_recapture_all)
         h = QHBoxLayout()
-        for b in (refresh, confirm, manga, recapture, recapture_all):
+        for b in (refresh, confirm, manga, reidentify, recapture, recapture_all):
             h.addWidget(b)
         h.addStretch(1)
         lay.addLayout(h)
@@ -1393,6 +1400,22 @@ class MainWindow(QMainWindow):
         self._log(f"已改用 manga 保底：{', '.join(pages)}")
         self._refresh_review()
 
+    def _review_reidentify(self) -> None:
+        """重新识别（Paddle 检测路径）：对所选页重跑框识别。
+
+        与"重采"的区别是**不开 Photos 窗口**：走 PaddleOCR 全页检测，离线、
+        快速、无焦点/时序问题。审核页里"筛框后无框"的页多半是框被过滤光了，
+        走这条最快。
+        """
+        images = self._images()
+        if not images:
+            return
+        pages = self._review_selected_pages()
+        if not pages:
+            QMessageBox.information(self, "提示", "请先选择要重新识别的页面")
+            return
+        self._recapture_pages(pages, box_source="paddle")
+
     def _review_recapture(self) -> None:
         images = self._images()
         if not images:
@@ -1401,7 +1424,7 @@ class MainWindow(QMainWindow):
         if not pages:
             QMessageBox.information(self, "提示", "请先选择要重采的页面")
             return
-        self._recapture_pages(pages)
+        self._recapture_pages(pages, box_source="photos")
 
     def _review_recapture_all(self) -> None:
         """Re-capture every page currently in the review queue.
@@ -1421,13 +1444,20 @@ class MainWindow(QMainWindow):
             return
         self._recapture_pages(pages)
 
-    def _recapture_pages(self, pages: list[str]) -> None:
-        """Shared recapture pipeline: confirm, clear capture dirs, start stage1."""
+    def _recapture_pages(self, pages: list[str], *, box_source: str = "") -> None:
+        """Shared recapture pipeline: confirm, clear capture dirs, start stage1.
+
+        ``box_source`` 强制指定框来源（"paddle" = 检测重识别，"photos" = 开窗口
+        重采）；留空则用界面当前设置。
+        """
         if not pages:
             return
+        label = {"paddle": "Paddle 重新识别", "photos": "Photos 窗口重采"}.get(
+            box_source, "重新采集"
+        )
         answer = QMessageBox.question(
             self, "重采确认",
-            f"删除并重新采集这 {len(pages)} 页？\n{', '.join(pages)}"
+            f"删除并{label}这 {len(pages)} 页？\n{', '.join(pages)}"
         )
         if answer != QMessageBox.Yes:
             return
@@ -1461,8 +1491,11 @@ class MainWindow(QMainWindow):
                     # purges the same artifacts, so a locked file here
                     # must not abort the recapture.
                     self._log(f"警告: 删除 {page_dir} 失败（{error}），由 --overwrite 兜底")
-        self._log(f"已清除 {len(pages)} 页数据，开始重新采集…")
+        self._log(f"已清除 {len(pages)} 页数据，开始{label}…")
         args = [*self._base_args(), "--pages", ",".join(pages), "--overwrite"]
+        if box_source:
+            # 显式覆盖界面设置：审核页两条路各管一种来源，互不干扰
+            args += ["--box-source", box_source]
         self._run(args)
 
     # ---- tab switching ----
@@ -1746,7 +1779,9 @@ class MainWindow(QMainWindow):
                 continue
             cap = data.get("capture", {})
             if cap.get("selection_review_required") and not cap.get("selection_review_confirmed"):
-                if cap.get("no_text"):
+                if cap.get("selection_empty_after_filter"):
+                    reason = "筛框后无框"
+                elif cap.get("no_text"):
                     reason = "无文本"
                 elif cap.get("selection_missing"):
                     reason = "无蓝色像素"
