@@ -17,7 +17,7 @@
 # 0) 先启动本地翻译服务
 .\start_sakura.bat
 
-# 1) stage1：采集（打开 Photos → 用户框选蓝框 → 自动抓取）
+# 1) stage1：采集（默认 PaddleOCR 全页检测；--box-source photos 切回原 Photos 蓝框）
 venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录"
 
 # 2) 人工核对采集结果
@@ -55,6 +55,11 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
                      （默认 4；点击仍落在按钮/弹窗上时调大，GUI 设置页同名旋钮）
                      （以上四个等待与偏移在 GUI 设置页「采集等待」分组可调）
 --capture-only      只跑 stage1（采集 + 核对图）
+--box-source {paddle,photos}  采集期框来源（默认 paddle）：
+                    paddle = PaddleOCR 全页文本检测，离线、无窗口自动化，
+                             GPU 下 32 页约 7 秒；
+                    photos = 原 Photos 蓝框采集，需窗口自动化（下面一组参数仅对它生效）
+                    两条路径产出同一 capture.json 契约，下游完全一致
 --process           只跑 stage2（后台处理），跳过采集
 --stage {ocr,translate,typeset}  只跑 stage2 的某一个阶段（--pages 选出该阶段页；前置产物必须已存在，缺前置的页会跳过并提示）
 --auto              采集完成立即处理

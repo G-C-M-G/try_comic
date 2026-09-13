@@ -109,12 +109,156 @@ def _parse_pages(value: str | None) -> set[str] | None:
     return pages
 
 
+def _is_black_page(image_path: Path, dark_ratio: float = 0.90) -> bool:
+    """整页几乎全黑（无内容）——与 photos_capture._is_black_page 同判据。"""
+    try:
+        arr = np.asarray(Image.open(image_path).convert("L"))
+    except (OSError, ValueError):
+        return False
+    if arr.size == 0:
+        return False
+    return float((arr < 32).mean()) > dark_ratio
+
+
+def capture_boxes_with_paddle(
+    images: Path, out_root: Path, pages: set[str] | None,
+    *, device: str = "auto", box_area_ratio: float = 0.20,
+    min_side: int = 6,
+) -> bool:
+    """stage1 的另一种框来源：PaddleOCR 全页检测（默认）。
+
+    产出与 Photos 蓝框**完全相同的 capture.json 契约**（source + capture.
+    selection_blocks / selection_groups / complete / 状态字段），所以后续
+    每一步——check 核对图、dataset 构建、填黑图、20%/40% 分组、stage2——
+    都零改动复用。相比 Photos 路径：无窗口自动化、无焦点/时序问题、
+    离线确定性、GPU 下 32 页约 7 秒。
+
+    检测到的框是**文本行**级（Photos 对白页也是按句切分，两者粒度接近；
+    但大字/疏排页面 Photos 会退化成逐字，Paddle 仍是整行——见 开发记录）。
+    """
+    capture_dir = out_root / "capture"
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    raw_output = out_root / "paddle_boxes.json"
+    worker = ROOT / "paddle_ocr_worker.py"
+    cmd = [
+        str(ROOT / "paddle_venv" / "Scripts" / "python.exe"),
+        "-u", str(worker), str(images), str(raw_output), "--device", device,
+    ]
+    if pages:
+        cmd += ["--pages", ",".join(sorted(pages))]
+    print(f"[box-source=paddle] {' '.join(cmd)}")
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line:
+            print(line)
+    code = proc.wait()
+    if code != 0 or not raw_output.is_file():
+        print(f"paddle box detection failed (exit {code})", file=sys.stderr)
+        return False
+
+    payload = json.loads(raw_output.read_text(encoding="utf-8"))
+    print(f"[box-source=paddle] backend={payload.get('backend')} "
+          f"device={payload.get('device')}")
+    written = 0
+    for entry in payload.get("pages") or []:
+        source_path = Path(entry["source"])
+        try:
+            with Image.open(source_path) as handle:
+                image_w, image_h = handle.size
+        except (OSError, ValueError):
+            continue
+        black_page = _is_black_page(source_path)
+        image_area = max(1, image_w * image_h)
+        candidates = []
+        for prediction in entry.get("predictions") or []:
+            polygon = prediction.get("polygon") or []
+            if len(polygon) < 3:
+                continue
+            xs = [int(point[0]) for point in polygon]
+            ys = [int(point[1]) for point in polygon]
+            x1, y1 = max(0, min(xs)), max(0, min(ys))
+            x2, y2 = min(image_w, max(xs)), min(image_h, max(ys))
+            if x2 - x1 < min_side or y2 - y1 < min_side:
+                continue
+            # 整页大框：不是原子文本单位（与 Photos 的 20% 过滤同规则）
+            if (x2 - x1) * (y2 - y1) > box_area_ratio * image_area:
+                continue
+            candidates.append((y1, -x2, [x1, y1, x2, y2]))
+
+        # id 稳定分配：按阅读序（上→下，右→左），与 Photos 的编号习惯一致
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        blocks = [
+            {
+                "id": f"sel_{index:03d}",
+                "display_bbox": list(box),
+                "image_bbox": list(box),
+                "page_scale": False,
+            }
+            for index, (_, _, box) in enumerate(candidates, 1)
+        ]
+        groups = [
+            {
+                "id": f"selg_{index:03d}",
+                "image_bbox": [int(value) for value in bbox],
+                "display_bbox": [int(value) for value in bbox],
+                "members": member_ids,
+            }
+            for index, (bbox, member_ids) in enumerate(
+                _group_boxes_by_overlap(blocks), 1
+            )
+            if member_ids
+        ]
+        page_dir = capture_dir / source_path.stem
+        page_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema_version": 2,
+            "backend": payload.get("backend") or "PaddleOCR",
+            "source": {
+                "path": str(source_path),
+                "width": image_w,
+                "height": image_h,
+            },
+            "capture": {
+                "app": "paddle-ocr",
+                "method": "full-page text detection (box-source=paddle)",
+                "frames_only": False,
+                "box_source": "paddle",
+                "device": payload.get("device"),
+                "viewport_size": [image_w, image_h],
+                "island_count": len(blocks),
+                "selection_boxes_status": "ok" if blocks else "no_boxes",
+                "selection_missing": not blocks,
+                # 硬规则沿用：检测不到任何框的页需人工确认后才进入 stage2
+                "selection_review_required": not blocks,
+                "selection_blocks": blocks,
+                "selection_groups": groups,
+                "black_page": black_page,
+                "complete": True,
+            },
+        }
+        (page_dir / "capture.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        written += 1
+        print(f"paddle capture page {source_path.stem}: {len(blocks)} boxes"
+              + ("  [black page]" if black_page else ""))
+    print(f"paddle box capture done: {written} page(s) -> {capture_dir}")
+    return written > 0
+
+
 def stage1_capture(
     images: Path, out_root: Path, pages: set[str] | None, parallel: int,
     display_scale: int, row_gap_px: int | None, bottom_shift_up: int,
     layout_region: str = "", box_delta: int = 8, box_tolerance: float = 5.0,
     box_area_ratio: float = 0.20, overwrite: bool = False,
     ocr_engine: str = "auto", paddle_device: str = "auto",
+    box_source: str = "paddle",
     row_spacing_px: int | None = None,
     right_gap_px: int = 0, scan_wait: float = 0.5,
     scan_settle: float = 1.3, select_wait: float = 0.45,
@@ -138,79 +282,93 @@ def stage1_capture(
         _purge_page_artifacts(out_root, target, capture=True)
         print(f"overwrite: purged old artifacts of {len(target)} page(s)")
 
-    cmd = [
-        str(_venv_python()),
-        "-u",  # unbuffered: the child must flush layout/progress lines
-               # immediately so a killed run leaves a meaningful trace in
-               # run.log instead of an empty buffer that looks like the
-               # capture never started.
-        str(ROOT / "photos_capture.py"),
-        "batch", "--fast",
-        "--images", str(images),
-        "--output-dir", str(capture_dir),
-        "--frames-only",
-        "--parallel", str(parallel),
-        "--display-scale", str(display_scale),
-        "--box-delta", str(box_delta),
-        "--box-tolerance", str(box_tolerance),
-        "--box-area-ratio", str(box_area_ratio),
-    ]
-    if ocr_engine != "auto":
-        cmd += ["--ocr-engine", ocr_engine]
-    if paddle_device != "auto":
-        cmd += ["--paddle-device", paddle_device]
-    if not overwrite:
-        # Skip pages that were already captured (unless overwriting).
-        cmd += ["--resume"]
-    if row_gap_px is not None:
-        cmd += ["--layout-row-gap", str(row_gap_px)]
-    if row_spacing_px is not None:
-        cmd += ["--layout-row-spacing", str(row_spacing_px)]
-    if right_gap_px:
-        cmd += ["--layout-right-gap", str(right_gap_px)]
-    if scan_wait != 0.5:
-        cmd += ["--scan-wait", str(scan_wait)]
-    if scan_settle != 1.3:
-        cmd += ["--scan-settle", str(scan_settle)]
-    if select_wait != 0.45:
-        cmd += ["--select-wait", str(select_wait)]
-    if regrab_wait != 0.6:
-        cmd += ["--regrab-wait", str(regrab_wait)]
-    if focus_clear_pct != 4.0:
-        cmd += ["--focus-clear-pct", str(focus_clear_pct)]
-    if bottom_shift_up:
-        cmd += ["--layout-bottom-shift-up", str(bottom_shift_up)]
-    if layout_region:
-        cmd += ["--layout-region", layout_region]
-    if pages:
-        cmd += ["--pages", ",".join(sorted(pages))]
     from manga_localizer.progress import ProgressFile
 
     progress = ProgressFile(out_root)
     progress.set_stage("capture", total=len(pages) if pages else 0)
-    progress.log(f"capturing {len(pages) if pages else 'all'} pages (parallel={parallel})")
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    assert proc.stdout is not None
-    captured = 0
-    for line in proc.stdout:
-        line = line.rstrip()
-        if not line:
-            continue
-        print(line)
-        progress.log(line)
-        if "capture" in line and "page" in line.lower():
-            captured += 1
-            total = len(pages) if pages else 0
-            progress.progress(min(captured, total or 1), item=line[:60])
-    code = proc.wait()
-    if code != 0:
-        progress.fail(f"photos_capture exited {code}")
-        return False
-    progress.progress(len(pages) if pages else 0, item="capture done")
+    if box_source == "paddle":
+        # PaddleOCR 全页检测：离线、无窗口自动化（默认）
+        progress.log(f"paddle full-page detection: "
+                     f"{len(pages) if pages else 'all'} page(s)")
+        ok = capture_boxes_with_paddle(
+            images, out_root, pages,
+            device=paddle_device, box_area_ratio=box_area_ratio,
+        )
+        if not ok:
+            progress.fail("paddle box capture failed")
+            return False
+        progress.progress(len(pages) if pages else 0, item="paddle capture done")
+    else:
+        progress.log(f"capturing {len(pages) if pages else 'all'} pages "
+                     f"(parallel={parallel})")
+        cmd = [
+            str(_venv_python()),
+            "-u",  # unbuffered: the child must flush layout/progress lines
+                   # immediately so a killed run leaves a meaningful trace in
+                   # run.log instead of an empty buffer that looks like the
+                   # capture never started.
+            str(ROOT / "photos_capture.py"),
+            "batch", "--fast",
+            "--images", str(images),
+            "--output-dir", str(capture_dir),
+            "--frames-only",
+            "--parallel", str(parallel),
+            "--display-scale", str(display_scale),
+            "--box-delta", str(box_delta),
+            "--box-tolerance", str(box_tolerance),
+            "--box-area-ratio", str(box_area_ratio),
+        ]
+        if ocr_engine != "auto":
+            cmd += ["--ocr-engine", ocr_engine]
+        if paddle_device != "auto":
+            cmd += ["--paddle-device", paddle_device]
+        if not overwrite:
+            # Skip pages that were already captured (unless overwriting).
+            cmd += ["--resume"]
+        if row_gap_px is not None:
+            cmd += ["--layout-row-gap", str(row_gap_px)]
+        if row_spacing_px is not None:
+            cmd += ["--layout-row-spacing", str(row_spacing_px)]
+        if right_gap_px:
+            cmd += ["--layout-right-gap", str(right_gap_px)]
+        if scan_wait != 0.5:
+            cmd += ["--scan-wait", str(scan_wait)]
+        if scan_settle != 1.3:
+            cmd += ["--scan-settle", str(scan_settle)]
+        if select_wait != 0.45:
+            cmd += ["--select-wait", str(select_wait)]
+        if regrab_wait != 0.6:
+            cmd += ["--regrab-wait", str(regrab_wait)]
+        if focus_clear_pct != 4.0:
+            cmd += ["--focus-clear-pct", str(focus_clear_pct)]
+        if bottom_shift_up:
+            cmd += ["--layout-bottom-shift-up", str(bottom_shift_up)]
+        if layout_region:
+            cmd += ["--layout-region", layout_region]
+        if pages:
+            cmd += ["--pages", ",".join(sorted(pages))]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        assert proc.stdout is not None
+        captured = 0
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            print(line)
+            progress.log(line)
+            if "capture" in line and "page" in line.lower():
+                captured += 1
+                total = len(pages) if pages else 0
+                progress.progress(min(captured, total or 1), item=line[:60])
+        code = proc.wait()
+        if code != 0:
+            progress.fail(f"photos_capture exited {code}")
+            return False
+        progress.progress(len(pages) if pages else 0, item="capture done")
 
     # check images: blue boxes (blue, drawn padded like OCR uses them) +
     # page_scale (red) per page.  No highlight-island detection: only the
@@ -1833,6 +1991,15 @@ def main(argv=None) -> int:
              "edge in --display-scale layout (default 0)",
     )
     parser.add_argument(
+        "--box-source",
+        default="paddle",
+        choices=["paddle", "photos"],
+        help="采集期框来源：paddle = PaddleOCR 全页文本检测（默认，离线、"
+             "无窗口自动化、GPU 下 32 页约 7 秒）；photos = 原来的 Photos "
+             "蓝框采集（需窗口自动化）。两者产出同一 capture.json 契约，"
+             "下游完全一致",
+    )
+    parser.add_argument(
         "--paddle-device",
         default="auto",
         choices=["auto", "cpu", "gpu"],
@@ -2102,6 +2269,7 @@ def main(argv=None) -> int:
                             overwrite=args.overwrite,
                             ocr_engine=args.ocr_engine,
                             paddle_device=args.paddle_device,
+                            box_source=args.box_source,
                             row_spacing_px=args.layout_row_spacing,
                             right_gap_px=args.layout_right_gap,
                             scan_wait=args.scan_wait,

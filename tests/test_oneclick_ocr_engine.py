@@ -155,6 +155,7 @@ class Stage1EnginePassthroughTests(unittest.TestCase):
             ok = stage1_capture(
                 self.images, self.root, {"1"}, 3, 25, None, 0,
                 overwrite=True, ocr_engine=ocr_engine,
+                box_source="photos",
             )
             self.assertTrue(ok)
             return calls[0]

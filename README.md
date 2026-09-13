@@ -18,7 +18,8 @@ venv\Scripts\python.exe one_click_gui.py
 # 或打包版（成品在 dist\ 下，GUI 调用 venv 源码，改代码无需重新打包）
 dist\漫画翻译软件.exe
 
-# 命令行：stage1 采集（打开 Photos → 用户框选蓝框 → 自动抓帧并生成核对图）
+# 命令行：stage1 采集（默认 PaddleOCR 全页检测，离线、无窗口自动化；
+#         --box-source photos 可切回原 Photos 蓝框采集）
 venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录"
 
 # stage2 后台处理（OCR → 翻译 → 擦字 → 嵌字 → PDF）

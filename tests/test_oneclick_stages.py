@@ -331,7 +331,7 @@ class Stage1OverwriteTests(unittest.TestCase):
             popen.side_effect = lambda *a, **k: (calls.append(a[0]), proc)[1]
             ok = stage1_capture(
                 self.images, self.root, {"1", "2"}, 3, 25, None, 0,
-                overwrite=overwrite,
+                overwrite=overwrite, box_source="photos",
             )
             self.assertTrue(ok)
             self.assertEqual(len(calls), 1)

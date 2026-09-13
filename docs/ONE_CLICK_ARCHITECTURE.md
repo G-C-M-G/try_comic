@@ -37,7 +37,26 @@ Photos 并行窗口 (上3下3, 行距=窗口高150%)
 | 有框岛 | 岛 bbox 内含任一蓝框中心 → 擦字 + 嵌字 |
 | 无蓝框页 | 无任何可用蓝框 → 整页保持原样（不 OCR、不翻译、不擦字、不嵌字） |
 
-## 三、stage1 — 采集 (photos_capture.py)
+## 三、stage1 — 采集（框来源二选一）
+
+> **两条路径产出同一份 `capture.json` 契约**（`source` + `capture.selection_blocks`
+> / `selection_groups` / 状态字段），因此核对图、dataset 构建、填黑图、20%/40%
+> 分组、stage2 全部**零改动共用**。切换开关 `--box-source {paddle,photos}`
+> （GUI 设置页「框来源（采集）」），**默认 paddle**。
+
+### 3.0 PaddleOCR 全页检测（`--box-source paddle`，默认）
+
+- 对每页原图跑 PP-OCRv6_medium_det（`paddle_ocr_worker.py`，GPU `auto`），
+  检测框 → 过滤（`min_side=6px`；面积 > 20% 整页的框丢弃，同 Photos 规则）
+  → 按阅读序（上→下、右→左）编号 `sel_001…` → 20%/40% 分组写 `selection_groups`
+- **无窗口自动化**：不开 Photos、无焦点/时序/漂移问题，离线确定性；
+  GPU 下 32 页约 7 秒（Photos 路径约 20s/页）
+- 检不到任何框 → `selection_review_required: true`（沿用人工审核门硬规则）；
+  整页全黑 → `black_page: true` 跳过
+- **粒度**：输出"文本行"级框。对白页与 Photos 的按句切分接近；**大字/疏排页面
+  Photos 会退化成逐字切分，Paddle 仍是整行**（实测见 开发记录，注意页 45 框 vs 13 框）
+
+### 3.1 Photos 蓝框采集（`--box-source photos`）
 
 - 并行 6 窗口：上 3 下 3，紧贴四边对齐（上贴顶、下贴底、左贴左、右贴右），窗口最小间距 32px（漂移容差）
 - **显示缩放（上限 + auto-fit）**：`--display-scale <n>` 时每窗尺寸 ≤ 页面 × n%（宽高比一致），整页完整可见；

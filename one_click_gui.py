@@ -805,6 +805,14 @@ class MainWindow(QMainWindow):
         self.stage2_engine_combo = QComboBox()
         self.stage2_engine_combo.addItem("manga-ocr（本地，默认）", "manga-ocr")
         self.stage2_engine_combo.addItem("AI 视觉 OCR", "ai-ocr")
+        self.box_source_combo = QComboBox()
+        self.box_source_combo.addItem("PaddleOCR 全页检测（默认，离线快）", "paddle")
+        self.box_source_combo.addItem("Photos 蓝框采集（窗口自动化）", "photos")
+        self.box_source_combo.setToolTip(
+            "采集期的框来源。两者产出同一份 capture.json 契约，下游完全一致。\n"
+            "paddle：离线检测、无窗口自动化、GPU 下 32 页约 7 秒；\n"
+            "photos：原流程，需开 Photos 窗口并做焦点/时序控制。"
+        )
         self.paddle_device_combo = QComboBox()
         self.paddle_device_combo.addItem("自动（有 GPU 就用，默认）", "auto")
         self.paddle_device_combo.addItem("GPU", "gpu")
@@ -908,7 +916,8 @@ class MainWindow(QMainWindow):
         _row("AI OCR 接口", self.ai_ocr_url_edit)
         _row("AI OCR 模型", self.ai_ocr_model_edit)
         _row("AI OCR Key", self.ai_ocr_key_edit)
-        _row("OCR 引擎（采集）", self.ocr_engine_combo)
+        _row("框来源（采集）", self.box_source_combo)
+        _row("OCR 引擎（采集，Photos 路径）", self.ocr_engine_combo)
         _row("读字引擎（嵌字前）", self.stage2_engine_combo)
         _row("OCR 设备（采集，Paddle）", self.paddle_device_combo)
         cap_title = QLabel("采集", objectName="cardTitle")
@@ -972,6 +981,9 @@ class MainWindow(QMainWindow):
         engine = data.get("ocr_engine")
         index = self.ocr_engine_combo.findData(engine) if engine else -1
         self.ocr_engine_combo.setCurrentIndex(index if index >= 0 else 0)
+        box_source = data.get("box_source")
+        index = self.box_source_combo.findData(box_source) if box_source else -1
+        self.box_source_combo.setCurrentIndex(index if index >= 0 else 0)
         stage2_engine = data.get("stage2_engine")
         index = self.stage2_engine_combo.findData(stage2_engine) if stage2_engine else -1
         self.stage2_engine_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -1081,6 +1093,7 @@ class MainWindow(QMainWindow):
             "ai_ocr_url": self.ai_ocr_url_edit.text().strip(),
             "ai_ocr_model": self.ai_ocr_model_edit.text().strip(),
             "ai_ocr_api_key": self.ai_ocr_key_edit.text().strip(),
+            "box_source": self.box_source_combo.currentData(),
             "ocr_engine": self.ocr_engine_combo.currentData(),
             "paddle_device": self.paddle_device_combo.currentData(),
             "stage2_engine": self.stage2_engine_combo.currentData(),
@@ -1535,6 +1548,9 @@ class MainWindow(QMainWindow):
             args += ["--pages", pages]
         args += ["--parallel", str(self.parallel_spin.value())]
         args += ["--display-scale", str(self.scale_spin.value())]
+        box_source = self.box_source_combo.currentData()
+        if box_source and box_source != "paddle":
+            args += ["--box-source", box_source]
         engine = self.ocr_engine_combo.currentData()
         if engine and engine != "auto":
             args += ["--ocr-engine", engine]
