@@ -95,7 +95,11 @@ masked = 全页填充色 (BLUEBOX_FILL)
 - 子进程加载 manga-ocr 一次，遍历全部 crops（JSON 行协议输出）
 - **只读蓝框**：`{page}:box:{block_id}`，source = 填黑图，bbox = 蓝框扩 6px
 - 无框岛**不进 OCR**（填黑图填充区是纯色，manga-ocr 会幻觉输出，如 "それでも、"）
-- 读空 2 次跳过：同一蓝框连续两轮读空 → 判定为误选区，丢弃（`empty_counts`）
+- 读空 2 遍判误选（同一轮内两遍读，非跨轮）：第一遍全量读 → 读空的框以
+  `{page}:box:{id}:reread` 的独立 id **再读一遍** → 仍读空才判定为误选区，记入
+  `dropped_boxes`，此后**全线不参与**（不进句子拼接、不擦字、不嵌字）
+  - 因为缓存只存非空读数（见 4.8），恒空的框每次运行都会重演"读→复读"，
+    不会被缓存跳过
 - **AI OCR 补强（可选）**：manga-ocr 未读出的框（misses）若有配置 `ai_ocr_url/model/key`，
   走 OpenAI 兼容视觉模型（`manga_localizer/ai_ocr.py`）复读，结果同样入缓存
 
