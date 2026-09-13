@@ -29,6 +29,8 @@ def _plain(value):
 def _parse_pages(value: str | None) -> set[str] | None:
     if not value:
         return None
+    # Tolerate full-width punctuation ("4，6" / "4、6" from an IME).
+    value = value.replace("，", ",").replace("、", ",").replace(" ", "")
     pages: set[str] = set()
     for raw in value.split(","):
         item = raw.strip()

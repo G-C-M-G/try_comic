@@ -74,6 +74,11 @@ def _load_api_config() -> dict:
 def _parse_pages(value: str | None) -> set[str] | None:
     if not value:
         return None
+    # Tolerate full-width punctuation (users type "4，6" / "4、6" in an
+    # IME): normalize to the half-width separator before splitting, so a
+    # full-width comma cannot become part of a page name and silently
+    # match nothing ("no images found").
+    value = value.replace("，", ",").replace("、", ",").replace(" ", "")
     pages: set[str] = set()
     for raw in value.split(","):
         item = raw.strip()
