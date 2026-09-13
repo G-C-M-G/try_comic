@@ -1021,8 +1021,59 @@ def _group_boxes_by_overlap(
     return sorted(result, key=lambda item: (item[0][1], -item[0][2]))
 
 
+def _rects_intersect(a, b) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _yield_step(small, big, limit: float, gap: int = 1):
+    """把 small 推离 big 所需的最小位移（两轴取小），|位移| 受 limit 约束。"""
+    candidates = []
+    for dx in ((big[0] - gap) - small[2], (big[2] + gap) - small[0]):
+        if abs(dx) <= limit:
+            candidates.append((abs(dx), dx, 0))
+    for dy in ((big[1] - gap) - small[3], (big[3] + gap) - small[1]):
+        if abs(dy) <= limit:
+            candidates.append((abs(dy), 0, dy))
+    if not candidates:
+        return None
+    _, dx, dy = min(candidates)
+    return dx, dy
+
+
+def _shifted(rect, shift):
+    return (rect[0] + shift[0], rect[1] + shift[1],
+            rect[2] + shift[0], rect[3] + shift[1])
+
+
+def _resolve_group_yields(rects, *, limit_ratio: float = 0.5,
+                          gap: int = 1) -> list[list[int]]:
+    """小组让位：组矩形相交时把**面积小**的组推开，返回每组的位移。
+
+    组矩形（成员框并集 ±bbox_pad）就是嵌字的布局边界，两框相交即两段译文
+    会互相干扰。规则：只对更大的组让位；沿"移动量最小"的轴推开到不相交
+    （四周各留 gap）；位移上限 = limit_ratio × 自身较短边，避免挪飞。
+    推不开（上限内无法分离）就保持原位——宁可轻微重叠也不把文字甩到远处。
+    """
+    shifts = [[0, 0] for _ in rects]
+    areas = [(r[2] - r[0]) * (r[3] - r[1]) for r in rects]
+    order = sorted(range(len(rects)), key=lambda index: -areas[index])
+    for rank, index in enumerate(order):
+        for bigger in order[:rank]:
+            current = _shifted(rects[index], shifts[index])
+            target = _shifted(rects[bigger], shifts[bigger])
+            if not _rects_intersect(current, target):
+                continue
+            limit = limit_ratio * min(current[2] - current[0], current[3] - current[1])
+            step = _yield_step(current, target, limit, gap)
+            if step is None:
+                continue
+            shifts[index][0] += step[0]
+            shifts[index][1] += step[1]
+    return shifts
+
+
 def build_bluebox_dataset(
-    manifest_path, page_dir, source_path, min_island_area: float = 800.0, pad: int = 2
+    manifest_path, page_dir, source_path, min_island_area: float = 800.0, pad: int = 0
 ) -> list[dict]:
     """islands.json purely from the Photos blue boxes (original image space).
 
@@ -1054,6 +1105,35 @@ def build_bluebox_dataset(
         for index, (bbox, member_ids) in enumerate(grouped, 1)
         if member_ids
     ]
+    # 小组让位：先算每组的"嵌字布局矩形"（成员框并集 ±bbox_pad），相交时让
+    # 面积小的组推开。位移只记进数据集（typeset_shift），**不动成员框本身**——
+    # OCR 裁剪与擦字仍以原框为准，只有嵌字的布局框被挪开。
+    boxes_by_id = {b["id"]: b for b in blocks}
+    source_kind = str(payload.get("capture", {}).get("box_source") or "photos")
+    bbox_pad = 4 if source_kind == "paddle" else 6
+    group_rects = []
+    for group in groups:
+        member_boxes = [boxes_by_id[mid]["image_bbox"] for mid in group["members"]
+                        if mid in boxes_by_id]
+        if not member_boxes:
+            group_rects.append(None)
+            continue
+        group_rects.append([
+            min(b[0] for b in member_boxes) - bbox_pad,
+            min(b[1] for b in member_boxes) - bbox_pad,
+            max(b[2] for b in member_boxes) + bbox_pad,
+            max(b[3] for b in member_boxes) + bbox_pad,
+        ])
+    shiftable = [r for r in group_rects if r is not None]
+    shifts = _resolve_group_yields(shiftable)
+    shift_iter = iter(shifts)
+    group_shifts = []
+    for rect in group_rects:
+        group_shifts.append([0, 0] if rect is None else next(shift_iter))
+    for group, shift in zip(groups, group_shifts):
+        if shift[0] or shift[1]:
+            group["typeset_shift"] = list(shift)
+
     islands: list[dict] = []
     for group in groups:
         members = [member for member in group["members"] if member in atomic_ids]
@@ -1071,7 +1151,7 @@ def build_bluebox_dataset(
         area = float((x2 - x1) * (y2 - y1))
         if area < min_island_area:
             continue
-        islands.append({
+        island_record = {
             "id": f"island_{len(islands) + 1:03d}",
             "display_bbox": [x1, y1, x2, y2],
             "display_center": [(x1 + x2) // 2, (y1 + y2) // 2],
@@ -1080,7 +1160,12 @@ def build_bluebox_dataset(
             "image_center": [(x1 + x2) // 2, (y1 + y2) // 2],
             "image_area": round(area, 1),
             "from_selection_group": True,
-        })
+        }
+        shift = group.get("typeset_shift")
+        if shift:
+            # 让位位移：stage2 据此把**布局框**挪开（擦字范围会一并覆盖让位处）
+            island_record["typeset_shift"] = list(shift)
+        islands.append(island_record)
     if not islands:
         raise ValueError(
             f"page {Path(page_dir).name}: no usable blue boxes "
@@ -1118,6 +1203,10 @@ def build_bluebox_dataset(
                 "image_size": [image_w, image_h],
                 "selection_blocks": blocks,
                 "selection_groups": groups,
+                # 框来源决定字号上限的补偿量（见 build_union_overrides）：
+                # Photos 蓝框紧贴笔画（上限 = 框宽+12），Paddle 检测框自带边距
+                # （上限 = 框宽+8，各减 2px/边抵消松边）
+                "box_source": str(payload.get("capture", {}).get("box_source") or "photos"),
             },
             ensure_ascii=False,
             indent=2,
@@ -1856,7 +1945,9 @@ def _skip_pages(capture_dir: Path, pages: list[str]) -> set[str]:
     return skipped
 
 
-def build_union_overrides(dataset, boxes, pad: int = 6) -> dict:
+def build_union_overrides(dataset, boxes, pad: int = 6,
+                          glyph_margin: int | None = None,
+                          bbox_pad: int | None = None) -> dict:
     """Per-island blue-box union masks (island-local coords).
 
     Each island's mask is the union of its blue boxes expanded by *pad* px
@@ -1890,8 +1981,11 @@ def build_union_overrides(dataset, boxes, pad: int = 6) -> dict:
                 # 坐标，会被岛 bbox 裁掉边缘；若拿它算字号上限，就会产生
                 # "岛 bbox 一变、字号跟着变"的无关耦合（组外接矩形加个 pad
                 # 都会把字号顶上去）。字号上限只该反映框本身的尺寸。
-                box_w = (x2 + pad) - (x1 - pad)
-                box_h = (y2 + pad) - (y1 - pad)
+                # 字号上限 = 框尺寸 + 固定余量（不随 pad 变）：Photos 蓝框
+                # 紧贴笔画用 +12；Paddle 检测框自带约 2px/边余量，用 +5 抵消
+                margin = 2 * pad if glyph_margin is None else glyph_margin
+                box_w = (x2 - x1) + margin
+                box_h = (y2 - y1) + margin
                 if min_w is None or box_w < min_w:
                     min_w = box_w
                 if min_h is None or box_h < min_h:
@@ -1901,9 +1995,10 @@ def build_union_overrides(dataset, boxes, pad: int = 6) -> dict:
         mask = np.zeros((iy2 - iy1, ix2 - ix1), dtype=np.uint8)
         for px1, py1, px2, py2 in local_boxes:
             mask[py1:py2, px1:px2] = 255
+        bp = pad if bbox_pad is None else bbox_pad
         raw = [
-            (b["image_bbox"][0] - pad, b["image_bbox"][1] - pad,
-             b["image_bbox"][2] + pad, b["image_bbox"][3] + pad)
+            (b["image_bbox"][0] - bp, b["image_bbox"][1] - bp,
+             b["image_bbox"][2] + bp, b["image_bbox"][3] + bp)
             for b in boxes
             if ix1 <= (b["image_bbox"][0] + b["image_bbox"][2]) // 2 <= ix2
             and iy1 <= (b["image_bbox"][1] + b["image_bbox"][3]) // 2 <= iy2
@@ -1999,7 +2094,22 @@ def erase_and_typeset_page_with(
     # coords; glyph size caps follow the PADDED box dimensions (vertical:
     # font width <= narrowest padded box width; horizontal: font height <=
     # shortest padded box height)
-    union_overrides = build_union_overrides(dataset, boxes, pad=6) if boxes else {}
+    # 字号上限的边距按框来源补偿：Paddle 检测框自带约 2px/边 的余量，
+    # 用 +8（pad 4）而非蓝框的 +12（pad 6），抵消松边导致的字号偏大
+    _box_source = ""
+    try:
+        _box_source = str(
+            json.loads(selection_json.read_text(encoding="utf-8")).get("box_source") or ""
+        )
+    except (OSError, ValueError):
+        _box_source = ""
+    glyph_margin = 5 if _box_source == "paddle" else 12
+    bbox_pad = 4 if _box_source == "paddle" else 6
+    union_overrides = (
+        build_union_overrides(dataset, boxes, pad=6, glyph_margin=glyph_margin,
+                              bbox_pad=bbox_pad)
+        if boxes else {}
+    )
     config = TypesetConfig(
         min_font_size=min_font_size if min_font_size else TypesetConfig.min_font_size,
         font_name=font_name or TypesetConfig.font_name,
@@ -2016,14 +2126,28 @@ def erase_and_typeset_page_with(
     # erasure range, the layout bounds and the reported block bbox all
     # refer to the same box, so text never lands on un-erased art.
     canonical = {}
+    layout = {}
     for island in dataset.islands:
         box = (union_overrides.get(island.id) or {}).get("bbox")
-        if box is not None:
-            canonical[island.id] = tuple(int(value) for value in box)
+        if box is None:
+            continue
+        canonical[island.id] = tuple(int(value) for value in box)
+        # 小组让位：数据集里记录的 typeset_shift 只挪**布局框**（嵌字范围），
+        # 擦字仍以不挪的 canonical box 为准（两者下面的 extra_regions 都覆盖）
+        raw_shift = island.raw.get("typeset_shift") or (0, 0)
+        try:
+            dx, dy = int(raw_shift[0]), int(raw_shift[1])
+        except (TypeError, ValueError, IndexError):
+            dx, dy = 0, 0
+        base = canonical[island.id]
+        layout[island.id] = (
+            (base[0] + dx, base[1] + dy, base[2] + dx, base[3] + dy)
+            if (dx or dy) else base
+        )
     canonical_dataset = dataclasses.replace(
         dataset,
         islands=tuple(
-            dataclasses.replace(island, image_bbox=canonical.get(island.id, island.image_bbox))
+            dataclasses.replace(island, image_bbox=layout.get(island.id, island.image_bbox))
             for island in dataset.islands
         ),
     )
@@ -2041,6 +2165,17 @@ def erase_and_typeset_page_with(
         for island_id in erase_ids
         if island_id in canonical
     }
+    # 让位过的岛：擦字要同时覆盖"原位"和"让位后的布局框"，否则译文会压在
+    # 没擦掉的原图笔画上
+    for island_id in list(extra_regions):
+        moved = layout.get(island_id)
+        if not moved or moved == extra_regions[island_id]:
+            continue
+        base = extra_regions[island_id]
+        extra_regions[island_id] = (
+            min(base[0], moved[0]), min(base[1], moved[1]),
+            max(base[2], moved[2]), max(base[3], moved[3]),
+        )
     erased = erase_island_image(
         source, active_dataset, config=ErasureConfig(), min_island_area=800.0,
         extra_regions=extra_regions,

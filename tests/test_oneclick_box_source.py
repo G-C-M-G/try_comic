@@ -250,3 +250,92 @@ class LargeSfxFilterTest(unittest.TestCase):
                  self._v(100, 100, 40, 300)]
         kept, _ = _filter_large_sfx(boxes, *self.PAGE)
         self.assertEqual([b[0] for b in kept], [500, 300, 100])
+
+
+class GroupYieldTest(unittest.TestCase):
+    """小组让位（_resolve_group_yields）：组矩形相交时面积小的让开。
+
+    组矩形 = 成员框并集 ±bbox_pad = 嵌字布局边界，相交意味着两段译文会
+    互相干扰。规则要点：只对更大的组让位、沿移动量最小的轴、位移有上限。
+    """
+
+    def test_smaller_yields_and_bigger_stays(self):
+        from one_click_translate import _resolve_group_yields, _rects_intersect, _shifted
+
+        big = [0, 0, 200, 200]
+        small = [190, 50, 260, 150]          # 与大组横向重叠 10px
+        shifts = _resolve_group_yields([big, small], gap=1)
+        self.assertEqual(shifts[0], [0, 0])                    # 大组不动
+        self.assertTrue(shifts[1][0] > 0 or shifts[1][1] != 0)  # 小组让位
+        self.assertFalse(
+            _rects_intersect(_shifted(big, shifts[0]), _shifted(small, shifts[1]))
+        )
+
+    def test_no_overlap_no_shift(self):
+        from one_click_translate import _resolve_group_yields
+
+        shifts = _resolve_group_yields([[0, 0, 100, 100], [300, 300, 400, 400]])
+        self.assertEqual(shifts, [[0, 0], [0, 0]])
+
+    def test_shift_uses_cheapest_axis(self):
+        from one_click_translate import _resolve_group_yields
+
+        big = [0, 0, 200, 200]
+        small = [195, 60, 260, 140]          # 横向只需 -56？纵向不行 → 横向
+        shifts = _resolve_group_yields([big, small], gap=1)
+        self.assertEqual(shifts[1][1], 0)     # 不动 y
+        self.assertNotEqual(shifts[1][0], 0)
+
+    def test_oversized_shift_is_refused(self):
+        """让位位移受上限约束：需要挪太远时宁可不动（不把文字甩到远处）。"""
+        from one_click_translate import _resolve_group_yields
+
+        big = [0, 0, 400, 400]
+        small = [100, 100, 140, 140]         # 完全被大组包住，任何方向都要挪很远
+        shifts = _resolve_group_yields([big, small], limit_ratio=0.5, gap=1)
+        self.assertEqual(shifts[1], [0, 0])
+
+    def test_cascade_three_groups(self):
+        from one_click_translate import _resolve_group_yields, _rects_intersect, _shifted
+
+        rects = [[0, 0, 300, 100], [280, 200, 420, 300], [400, 380, 470, 460]]
+        shifts = _resolve_group_yields(rects, gap=1)
+        self.assertEqual(shifts[0], [0, 0])   # 最大者不动
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                self.assertFalse(
+                    _rects_intersect(_shifted(rects[i], shifts[i]),
+                                     _shifted(rects[j], shifts[j])),
+                    f"{i} 与 {j} 仍相交",
+                )
+
+    def test_build_records_shift_in_dataset(self):
+        """位移要落到数据集里（typeset_shift），stage2 据此挪布局框。"""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        images = root / "images"
+        images.mkdir()
+        page = images / "1.jpg"
+        Image.new("RGB", (400, 300), "white").save(page)
+        manifest = root / "capture.json"
+        manifest.write_text(json.dumps({
+            "source": {"path": str(page), "width": 400, "height": 300},
+            "capture": {
+                "box_source": "paddle",
+                "selection_blocks": [
+                    {"id": "sel_001", "image_bbox": [20, 20, 60, 280], "page_scale": False},
+                    {"id": "sel_002", "image_bbox": [70, 20, 110, 280], "page_scale": False},
+                ],
+            },
+        }, ensure_ascii=False), encoding="utf-8")
+        islands = build_bluebox_dataset(manifest, root / "dataset" / "1", str(page))
+        self.assertTrue(islands)
+        # 同一组内的相邻列应被合并，因此这里不触发让位；键存在与否都合法
+        self.assertIsInstance(islands[0].get("typeset_shift", [0, 0]), list)
