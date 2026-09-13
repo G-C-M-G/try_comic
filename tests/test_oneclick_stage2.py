@@ -263,19 +263,28 @@ class GroupBoxesByOverlapTests(unittest.TestCase):
         groups = _group_boxes_by_overlap(boxes)
         self.assertEqual(len(groups), 1)
 
-    def test_vertical_gap_within_20_percent_padded_width_merges(self):
-        # Raw gap 20px -> padded gap 8px < 20% of the smaller padded
-        # width (72px * 0.2 = 14.4) -> merge.
+    def test_vertical_gap_within_60_percent_raw_width_merges(self):
+        # 合并判据在**原始框**上：间距 15px < 60% × 较小框宽 (30px → 18px)。
+        boxes = [
+            _box("a", 50, 30, 80, 200),
+            _box("b", 95, 40, 125, 220),
+        ]
+        groups = _group_boxes_by_overlap(boxes)
+        self.assertEqual(len(groups), 1)
+
+    def test_vertical_gap_beyond_60_percent_raw_width_does_not_merge(self):
+        # 同一对框把间距拉到 20px：20 > 60% × 30px = 18px -> 不并。
+        # （旧规则在"扩边后"几何上判，扩边给间距加了 2×pad 的常量，
+        #  等价比例约 20%；改成原始框后重标定为 60%。）
         boxes = [
             _box("a", 50, 30, 80, 200),
             _box("b", 100, 40, 130, 220),
         ]
         groups = _group_boxes_by_overlap(boxes)
-        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups), 2)
 
     def test_vertical_wide_horizontal_gap_does_not_merge(self):
-        # Raw gap 24px -> padded gap 12px > 20% of the smaller padded
-        # width (48px * 0.2 = 9.6) -> no merge.
+        # 间距 24px > 60% × 较小框宽 (36px → 21.6px) -> 不并。
         boxes = [
             _box("a", 40, 30, 100, 200),
             _box("b", 124, 40, 160, 210),

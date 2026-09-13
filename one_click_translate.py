@@ -913,7 +913,7 @@ def _group_boxes_by_overlap(
     boxes: Sequence[dict],
     *,
     pad: int = 6,
-    gap_ratio: float = 0.20,
+    gap_ratio: float = 0.60,
     overlap_ratio: float = 0.40,
 ) -> list[tuple[tuple[int, int, int, int], list[str]]]:
     """Group blue boxes (image-space) into OCR recognition units.
@@ -921,17 +921,28 @@ def _group_boxes_by_overlap(
     A box is vertical when its height >= width, horizontal otherwise.
     Boxes NEVER merge along the reading direction (Photos' blue boxes are
     the trusted atomic units); they only merge side-by-side on the
-    PERPENDICULAR axis when they are close AND aligned.  All distances
-    are measured on the PADDED boxes (each blue box expanded by *pad* px,
-    the same expansion the canonical "one box" uses):
+    PERPENDICULAR axis when they are close AND aligned.
 
-    * two VERTICAL boxes merge when the padded horizontal gap is below
-      20% of the smaller padded box's width AND their padded vertical
-      ranges overlap by more than 40% of the LARGER padded box's height;
-    * two HORIZONTAL boxes merge when the padded vertical gap is below
-      20% of the smaller padded box's height AND their padded horizontal
-      ranges overlap by more than 40% of the LARGER padded box's width;
+    **合并判据用原始框几何**（只有排布事实，不含 OCR 用的扩边量）；*pad*
+    只用于**组的外接矩形**（= 成员框扩边后的并集，下游据此决定填黑/擦字/
+    嵌字的范围）。顺序即：筛框 → 编组（原始框）→ 取扩框外接矩形。
+
+    Merge test on the raw boxes -- only the text layout, never the OCR
+    padding (padding is an engineering allowance, not a layout fact):
+
+    * two VERTICAL boxes merge when the raw horizontal gap is below
+      60% of the smaller box's width AND their vertical ranges overlap by
+      more than 40% of the LARGER box's height;
+    * two HORIZONTAL boxes merge when the raw vertical gap is below
+      60% of the smaller box's height AND their horizontal ranges overlap
+      by more than 40% of the LARGER box's width;
     * mixed-orientation pairs never merge.
+
+    (60% on raw geometry replaces the earlier "20% on padded geometry":
+    padding used to add ~2*pad px to every gap -- a large constant
+    relative to small boxes.  The raw form is scale-invariant.  Measured
+    sweep on 图源样张: any ratio in 0.4~0.6 gives near-identical
+    groupings, so the exact value is not critical.)
 
     Returns ``[(group_bbox, [member_ids])]`` sorted top-to-bottom,
     right-to-left.  ``boxes`` must carry ``id`` and ``image_bbox``.
@@ -957,23 +968,21 @@ def _group_boxes_by_overlap(
         if ra != rb:
             parent[ra] = rb
 
-    padded: dict[int, tuple[int, int, int, int]] = {}
-    for index, box in enumerate(ordered):
-        x1, y1, x2, y2 = box["image_bbox"]
-        padded[index] = (x1 - pad, y1 - pad, x2 + pad, y2 + pad)
-
+    # 合并判据用**原始框**几何：编组回答的是"这些框是不是同一个文本单位"，
+    # 应该只看文字本身的排布，不该被"给 OCR 的扩边量"影响（扩边是工程补偿，
+    # 不是排版事实）。顺序因此是：筛框 → 编组（原始框）→ 再按扩框取外接矩形。
     for i in range(len(ordered)):
         a = ordered[i]
         ax1, ay1, ax2, ay2 = a["image_bbox"]
         a_vertical = (ay2 - ay1) >= (ax2 - ax1)
-        pa = padded[i]
+        pa = (ax1, ay1, ax2, ay2)
         for j in range(i + 1, len(ordered)):
             b = ordered[j]
             bx1, by1, bx2, by2 = b["image_bbox"]
             b_vertical = (by2 - by1) >= (bx2 - bx1)
             if a_vertical != b_vertical:
                 continue
-            pb = padded[j]
+            pb = (bx1, by1, bx2, by2)
             min_pw = min(pa[2] - pa[0], pb[2] - pb[0])
             min_ph = min(pa[3] - pa[1], pb[3] - pb[1])
             if min_pw <= 0 or min_ph <= 0:
@@ -999,10 +1008,12 @@ def _group_boxes_by_overlap(
     result = []
     for root, member_ids in members_by_root.items():
         members = [ordered[i] for i in range(len(ordered)) if find(i) == root]
-        x1 = min(box["image_bbox"][0] for box in members)
-        y1 = min(box["image_bbox"][1] for box in members)
-        x2 = max(box["image_bbox"][2] for box in members)
-        y2 = max(box["image_bbox"][3] for box in members)
+        # 组的外接矩形 = 成员框**扩边后**的并集：编组本身按原始框判，但下游
+        # 拿这个矩形是要"多少像素"（填黑/擦字/嵌字的范围都在它之内）
+        x1 = min(box["image_bbox"][0] - pad for box in members)
+        y1 = min(box["image_bbox"][1] - pad for box in members)
+        x2 = max(box["image_bbox"][2] + pad for box in members)
+        y2 = max(box["image_bbox"][3] + pad for box in members)
         result.append(((x1, y1, x2, y2), member_ids))
     return sorted(result, key=lambda item: (item[0][1], -item[0][2]))
 
