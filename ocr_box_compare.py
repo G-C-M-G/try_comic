@@ -1,18 +1,18 @@
-"""OCR 引擎横向对比：PaddleOCR / comic-text-detector 全页自动检测 vs Photos 蓝框。
+"""OCR 引擎横向对比：PaddleOCR 全页自动检测 vs Photos 蓝框。
 
 用法（root venv）：
     venv/Scripts/python.exe ocr_box_compare.py --pages 1          # 单页试跑
     venv/Scripts/python.exe ocr_box_compare.py                    # 全部有产物的页
+    venv/Scripts/python.exe ocr_box_compare.py --ctd              # 追加 CTD 联
 
-对每一页生成对比图（蓝框 check / PaddleOCR / CTD 三联，CTD 模型缺失时
-自动退为两联），默认输出到 {书目录}/ocr_compare/（横排）。
-PaddleOCR 部分经 subprocess 用 paddle_venv 跑（与 paddle_ocr_worker 同
-配置，CPU）；comic-text-detector 走本地 ONNX
-（models/comic-text-detector-onnx，seg 掩膜连通域提框）。
-各引擎结果均落盘 var/ocr_compare/ 缓存，可增量重跑。
+默认两联（蓝框 check / PaddleOCR），输出到 {书目录}/ocr_compare/（横排）。
+`--ctd` 追加 comic-text-detector 联——实测精确率仅 39.2%（过度识别严重，
+把网点/木纹/衣褶都当文字），默认关闭，仅在复查该结论时开启。结果落盘
+var/ocr_compare/ 缓存，可增量重跑。
 
-Tesseract 曾在候选之列，实测过检 8.5 倍（4328 框，全是字符碎片）被淘汰，
-已从本工具移除（见 开发记录 选型一节）。
+PaddleOCR 经 subprocess 用 paddle_venv 跑（与 paddle_ocr_worker 同配置，
+CPU）。Tesseract 实测过检 8.5 倍（4328 框，全是字符碎片）已淘汰移除（见
+开发记录 选型一节）。
 """
 
 from __future__ import annotations
@@ -314,6 +314,11 @@ def main(argv=None) -> int:
     parser.add_argument("--out", default=None,
                         help="输出目录（默认 {书目录}/ocr_compare）")
     parser.add_argument("--width", type=int, default=900, help="对比图面板宽度")
+    parser.add_argument(
+        "--ctd", action="store_true",
+        help="追加 comic-text-detector 联（实测精确率仅 39.2%，过度识别严重，"
+             "默认关闭；仅在复查该结论时开启）",
+    )
     args = parser.parse_args(argv)
 
     book = ROOT / "outputs" / "oneclick" / args.book
@@ -337,7 +342,7 @@ def main(argv=None) -> int:
         paddle_err = paddle_boxes["error"]
 
     ctd_all: dict = {}
-    if (ROOT / "models" / "comic-text-detector-onnx" / "comic-text-detector.onnx").is_file():
+    if args.ctd and (ROOT / "models" / "comic-text-detector-onnx" / "comic-text-detector.onnx").is_file():
         ctd_cache = cache_dir / "ctd_boxes.json"
         ctd_all = json.loads(ctd_cache.read_text(encoding="utf-8")) if ctd_cache.is_file() else {}
         for i, page in enumerate(pages, 1):
@@ -348,7 +353,7 @@ def main(argv=None) -> int:
                                  encoding="utf-8")
             print(f"ctd {i}/{len(pages)} page {page}: "
                   f"{len(ctd_all[page])} boxes", flush=True)
-    else:
+    elif args.ctd:
         print("ctd: 模型未下载（models/comic-text-detector-onnx），跳过该联")
 
     def _bbox(poly):
@@ -368,10 +373,25 @@ def main(argv=None) -> int:
             best = max(best, inter / area)
         return best < 0.3
 
-    stats = {"page": [], "blue": [], "paddle": [], "ctd": [],
-             "miss_paddle": [], "miss_ctd": []}
+    def _is_true_positive(poly, blues, threshold: float = 0.5) -> bool:
+        """引擎框是否落在某个蓝框内（交集 / 自身面积 ≥ threshold）。"""
+        cl, ct, cr, cb = _bbox(poly)
+        area = max(1, (cr - cl) * (cb - ct))
+        for l, t, r, b in blues:
+            inter = max(0, min(cr, r) - max(cl, l)) * max(0, min(cb, b) - max(ct, t))
+            if inter / area >= threshold:
+                return True
+        return False
+
+    # 精确率必须和召回率一起看：只看漏检（召回）会漏掉"多出一堆假框"的引擎
+    # （CTD 的教训，见 开发记录 选型一节）。
+    metrics = {"paddle": {"tp": 0, "fp": 0, "fn": 0}, "ctd": {"tp": 0, "fp": 0, "fn": 0}}
+    per_page = {"page": [], "blue": [], "paddle": [], "ctd": [],
+                "miss_paddle": [], "miss_ctd": []}
     for i, page in enumerate(pages, 1):
-        paddle_items = paddle_boxes.get(page, []) if isinstance(paddle_boxes, dict) else []
+        paddle_items = [it for it in (paddle_boxes.get(page, [])
+                                      if isinstance(paddle_boxes, dict) else [])
+                        if "error" not in it]
         ctd_items = ctd_all.get(page)
         blues = []
         blocks_json = book / "dataset" / page / "selection_blocks.json"
@@ -379,28 +399,44 @@ def main(argv=None) -> int:
             data = json.loads(blocks_json.read_text(encoding="utf-8"))
             blues = [b["image_bbox"] for b in (data.get("selection_blocks") or [])
                      if not b.get("page_scale")]
-        stats["page"].append(page)
-        stats["blue"].append(len(blues))
-        stats["paddle"].append(sum(1 for it in paddle_items if "error" not in it))
-        stats["ctd"].append(len(ctd_items or []))
-        stats["miss_paddle"].append(sum(1 for bb in blues
-                                        if _uncovered(bb, paddle_items)))
-        stats["miss_ctd"].append(sum(1 for bb in blues
-                                     if _uncovered(bb, ctd_items or [])))
+        per_page["page"].append(page)
+        per_page["blue"].append(len(blues))
+        per_page["paddle"].append(len(paddle_items))
+        per_page["ctd"].append(len(ctd_items or []))
+        per_page["miss_paddle"].append(sum(1 for bb in blues
+                                           if _uncovered(bb, paddle_items)))
+        per_page["miss_ctd"].append(sum(1 for bb in blues
+                                        if _uncovered(bb, ctd_items or [])))
+        for engine, items in (("paddle", paddle_items), ("ctd", ctd_items)):
+            if items is None:
+                continue
+            for item in items:
+                if _is_true_positive(item["poly"], blues):
+                    metrics[engine]["tp"] += 1
+                else:
+                    metrics[engine]["fp"] += 1
+            metrics[engine]["fn"] += sum(1 for bb in blues if _uncovered(bb, items))
         compose(page, book / "check" / f"{page}.bluebox_check.png",
                 book / "dataset" / page / "original.jpg",
                 paddle_items,
                 out_dir / f"{page}_对比.png", args.width, ctd_items=ctd_items)
         print(f"compose {i}/{len(pages)} page {page}", flush=True)
 
-    print("\n=== 每页框数（蓝框 / PaddleOCR / CTD | 蓝框漏检 P / C）===")
-    for page, b, p, c, mp, mc in zip(stats["page"], stats["blue"],
-                                     stats["paddle"], stats["ctd"],
-                                     stats["miss_paddle"], stats["miss_ctd"]):
-        print(f"  page {page:>4}: {b:>3} / {p:>3} / {c:>3} | {mp} {mc}")
-    print(f"total: blue={sum(stats['blue'])} paddle={sum(stats['paddle'])} "
-          f"ctd={sum(stats['ctd'])}")
-    print(f"blue 漏检: paddle={sum(stats['miss_paddle'])} ctd={sum(stats['miss_ctd'])}")
+    stats = per_page
+    print("\n=== 每页框数（蓝框 / PaddleOCR | 蓝框漏检 P）===")
+    for page, b, p, mp in zip(stats["page"], stats["blue"],
+                              stats["paddle"], stats["miss_paddle"]):
+        print(f"  page {page:>4}: {b:>3} / {p:>3} | {mp}")
+    print(f"total: blue={sum(stats['blue'])} paddle={sum(stats['paddle'])}")
+    print("\n=== 精确率 / 召回率（引擎框落在蓝框内=真阳性，阈值 50%）===")
+    for engine, name in (("paddle", "PaddleOCR"), ("ctd", "CTD")):
+        m = metrics[engine]
+        if not (m["tp"] or m["fp"] or m["fn"]):
+            continue
+        precision = m["tp"] / (m["tp"] + m["fp"]) if m["tp"] + m["fp"] else 0.0
+        recall = m["tp"] / (m["tp"] + m["fn"]) if m["tp"] + m["fn"] else 0.0
+        print(f"  {name:<10} TP={m['tp']:<4} FP={m['fp']:<4} FN={m['fn']:<3} "
+              f"精确率={precision:.1%} 召回率={recall:.1%}")
     if paddle_err:
         print(f"paddle engine error: {paddle_err}", file=sys.stderr)
     return 0
