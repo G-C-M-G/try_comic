@@ -73,7 +73,10 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
                     设置后翻译优先 AI 整页批量，失败回退本地 Sakura；不设则全部走本地
 --ai-ocr-url <url>   AI OCR 视觉接口（OpenAI 兼容，如 GLM-4V/Qwen-VL；留空=本地 manga-ocr）
 --ai-ocr-model <name> AI OCR 视觉模型
---ai-ocr-api-key <key> AI OCR Key（或 AI_OCR_API_KEY 环境变量 / config/api_keys.json）--ocr-engine {auto,windows-ocr,paddle}  采集期遮罩页 OCR 引擎（默认 auto：Windows OCR 优先、
+--ai-ocr-api-key <key> AI OCR Key（或 AI_OCR_API_KEY 环境变量 / config/api_keys.json）
+--ai-ocr-workers <n>  AI OCR 并发请求数（默认 12，1 = 串行，护栏 32）。实测
+                    （deepseek-flash）：1 路 1.91s/框 → 8 路 0.20s/框（9×）→
+                    16 路 0.10s/框（19×）→ 24 路反而退化；撞 429 就调小--ocr-engine {auto,windows-ocr,paddle}  采集期遮罩页 OCR 引擎（默认 auto：Windows OCR 优先、
                     Paddle 兜底；强制指定某引擎时，不可用/读不出即报错停止，不回退）
 --stage2-engine {manga-ocr,ai-ocr}  stage2 读蓝框文字引擎（默认 manga-ocr；ai-ocr 需配置
                     --ai-ocr-url/--ai-ocr-model/--ai-ocr-api-key，未配置即报错）
@@ -100,6 +103,13 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
   翻译命中缓存天然跳过已翻内容；**OCR 读数缓存**（`ocr_readings.json`）
   使重跑跳过已识别的框——断点续跑近乎零成本。
 - 单页失败不中断整批：失败页记录并在 PDF 中保持原图。
+- `--overwrite` 会先清掉选中页的读数/译文再重做，所以它**会先把 `translations.json` /
+  `ocr_readings.json` 备份成 `*.bak`**（打印路径）：中途失败（进程被杀/断网/额度不足）
+  只会丢"没重做出来的"，不会连旧的也没了；回滚 = 把 `.bak` 改回原名。
+- `--images` 指向哪：原图目录（推荐，书名 = 目录名）。只跑 `--process/--stage` 时
+  也可以直接指 `outputs/oneclick/{书名}`（产物即输入）；指错目录时会给出提示而不是
+  只报 "no images found"。**注意同一个书目录不要并发跑两个 `--overwrite`**，
+  两个进程会互相清空/重建同一批产物。
 - `--max-workers 1-3`：翻译+嵌字按页并行（AI 在线翻译收益最明显）。
 
 ## 四、采集注意事项（重要）

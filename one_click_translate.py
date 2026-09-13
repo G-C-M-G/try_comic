@@ -56,6 +56,7 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 from PIL import Image, ImageDraw
 
+from manga_localizer.ai_ocr import DEFAULT_WORKERS as AI_OCR_DEFAULT_WORKERS
 from manga_localizer.text_rules import is_sfx_like
 from manga_localizer.thresholds import (
     SFX_MAX_FONT_SIZE,
@@ -119,6 +120,40 @@ def _parse_pages(value: str | None) -> set[str] | None:
         else:
             pages.add(str(int(item)) if item.isdigit() else item)
     return pages
+
+
+def _pages_from_dataset(out_root: Path, pages_set: set[str] | None) -> list[str]:
+    """只跑 stage2 时的页清单：取自既有 dataset（页名 = 原图 stem）。
+
+    用户把 `--images` 指到产物目录（`outputs/oneclick/{书名}`）时用它继续——
+    产物即契约，stage2 的输入本来就是 dataset，不需要原图。
+    """
+    dataset_dir = out_root / "dataset"
+    if not dataset_dir.is_dir():
+        return []
+    return sorted(
+        (
+            path.name for path in dataset_dir.iterdir()
+            if path.is_dir() and (path / "islands.json").is_file()
+            and (pages_set is None or path.name in pages_set)
+        ),
+        key=_page_sort_key,
+    )
+
+
+def _output_dir_hint(images: Path) -> str:
+    """`--images` 指到产物目录时的可执行提示（最常见的误操作）。"""
+    markers = [name for name in ("capture", "dataset", "check", "typeset")
+               if (images / name).is_dir()]
+    if not markers:
+        return ""
+    return (
+        f"提示：{images} 看起来是**输出目录**（含 {'/'.join(markers)} 产物），"
+        "不是原图目录。\n"
+        f"      --images 要指向原图（如 漫画翻译/原文/{{{images.name}}}），书名取该目录名；\n"
+        f"      产物在 outputs/oneclick/{images.name}/ 下，重采需要原图目录，\n"
+        "      只重做 stage2 可以继续指产物目录（需要其中有 dataset/*/islands.json）。"
+    )
 
 
 def _is_black_page(image_path: Path, dark_ratio: float = 0.90) -> bool:
@@ -696,19 +731,41 @@ def _purge_page_artifacts(out_root: Path, pages: list[str], *,
         if path.is_file():
             payload = _load_readings_cache(out_root)
             stale = [key for key in payload if key.split(":", 1)[0] in selected]
-            for key in stale:
-                del payload[key]
             if stale:
+                _backup_before_purge(path)
+                for key in stale:
+                    del payload[key]
                 _write_cache_json(path, payload)
     if translations:
         path = out_root / "translations.json"
         if path.is_file():
             payload = _load_translations(out_root)
             stale = [page for page in payload if page in selected]
-            for page in stale:
-                del payload[page]
             if stale:
+                _backup_before_purge(path)
+                for page in stale:
+                    del payload[page]
                 _write_cache_json(path, payload)
+
+
+def _backup_before_purge(path: Path) -> Path:
+    """清空产物前先留一份 ``*.bak``（`--overwrite` 的安全网）。
+
+    `--overwrite` 在 stage2 开头就删掉选中页的读数/译文，而重新生成它们要跑完
+    OCR + 翻译。中途失败（进程被杀、断网、Key 失效、额度不足）就会**只丢不进**：
+    实测踩到过一次——24 页译文被清空，只剩一个 ``{}``，等于白花钱重翻。
+    有了这份备份，最坏情况也只是回滚到本次运行前。
+    """
+    import shutil
+
+    backup = path.with_suffix(path.suffix + ".bak")
+    try:
+        shutil.copyfile(path, backup)
+    except OSError:
+        return path
+    print(f"!! --overwrite 前已备份：{backup.name}（失败可回滚）")
+    return backup
+
 
 
 def _page_units(dataset_dir: Path, page: str) -> dict | None:
@@ -772,8 +829,9 @@ def run_manga(
     ai_ocr_url: str = "",
     ai_ocr_model: str = "",
     ai_ocr_api_key: str = "",
+    ai_ocr_workers: int = AI_OCR_DEFAULT_WORKERS,
     stage2_engine: str = "manga-ocr",
-) -> dict:
+) -> tuple[dict, set[str]]:
     """OCR every crop: AI vision model when configured, else manga-ocr.
 
     The AI path (OpenAI-compatible vision, e.g. GLM-4V / Qwen-VL) posts
@@ -800,7 +858,7 @@ def run_manga(
 
             readings = ai_ocr_readings(
                 misses, ai_ocr_url, ai_ocr_model, ai_ocr_api_key,
-                progress=progress,
+                progress=progress, max_workers=ai_ocr_workers,
             )
             # 失败的框回退 **manga-ocr**（不是 Sakura —— Sakura 是翻译层）。
             # 视觉模型读不出的往往是风格化小字，本地 OCR 至少还能给出候选，
@@ -822,7 +880,7 @@ def run_manga(
 
         readings = ai_ocr_readings(
             misses, ai_ocr_url, ai_ocr_model, ai_ocr_api_key,
-            progress=progress,
+            progress=progress, max_workers=ai_ocr_workers,
         )
     elif misses:
         readings = _run_manga_subprocess(misses, out_root, progress)
@@ -1310,6 +1368,7 @@ def stage2_process(
     ai_ocr_url: str = "",
     ai_ocr_model: str = "",
     ai_ocr_api_key: str = "",
+    ai_ocr_workers: int = AI_OCR_DEFAULT_WORKERS,
     stage2_engine: str = "manga-ocr",
     box_source: str = "paddle",
     drop_large_boxes: bool = True,
@@ -1364,7 +1423,8 @@ def stage2_process(
     page_texts, page_directions, dropped_boxes = _stage2_ocr(
         out_root, active_pages, progress=progress, overwrite=overwrite,
         ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
-        ai_ocr_api_key=ai_ocr_api_key, stage2_engine=stage2_engine,
+        ai_ocr_api_key=ai_ocr_api_key, ai_ocr_workers=ai_ocr_workers,
+        stage2_engine=stage2_engine,
     )
     translations = _stage2_translate(
         out_root, active_pages, page_texts, progress=progress,
@@ -1575,6 +1635,7 @@ def _stage2_ocr(out_root: Path, pages: list[str], *,
                 progress: "ProgressFile", overwrite: bool = False,
                 ai_ocr_url: str = "", ai_ocr_model: str = "",
                 ai_ocr_api_key: str = "",
+                ai_ocr_workers: int = AI_OCR_DEFAULT_WORKERS,
                 stage2_engine: str = "manga-ocr") -> tuple[dict, dict, dict]:
     """OCR the blue boxes (manga/AI) and derive page texts/directions.
 
@@ -1631,7 +1692,8 @@ def _stage2_ocr(out_root: Path, pages: list[str], *,
     readings, fallback_ids = run_manga(
         crops, out_root, progress=progress,
         ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
-        ai_ocr_api_key=ai_ocr_api_key, stage2_engine=stage2_engine,
+        ai_ocr_api_key=ai_ocr_api_key, ai_ocr_workers=ai_ocr_workers,
+        stage2_engine=stage2_engine,
     )
 
     # Second pass: reread the boxes manga-ocr read empty once.  A box that
@@ -1655,7 +1717,8 @@ def _stage2_ocr(out_root: Path, pages: list[str], *,
         reread_readings, reread_fallbacks = run_manga(
             rereads, out_root, progress=progress,
             ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
-            ai_ocr_api_key=ai_ocr_api_key, stage2_engine=stage2_engine,
+            ai_ocr_api_key=ai_ocr_api_key, ai_ocr_workers=ai_ocr_workers,
+            stage2_engine=stage2_engine,
         )
         fallback_ids |= reread_fallbacks
         for crop in rereads:
@@ -1823,6 +1886,12 @@ def _stage2_translate(out_root: Path, pages: list[str],
     _store_translations(out_root, translations)
     if failed:
         print(f"!! 翻译失败页（未写入 translations.json）: {', '.join(failed)}")
+        backup = out_root / "translations.json.bak"
+        if backup.is_file():
+            print(
+                f"!! 旧译文仍在 {backup.name}：本次失败的页没有新译文，"
+                f"要回滚就把 {backup.name} 改名回 translations.json"
+            )
     _sync_sfx_glossary(out_root, texts, translations, progress,
                        min_count=sfx_glossary_min_count)
     return translations
@@ -2721,6 +2790,13 @@ def main(argv=None) -> int:
         help="AI OCR vision model name",
     )
     parser.add_argument(
+        "--ai-ocr-workers", type=int, default=AI_OCR_DEFAULT_WORKERS,
+        help="AI OCR 并发请求数（默认 %(default)s，1 = 串行，护栏 32）。实测"
+             "（deepseek-flash）：1 路 1.91s/框 → 8 路 0.20s/框（9×）→ 16 路 "
+             "0.10s/框（19×）→ 24 路反而退化，故默认 12；机器/账号给力可调高，"
+             "撞 429 就调小",
+    )
+    parser.add_argument(
         "--ai-ocr-api-key",
         default="",
         help="AI OCR API key (or AI_OCR_API_KEY env)",
@@ -2871,8 +2947,20 @@ def main(argv=None) -> int:
          and (pages_set is None or path.stem in pages_set)),
         key=lambda item: int(item) if item.isdigit() else item.lower(),
     )
+    if not pages and (args.process or args.stage):
+        # 只跑 stage2 时产物才是输入：用户把 --images 指到 outputs/oneclick/{书名}
+        # （产物目录）也能跑——页名与原图 stem 一一对应，直接按既有 dataset 继续。
+        pages = _pages_from_dataset(out_root, pages_set)
+        if pages:
+            print(
+                f"注意：{images} 里没有图片，按既有产物继续（{len(pages)} 页）："
+                f"{out_root.name}/dataset"
+            )
     if not pages:
         print(f"no images found in {images}", file=sys.stderr)
+        hint = _output_dir_hint(images)
+        if hint:
+            print(hint, file=sys.stderr)
         return 2
 
     if not args.process and not args.stage:
@@ -2937,6 +3025,7 @@ def main(argv=None) -> int:
         ai_ocr_api_key=args.ai_ocr_api_key
         or os.environ.get("AI_OCR_API_KEY", "")
         or _config.get("ai_ocr_api_key", ""),
+        ai_ocr_workers=args.ai_ocr_workers,
         stage2_engine=args.stage2_engine,
         drop_large_boxes=not args.keep_large_boxes,
         sfx_min_side_ratio=args.sfx_min_side_ratio,

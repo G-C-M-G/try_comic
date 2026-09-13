@@ -97,6 +97,9 @@ robocopy config backups\<日期>\config /E /XF api_keys.json
 
 # 重新打包 exe（先关闭正在运行的 exe）
 venv\Scripts\python.exe -m PyInstaller "漫画翻译软件.spec" --noconfirm
+# 调试用快启动版（onedir：启动无需解压 136MB，窗口秒开）：
+venv\Scripts\python.exe -m PyInstaller "漫画翻译软件_onedir.spec" --noconfirm
+#   成品 dist\gui\gui.exe（GUI 会自己往上找项目根，不需要放在 dist/ 根）
 
 # 可清理冗余（勿删 dataset/typeset/ocr_readings.json/翻译缓存）
 #   - 书目录下 crops.*.json、_logs/、旧调试图（*.erased.png 等）、旧格式 *.bluebox_check.jpg

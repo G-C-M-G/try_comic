@@ -389,3 +389,68 @@ class TranslationsStoreMergeTests(unittest.TestCase):
             _store_translations(root, {"1": {"island_001": "新甲"}})
             saved = _load_translations(root)
             self.assertEqual(saved["1"], {"island_001": "新甲"})
+
+
+class PurgeBackupTests(unittest.TestCase):
+    """`--overwrite` 清空产物前必须先备份（失败可回滚）。
+
+    背景：`--overwrite` 在 stage2 开头就删掉选中页的读数/译文，而重新生成要跑完
+    OCR + 翻译；中途失败就是"只丢不进"（实测 24 页译文被清成 {}）。
+    """
+
+    def setUp(self):
+        import json
+        import tempfile
+
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "translations.json").write_text(
+            json.dumps(
+                {"1": {"island_001": "甲"}, "2": {"island_002": "乙"}},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (self.root / "ocr_readings.json").write_text(
+            json.dumps({"1:box:a": "あ", "2:box:b": "い"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _purge(self, pages):
+        from one_click_translate import _purge_page_artifacts
+
+        _purge_page_artifacts(self.root, pages, capture=False, dataset=False,
+                              readings=True, translations=True)
+
+    def _load(self, name):
+        import json
+
+        return json.loads((self.root / name).read_text(encoding="utf-8"))
+
+    def test_backup_written_before_purge(self):
+        self._purge(["1"])
+        self.assertEqual(self._load("translations.json"), {"2": {"island_002": "乙"}})
+        self.assertEqual(
+            self._load("translations.json.bak"),
+            {"1": {"island_001": "甲"}, "2": {"island_002": "乙"}},
+        )
+        self.assertEqual(self._load("ocr_readings.json.bak"),
+                         {"1:box:a": "あ", "2:box:b": "い"})
+
+    def test_failed_rerun_keeps_the_backup(self):
+        """失败后重跑（文件已空）不能覆盖掉可回滚的那份备份。"""
+        self._purge(["1"])
+        before = (self.root / "translations.json.bak").read_text(encoding="utf-8")
+        # 第二次：这两个键已不存在 → 不该产生新备份
+        self._purge(["1"])
+        self.assertEqual(
+            (self.root / "translations.json.bak").read_text(encoding="utf-8"), before,
+        )
+
+    def test_no_backup_when_nothing_to_remove(self):
+        self._purge(["999"])
+        self.assertFalse((self.root / "translations.json.bak").exists())
+        self.assertEqual(len(self._load("translations.json")), 2)
+
+    def test_pages_not_selected_untouched(self):
+        self._purge(["2"])
+        self.assertEqual(self._load("translations.json"), {"1": {"island_001": "甲"}})

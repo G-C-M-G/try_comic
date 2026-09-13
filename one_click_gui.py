@@ -43,18 +43,17 @@ from PySide6.QtWidgets import (
 )
 
 def _find_root() -> Path:
-    """Project root containing venv/one_click_translate.py.
+    """Project root containing venv/（exe 在哪一层都能找到）。
 
-    In PyInstaller onefile mode ``__file__`` points at the temp extraction
-    dir, so resolve from the exe location instead and walk up until the
-    venv is found (exe sits in ``dist/``, venv one level up).
+    打包运行时 ``__file__`` 指向临时解压目录，所以从 **exe 位置**往上找：
+    onefile 放在 ``dist/``（上一层就是项目根），onedir 放在
+    ``dist/<名字>/``（要上溯两层）—— 统一按最多 4 层祖先扫描，比写死层数稳。
     """
     if getattr(sys, "frozen", False):
         base = Path(sys.executable).resolve().parent
-        candidates = [base, base.parent]
     else:
         base = Path(__file__).resolve().parent
-        candidates = [base]
+    candidates = [base, *(base.parents[:4])]
     for candidate in candidates:
         if (candidate / "venv" / "Scripts" / "python.exe").is_file():
             return candidate
@@ -925,6 +924,14 @@ class MainWindow(QMainWindow):
             "拟声框在原图里又大又粗，字号若跟着框走会嵌出一个盖过对白的巨型"
             "中文拟声；\n上限只封顶不放大（框小仍按框自适应）。"
         )
+        self.ai_ocr_workers_spin = QSpinBox()
+        self.ai_ocr_workers_spin.setRange(1, 32)
+        self.ai_ocr_workers_spin.setValue(12)
+        self.ai_ocr_workers_spin.setToolTip(
+            "AI OCR 并发请求数（默认 12，1 = 串行，护栏 32）。\n"
+            "实测 1 路 1.91s/框 → 8 路 0.20s/框（9×）→ 16 路 0.10s/框（19×），"
+            "24 路反而退化。\n机器或账号更给力可以调高，撞服务端限流（429）就调小。"
+        )
         self.sfx_glossary_spin = QSpinBox()
         self.sfx_glossary_spin.setRange(0, 20)
         self.sfx_glossary_spin.setValue(2)
@@ -1045,6 +1052,7 @@ class MainWindow(QMainWindow):
         _row("字号下限（px）", self.min_font_spin)
         _row("拟声词字号上限（px）", self.sfx_font_spin)
         _row("拟声词进术语库门槛（次）", self.sfx_glossary_spin)
+        _row("AI OCR 并发（默认 8）", self.ai_ocr_workers_spin)
         _row("字体", self.font_combo)
         _row("描边粗细（字号÷N，大=细，默认 10）", self.stroke_spin)
         _row("行间距（横排，字号÷N，默认 4）", self.row_gap_spin)
@@ -1109,6 +1117,9 @@ class MainWindow(QMainWindow):
         self.sfx_font_spin.setValue(self._int_setting(data, "sfx_max_font_size", 30))
         self.sfx_glossary_spin.setValue(
             self._int_setting(data, "sfx_glossary_min_count", 2)
+        )
+        self.ai_ocr_workers_spin.setValue(
+            self._int_setting(data, "ai_ocr_workers", 12)
         )
         font = data.get("font_name", "msyh.ttc")
         index = self.font_combo.findData(font)
@@ -1221,6 +1232,7 @@ class MainWindow(QMainWindow):
             "min_font_size": self.min_font_spin.value(),
             "sfx_max_font_size": self.sfx_font_spin.value(),
             "sfx_glossary_min_count": self.sfx_glossary_spin.value(),
+            "ai_ocr_workers": self.ai_ocr_workers_spin.value(),
             "font_name": self.font_combo.currentData() or "msyh.ttc",
             "stroke_divisor": self.stroke_spin.value(),
             "row_gap_divisor": self.row_gap_spin.value(),
@@ -1799,6 +1811,7 @@ class MainWindow(QMainWindow):
         if ocr_url and ocr_model and ocr_key:
             args += ["--ai-ocr-url", ocr_url, "--ai-ocr-model", ocr_model,
                      "--ai-ocr-api-key", ocr_key]
+        args += ["--ai-ocr-workers", str(self.ai_ocr_workers_spin.value())]
         return args
 
     def _start_capture(self) -> None:
