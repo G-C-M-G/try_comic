@@ -39,11 +39,11 @@ from dataclasses import dataclass
 import math
 import time
 from pathlib import Path
-from typing import Mapping, Optional, Sequence, Tuple
+from typing import Collection, Mapping, Optional, Sequence, Tuple
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
-from .thresholds import STROKE_OVERFLOW_MARGIN
+from .thresholds import SFX_MAX_FONT_SIZE, STROKE_OVERFLOW_MARGIN
 from .text_rules import normalize_ellipsis
 from .errors import ErasureError, TypesettingError
 from .island_contract import IslandDataset, IslandInfo
@@ -126,6 +126,9 @@ class TypesetConfig:
     column_gap_divisor: int = COLUMN_GAP_DIVISOR
     row_gap_divisor: int = COLUMN_GAP_DIVISOR
     min_font_size: int = MIN_FONT_SIZE
+    # 拟声词字号上限（见 thresholds.SFX_MAX_FONT_SIZE 的说明）。只作用于
+    # 被判定为拟声词的岛，且只封顶不放大。
+    sfx_max_font_size: int = SFX_MAX_FONT_SIZE
     padding: int = 0
 
     def tracking(self, size: int) -> int:
@@ -393,6 +396,62 @@ def _block_metrics(
     return bbox, centre
 
 
+
+# 符号回退字体：主字体（雅黑等）缺 ♡ ♥ ♪ ♫ ❤ ∀ 这类字形，会画成豆腐块 □。
+# 逐字挑选第一个"有该字形"的字体——中文仍用主字体，符号交给符号字体。
+# 判定用"与私用区字符的渲染结果比对"（豆腐块的位图是固定的），结果按
+# (字体, 字符) 缓存，只在首次遇到某符号时算一次。
+FONT_FALLBACKS = (
+    r"C:\Windows\Fonts\seguisym.ttf",   # Segoe UI Symbol：♡♥♪♫❤∀ 全覆盖
+    r"C:\Windows\Fonts\seguiemj.ttf",   # Segoe UI Emoji：兜底
+)
+_TOFU_REF = ""                        # 私用区：字体必然没有的字形
+
+
+class _FontChain:
+    """按字符挑字体：主字体 → 回退字体（缺字形则跳过）。"""
+
+    def __init__(self, primary: str, size: int,
+                 fallbacks: Sequence[str] = FONT_FALLBACKS) -> None:
+        self._primary = ImageFont.truetype(primary, size=size)
+        self._size = size
+        self._fallbacks: list = []
+        for path in fallbacks:
+            try:
+                self._fallbacks.append(ImageFont.truetype(path, size=size))
+            except OSError:
+                continue        # 该回退字体不存在就跳过
+        self._cache: dict[str, object] = {}
+        self._tofu: dict[int, bytes] = {}
+
+    def _reference(self, font) -> bytes:
+        key = id(font)
+        if key not in self._tofu:
+            image = Image.new("L", (64, 64), 0)
+            ImageDraw.Draw(image).text((4, 4), _TOFU_REF, font=font, fill=255)
+            self._tofu[key] = image.tobytes()
+        return self._tofu[key]
+
+    def _has_glyph(self, font, char: str) -> bool:
+        image = Image.new("L", (64, 64), 0)
+        ImageDraw.Draw(image).text((4, 4), char, font=font, fill=255)
+        return image.tobytes() != self._reference(font)
+
+    def font_for(self, char: str):
+        """该字符该用哪个字体：主字体有就用它，否则第一个有字形的回退字体。"""
+        cached = self._cache.get(char)
+        if cached is not None:
+            return cached
+        chosen = self._primary
+        if not self._has_glyph(self._primary, char):
+            for fallback in self._fallbacks:
+                if self._has_glyph(fallback, char):
+                    chosen = fallback
+                    break
+        self._cache[char] = chosen
+        return chosen
+
+
 def _draw_slots(
     canvas: Image.Image,
     text: str,
@@ -401,7 +460,8 @@ def _draw_slots(
     config: TypesetConfig,
     direction: str = "vertical",
 ) -> ImageFont.ImageFont:
-    font = ImageFont.truetype(config.font_name, size=size)
+    # 主字体 + 符号回退（否则 ♡♥♪♫❤ 会被画成豆腐块 □）
+    fonts = _FontChain(config.font_name, size)
     draw = ImageDraw.Draw(canvas)
     stroke = config.stroke(size)
     step = _char_step(config, size)
@@ -431,12 +491,12 @@ def _draw_slots(
                 draw.text(
                     (x, y),
                     char,
-                    font=font,
+                    font=fonts.font_for(char),
                     fill=config.text_color,
                     stroke_width=stroke,
                     stroke_fill=config.stroke_color,
                 )
-        return font
+        return fonts._primary
     for slot in slots:
         top = slot.y_center - ((slot.char_count - 1) * step + size) / 2.0
         for j in range(slot.char_count):
@@ -450,12 +510,12 @@ def _draw_slots(
             draw.text(
                 (x, y),
                 char,
-                font=font,
+                font=fonts.font_for(char),
                 fill=config.text_color,
                 stroke_width=stroke,
                 stroke_fill=config.stroke_color,
             )
-    return font
+    return fonts._primary
 
 
 def _fit_size(
@@ -467,6 +527,7 @@ def _fit_size(
     direction: str = "vertical",
     glyph_width_limit: Optional[float] = None,
     glyph_height_limit: Optional[float] = None,
+    sfx: bool = False,
 ) -> Tuple[int, Sequence[TypesetColumnSlot], Optional[float], Tuple[str, ...]]:
     """Single-path fit: a centred block laid out inside the ISLAND bbox.
 
@@ -494,6 +555,12 @@ def _fit_size(
         max_size = max(MIN_FONT_SIZE_MIN, min(max_size, int(glyph_width_limit)))
     if direction == "horizontal" and glyph_height_limit is not None and glyph_height_limit > 0:
         max_size = max(MIN_FONT_SIZE_MIN, min(max_size, int(glyph_height_limit)))
+    if sfx:
+        # 拟声词只封顶不放大：框小的时候仍按框自适应
+        max_size = max(
+            MIN_FONT_SIZE_MIN,
+            min(max_size, int(config.sfx_max_font_size)),
+        )
 
     gw = max(1, x2 - x1)
     gh = max(1, y2 - y1)
@@ -591,6 +658,7 @@ def _compute_island_plan(
     direction: str,
     config: TypesetConfig,
     union_overrides: Optional[Mapping[str, dict]] = None,
+    sfx: bool = False,
 ) -> dict:
     """Layout-only geometry for one island (no drawing, no pixel access).
 
@@ -610,6 +678,7 @@ def _compute_island_plan(
             direction=direction,
             glyph_width_limit=union.get("glyph_width_limit") if union else None,
             glyph_height_limit=union.get("glyph_height_limit") if union else None,
+            sfx=sfx,
         )
     except TypesettingError as error:
         return {
@@ -710,6 +779,7 @@ def typeset_island_page(
     ] = None,
     direction_overrides: Optional[Mapping[str, str]] = None,
     union_overrides: Optional[Mapping[str, dict]] = None,
+    sfx_islands: Optional[Collection[str]] = None,
 ) -> IslandTypesetResult:
     if erased.size != dataset.image_size:
         raise ErasureError(
@@ -717,6 +787,7 @@ def typeset_island_page(
         )
     started = time.perf_counter()
     canvas = erased.convert("RGB").copy()
+    sfx_ids = frozenset(sfx_islands or ())
     audits = []
     for island in dataset.islands:
         if island.id not in translations:
@@ -752,6 +823,7 @@ def typeset_island_page(
         plan = _compute_island_plan(
             island, text, direction, config,
             union_overrides=union_overrides,
+            sfx=island.id in sfx_ids,
         )
         if plan.get("block_bbox") is None:
             audits.append(

@@ -192,3 +192,75 @@ class HorizontalTypesetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SfxFontCapTests(unittest.TestCase):
+    """拟声词（短假名/符号）字号封顶，且只封顶不放大。
+
+    大拟声框在原图里又大又粗，字号若跟着框走会得到 60~120px 的中文拟声，
+    压过对白；封顶后固定在小注音量级。判定依据是**日文原文**，正常台词
+    不受影响。
+    """
+
+    def _big_island(self, tmp, size=(420, 420)):
+        return _dataset(
+            [("island_001", (100, 100, 100 + size[0], 100 + size[1]))], tmp
+        )
+
+    def _typeset(self, dataset, translations, sfx_islands, direction="vertical"):
+        erased = Image.new("RGB", dataset.image_size, (250, 250, 250))
+        return typeset_island_page(
+            erased, dataset, translations, [],
+            config=TypesetConfig(),
+            direction_overrides={"island_001": direction},
+            sfx_islands=sfx_islands,
+        )
+
+    def test_sfx_capped_at_configured_max(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = self._big_island(tmp)
+            result = self._typeset(
+                dataset, {"island_001": "夹紧♡"}, {"island_001"},
+            )
+            audit = result.audits[0]
+            self.assertLessEqual(audit.font_size, TypesetConfig().sfx_max_font_size)
+
+    def test_non_sfx_island_not_capped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = self._big_island(tmp)
+            result = self._typeset(
+                dataset, {"island_001": "夹紧♡"}, set(),
+            )
+            self.assertGreater(
+                result.audits[0].font_size, TypesetConfig().sfx_max_font_size,
+            )
+
+    def test_cap_is_configurable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = self._big_island(tmp)
+            erased = Image.new("RGB", dataset.image_size, (250, 250, 250))
+            result = typeset_island_page(
+                erased, dataset, {"island_001": "夹紧♡"}, [],
+                config=TypesetConfig(sfx_max_font_size=18),
+                direction_overrides={"island_001": "vertical"},
+                sfx_islands={"island_001"},
+            )
+            self.assertLessEqual(result.audits[0].font_size, 18)
+
+    def test_small_box_not_enlarged_by_cap(self):
+        """框本身就小：上限不该把字号放大（min(框, 上限)）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = _dataset([("island_001", (100, 100, 130, 180))], tmp)
+            result = self._typeset(
+                dataset, {"island_001": "夹紧♡"}, {"island_001"},
+            )
+            self.assertLessEqual(result.audits[0].font_size, 30)
+
+    def test_horizontal_sfx_capped_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = _dataset([("island_001", (60, 100, 580, 300))], tmp)
+            result = self._typeset(
+                dataset, {"island_001": "夹紧♡"}, {"island_001"},
+                direction="horizontal",
+            )
+            self.assertLessEqual(result.audits[0].font_size, 30)

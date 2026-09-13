@@ -11,7 +11,7 @@
 
 ```powershell
 # 环境（root venv 已含 PySide6/PIL/numpy/winrt/manga_ocr/jsonschema）
-venv\Scripts\python.exe -m unittest discover -s tests        # 242 项测试
+venv\Scripts\python.exe -m unittest discover -s tests        # 333 项测试
 
 # 图形界面（推荐：采集 / 处理 / 审核 / 预览 / 术语 / 设置 一站完成）
 venv\Scripts\python.exe one_click_gui.py

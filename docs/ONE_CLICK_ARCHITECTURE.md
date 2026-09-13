@@ -205,8 +205,19 @@ masked = 全页填充色 (BLUEBOX_FILL)
   `dropped_boxes`，此后**全线不参与**（不进句子拼接、不擦字、不嵌字）
   - 因为缓存只存非空读数（见 4.8），恒空的框每次运行都会重演"读→复读"，
     不会被缓存跳过
-- **AI OCR 补强（可选）**：manga-ocr 未读出的框（misses）若有配置 `ai_ocr_url/model/key`，
-  走 OpenAI 兼容视觉模型（`manga_localizer/ai_ocr.py`）复读，结果同样入缓存
+- **AI OCR 全量优先（可选）**：`--stage2-engine ai-ocr` 时**全部框**走 OpenAI 兼容视觉模型
+  （`manga_localizer/ai_ocr.py`，默认 DeepSeek `deepseek-flash`，配置在 `config/api_keys.json`
+  的 `ai_ocr_url/model/api_key`）。视觉模型**读空的框回退 manga-ocr**
+  （`_run_manga_subprocess`）——不是 Sakura，Sakura 是翻译层。手绘字/符号（♡）上视觉模型
+  明显强于字符级 manga-ocr
+- **回退读数可疑 → 不翻译（保留原文）**：回退框的读数若命中 `text_rules.suspicious_short_kana`
+  （纯假名/符号且 ≤6 字符），判为**假选框**写入 `dropped_boxes` → 不翻译、不擦字、不嵌字，
+  页面保持原样。实书实测依据：`ぎゅっ♡` 被 manga-ocr 读成 `どうし/どんな/どうやっ`，
+  再被翻成"为什么/什么样/怎么会"，语义全错还擦掉了原文，代价远大于保留日文
+  - 只作用于**回退**读数：视觉模型的读数不判（它读对了就是对的），正常 manga-ocr 读数也不判
+    （否则 `どうして` 这类合法短台词会被误杀）
+  - 智能体视角提示：这条与"`--stage2-engine ai-ocr`"配合才有意义——回退是低置信信号，
+    低置信 + 短假名 = 大概率是风格化拟声词
 
 ### 4.4 组拼接与方向 (page_texts / page_directions)
 - 组内蓝框按方向排序拼接为整句：
@@ -219,8 +230,27 @@ masked = 全页填充色 (BLUEBOX_FILL)
 - 引擎双级：**AI 整页批量优先**（`translate_page_batch`，OpenAI 兼容，默认 DeepSeek
   `https://api.deepseek.com/v1` + `deepseek-chat`，需 `--ai-api-key`/`config/api_keys.json`），
   失败/未配置 → **本地 Sakura 兜底**（`translate_island_page`，`http://127.0.0.1:8080/v1`，模型 `sukinishiro`）
-- AI 批量缓存 `translation_batch_cache/`（按页批量签名）；本地缓存 `translation_cache/`
+- AI 批量缓存 `translation_batch_cache/`（按页批量签名 = 页 + 岛文本 + 模型 + 温度 +
+  **术语表 sha + 提示词版本**）；本地缓存 `translation_cache/`
   （signature = 源文本 + 上下文 + 术语表 + 提示词版本）
+  - 术语表 sha 必须进签名：术语表是提示词的正文（拟声词自动收录会改它），不进签名就会出现
+    "改了术语表却命中旧缓存、改动毫无效果"（FORMAT_VERSION=2 起修正）
+- **提示词约束**：译文用于嵌进**大小固定**的文字框（框由原文字数/框尺寸决定），提示词要求
+  "长度以原文为准，日译中通常压到七成，宁短勿长，但不要为了压字数丢原意"。
+  注意**不设硬性字数上限**：实测 1222 对真实译文/原文的字数比 p50=0.75、p95=1.00、仅 4.6% 超 1.0×
+  （且全是 2~6 字的小感叹句），说明模型本身就压缩，硬卡上限只会伤到原意
+  - 改任一处翻译提示词 → 必须升 `PROMPT_VERSION`（translator.py）/ `ISLAND_PROMPT_VERSION`
+    （island_translate.py），否则旧缓存静默命中
+- **拟声词自动进术语库**（`manga_localizer/glossary_auto.py`）：译好且**译法稳定**的拟声词回灌
+  `config/glossary.json`，此后全书（含重跑）统一译法。三道护栏决定"只有准确的才进库"：
+  1. 原文必须是 `is_sfx_like`（纯假名/符号 ≤6 字）；2. 译文 ≤6 字且不在疑问词黑名单
+  （为什么/什么样/怎么会…——就是上面那类错读数的产物）；3. 同一原文 + 同一译法至少出现
+  `--sfx-glossary-min-count`（默认 2）次
+  - **冲突即撤出**：同一原文出现第二种译法 → 说明 AI 自己都没把握，自动条目撤出，
+    宁可每次现译也不锁死一个可能错的译法
+  - **手写条目永不覆盖**：note 不以「自动收录」开头的条目视为用户手写，只读不写
+  - 入库会改术语表 sha → 页级翻译缓存失效 → 下次运行按新术语表统一重译（收敛，不会每轮都失效）
+
 - 防护（`_validate_island_translation`）：
   - 空输出 / 原文照抄 → 拒绝
   - 泄漏提示词字段（本页前文/术语表/人名表/翻译成…）→ 拒绝
@@ -359,6 +389,11 @@ masked = 全页填充色 (BLUEBOX_FILL)
 - **首选下限 28px**：优先使用 ≥28px；28px 放不下时继续降到 12px 绝对下限
 - **竖排**：字号（=字宽）≤ 蓝框**扩 6px 后**的最窄宽（`glyph_width_limit` = min 扩框宽）
 - **横排**：字号（=字高）≤ 蓝框**扩 6px 后**的最矮高（`glyph_height_limit` = min 扩框高）
+- **拟声词额外封顶 `--sfx-max-font-size`（默认 30px）**：判定依据是**日文原文**命中
+  `text_rules.is_sfx_like`（纯假名/符号 ≤6 字），判定集合由上游 `page_texts` 传入
+  （`typeset_island_page(..., sfx_islands=...)`），**不靠译文猜**。只封顶不放大
+  （生效值 = min(框自适应值, 上限)）：拟声框原图里又大又粗，字号跟框走会嵌出一个
+  60~120px 的中文拟声盖过对白；正常台词不受影响
 
 ### 5.5 对齐与列位
 - **竖排**：列内字自上而下，**同一句（同一岛内）各列顶端对齐**（共享顶边）；列从右到左、以 B 中心整组居中均分（**不跟随各蓝框位置**）
@@ -369,6 +404,13 @@ masked = 全页填充色 (BLUEBOX_FILL)
 - 黑字白描边：stroke = max(1, 字号//10)
 - 字距 = 字号//16；列距/行距 = 字号//4
 - 字体 msyh.ttc；可选 `background_color`（每字后画纯色底块）
+- **符号字体回退（`_FontChain`）**：msyh 缺字形时按字符回退
+  `seguisym.ttf`（Segoe UI Symbol，覆盖 ♡♥♪♫❤∀）→ `seguiemj.ttf`。
+  缺字形判定 = 把字符渲染成位图与私用区字符 `\ue000`（必然是豆腐块 □）的位图比较，
+  **逐字符**取字体（`draw.text` 一次一个字符）——不是整串一个字体，
+  所以"夹紧♡"会是 msyh 画中文、seguisym 画 ♡。纯中文字体下 ♡ 会渲染成 □，
+  这是"原文有 ♡ 但成品是方框"的根因（不是 OCR 也不是翻译问题）
+
 
 ## 六、数据契约
 
@@ -419,6 +461,8 @@ outputs/oneclick/{书名}/
 ### 8.2 stage2 读字引擎（`one_click_translate.py`）
 - 参数 `--stage2-engine {manga-ocr,ai-ocr}`（GUI 设置页「读字引擎（嵌字前）」），默认 manga-ocr
 - `manga-ocr`：本地子进程读蓝框（配置了 AI OCR 时 AI 仍补读 misses，历史行为不变）
-- `ai-ocr`：全部框走 AI 视觉模型；未配置 `--ai-ocr-url/--ai-ocr-model/--ai-ocr-api-key`
-  → 抛 RuntimeError 报错停止
-- 接入点 `run_manga(..., stage2_engine=...)`；新引擎在此分支注册即可
+- `ai-ocr`：**全部框**走 AI 视觉模型；未配置 `--ai-ocr-url/--ai-ocr-model/--ai-ocr-api-key`
+  → 抛 RuntimeError 报错停止；视觉模型读空的框**回退 manga-ocr**（本地子进程，一次加载模型）
+  并记入 `fallback_ids`，交由 §4.3 的"可疑读数不翻译"规则判定
+- 接入点 `run_manga(..., stage2_engine=...) -> (readings, fallback_ids)`；新引擎在此分支注册即可
+  - 返回 `fallback_ids` 是**契约的一部分**：调用方靠它区分"视觉模型读的"与"回退读的"

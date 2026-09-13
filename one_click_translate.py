@@ -56,8 +56,11 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 from PIL import Image, ImageDraw
 
+from manga_localizer.text_rules import is_sfx_like
 from manga_localizer.thresholds import (
+    SFX_MAX_FONT_SIZE,
     STROKE_OVERFLOW_MARGIN,
+    SFX_GLOSSARY_MIN_COUNT,
     SFX_MIN_SIDE_PAGE,
     SFX_MIN_SIDE_RATIO,
     WHOLE_PAGE_AREA_RATIO,
@@ -785,6 +788,7 @@ def run_manga(
     """
     cached = _load_readings_cache(out_root)
     misses = _select_crop_misses(crops, cached)
+    fallback_ids: set[str] = set()
     if stage2_engine == "ai-ocr":
         if not (ai_ocr_url and ai_ocr_model and ai_ocr_api_key):
             raise RuntimeError(
@@ -798,6 +802,18 @@ def run_manga(
                 misses, ai_ocr_url, ai_ocr_model, ai_ocr_api_key,
                 progress=progress,
             )
+            # 失败的框回退 **manga-ocr**（不是 Sakura —— Sakura 是翻译层）。
+            # 视觉模型读不出的往往是风格化小字，本地 OCR 至少还能给出候选，
+            # 由调用方按"可疑读数"规则决定要不要用。
+            failed = [
+                crop for crop in misses
+                if not str(readings.get(crop["id"]) or "").strip()
+            ]
+            if failed:
+                if progress is not None:
+                    progress.log(f"ai-ocr 失败 {len(failed)} 框 → 回退 manga-ocr")
+                readings.update(_run_manga_subprocess(failed, out_root, progress))
+                fallback_ids = {crop["id"] for crop in failed}
         else:
             # all crops cached: nothing to read, even in forced ai-ocr mode
             readings = {}
@@ -818,7 +834,7 @@ def run_manga(
         result[crop["id"]] = str(
             readings.get(crop["id"]) or cached.get(crop["id"]) or ""
         )
-    return result
+    return result, fallback_ids
 
 
 def _run_manga_subprocess(
@@ -1311,6 +1327,8 @@ def stage2_process(
     stroke_color: str = "",
     background_color: str = "",
     max_workers: int = 1,
+    sfx_glossary_min_count: int = 2,
+    sfx_max_font_size: int | None = None,
     progress: "ProgressFile | None" = None,
     overwrite: bool = False,
 ) -> bool:
@@ -1352,11 +1370,14 @@ def stage2_process(
         out_root, active_pages, page_texts, progress=progress,
         overwrite=overwrite, ai_url=ai_url, ai_model=ai_model,
         ai_api_key=ai_api_key, max_workers=max_workers,
+        sfx_glossary_min_count=sfx_glossary_min_count,
     )
     return _stage2_typeset(
         out_root, images, pages, active_pages, translations,
         page_directions, dropped_boxes, progress=progress, resume=resume,
-        no_pdf=no_pdf, min_font_size=min_font_size, font_name=font_name,
+        no_pdf=no_pdf, min_font_size=min_font_size,
+        sfx_sources=page_texts, sfx_max_font_size=sfx_max_font_size,
+        font_name=font_name,
         stroke_divisor=stroke_divisor, row_gap_divisor=row_gap_divisor,
         column_gap_divisor=column_gap_divisor,
         tracking_divisor=tracking_divisor, text_color=text_color,
@@ -1607,7 +1628,7 @@ def _stage2_ocr(out_root: Path, pages: list[str], *,
         units[page] = unit
     progress.set_stage("ocr", total=len(crops))
     progress.sub_progress(0, len(crops), "manga-ocr")
-    readings = run_manga(
+    readings, fallback_ids = run_manga(
         crops, out_root, progress=progress,
         ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
         ai_ocr_api_key=ai_ocr_api_key, stage2_engine=stage2_engine,
@@ -1631,11 +1652,12 @@ def _stage2_ocr(out_root: Path, pages: list[str], *,
         )
     if rereads:
         progress.log(f"rereading {len(rereads)} empty boxes")
-        reread_readings = run_manga(
+        reread_readings, reread_fallbacks = run_manga(
             rereads, out_root, progress=progress,
             ai_ocr_url=ai_ocr_url, ai_ocr_model=ai_ocr_model,
             ai_ocr_api_key=ai_ocr_api_key, stage2_engine=stage2_engine,
         )
+        fallback_ids |= reread_fallbacks
         for crop in rereads:
             page, _, rest = crop["id"].partition(":box:")
             box_id = rest.removesuffix(":reread")
@@ -1646,8 +1668,40 @@ def _stage2_ocr(out_root: Path, pages: list[str], *,
             else:
                 dropped_boxes[page].add(box_id)
 
+    dropped_boxes = _demote_suspicious_fallbacks(
+        readings, dropped_boxes, fallback_ids, progress,
+    )
     page_texts, page_directions = build_page_texts(units, readings, dropped_boxes)
     return page_texts, page_directions, dropped_boxes
+
+
+def _demote_suspicious_fallbacks(
+    readings: dict[str, str],
+    dropped_boxes: dict[str, set[str]],
+    fallback_ids: set[str],
+    progress: "ProgressFile",
+) -> dict[str, set[str]]:
+    """AI OCR 失败回退 manga-ocr 后，可疑读数一律不翻译（保留原文）。
+
+    AI 视觉模型和图内文字识别模型都没把握的框，多半是风格化拟声词/语气词
+    （``ぎゅっ♡`` 被 manga-ocr 读成 ``どうし`` 再译成"为什么"）。这种读数
+    进翻译只会产出语义全错的中文并擦掉原文，代价比保留日文大，所以按
+    "假选框"处理：不翻译、不擦字、不嵌字，页面保持原样。
+    """
+    from manga_localizer.text_rules import suspicious_short_kana
+
+    demoted = 0
+    for crop_id in sorted(fallback_ids):
+        page, _, rest = crop_id.partition(":box:")
+        box_id = rest.removesuffix(":reread")
+        if box_id in dropped_boxes.get(page, set()):
+            continue
+        if suspicious_short_kana(readings.get(f"{page}:box:{box_id}", "")):
+            dropped_boxes.setdefault(page, set()).add(box_id)
+            demoted += 1
+    if demoted:
+        progress.log(f"回退读数可疑，保留原文 {demoted} 框（不翻译）")
+    return dropped_boxes
 
 
 def _translate_one_page(page: str, texts: dict[str, str], *,
@@ -1712,7 +1766,8 @@ def _stage2_translate(out_root: Path, pages: list[str],
                       progress: "ProgressFile", overwrite: bool = False,
                       ai_url: str = "https://api.deepseek.com/v1",
                       ai_model: str = "deepseek-chat", ai_api_key: str = "",
-                      max_workers: int = 1) -> dict[str, dict[str, str]]:
+                      max_workers: int = 1,
+                      sfx_glossary_min_count: int = 2) -> dict[str, dict[str, str]]:
     """Translate every given page and persist ``translations.json``.
 
     AI whole-page batch first, local Sakura fallback; the per-page result
@@ -1768,7 +1823,49 @@ def _stage2_translate(out_root: Path, pages: list[str],
     _store_translations(out_root, translations)
     if failed:
         print(f"!! 翻译失败页（未写入 translations.json）: {', '.join(failed)}")
+    _sync_sfx_glossary(out_root, texts, translations, progress,
+                       min_count=sfx_glossary_min_count)
     return translations
+
+
+def _sync_sfx_glossary(out_root: Path, texts: dict[str, dict[str, str]],
+                       translations: dict[str, dict[str, str]],
+                       progress: "ProgressFile",
+                       *, min_count: int = 2) -> dict:
+    """把本次译好、且译法稳定的拟声词收录进 ``config/glossary.json``。
+
+    收录后术语表 sha 变化 → 页级翻译缓存签名失效 → 下次运行（含全书重跑）
+    统一按收录的译法走。失败（读不了/写不了）不影响翻译结果。
+    """
+    from manga_localizer.glossary_auto import (
+        collect_observations,
+        empty_report,
+        sync_sfx_terms,
+    )
+
+    if min_count <= 0:
+        return empty_report()
+    observations = collect_observations(texts, translations)
+    if not observations:
+        return empty_report()
+    try:
+        report = sync_sfx_terms(
+            ROOT / "config" / "glossary.json", observations, min_count=min_count,
+        )
+    except OSError as error:  # noqa: BLE001 - 术语库写失败不该影响出图
+        progress.log(f"拟声词术语库更新失败: {error}")
+        return empty_report()
+    for key in ("added", "updated", "removed"):
+        items = report.get(key) or []
+        if items:
+            progress.log(f"拟声词术语库 {key}: {'、'.join(items)}")
+    if report.get("removed"):
+        # 译法冲突 → 撤出，避免锁死可能是错的译法
+        print(f"  拟声词译法不稳定，已撤出术语库: {'、'.join(report['removed'])}")
+    if report.get("added") or report.get("updated"):
+        print("  拟声词已收录进术语库（下次运行全书统一）："
+              + "、".join(report.get("added", []) + report.get("updated", [])))
+    return report
 
 def _stage2_typeset(out_root: Path, images: Path, pages: list[str],
                     active_pages: list[str],
@@ -1776,6 +1873,8 @@ def _stage2_typeset(out_root: Path, images: Path, pages: list[str],
                     page_directions: dict, dropped_boxes: dict, *,
                     progress: "ProgressFile", resume: bool = False,
                     no_pdf: bool = False, min_font_size: int | None = None,
+                    sfx_sources: dict[str, dict[str, str]] | None = None,
+                    sfx_max_font_size: int | None = None,
                     font_name: str = "", stroke_divisor: int | None = None,
                     row_gap_divisor: int | None = None,
                     column_gap_divisor: int | None = None,
@@ -1815,7 +1914,10 @@ def _stage2_typeset(out_root: Path, images: Path, pages: list[str],
             erase_and_typeset_page_with(
                 dataset_dir, typeset_dir, page, translations_page,
                 page_directions.get(page), dropped_boxes.get(page, set()),
-                min_font_size=min_font_size, font_name=font_name,
+                min_font_size=min_font_size,
+                sources=(sfx_sources or {}).get(page),
+                sfx_max_font_size=sfx_max_font_size,
+                font_name=font_name,
                 stroke_divisor=stroke_divisor, row_gap_divisor=row_gap_divisor,
                 column_gap_divisor=column_gap_divisor,
                 tracking_divisor=tracking_divisor,
@@ -1982,6 +2084,7 @@ def _run_stage2_single(stage: str, images: Path, out_root: Path,
             overwrite=overwrite, ai_url=kwargs["ai_url"],
             ai_model=kwargs["ai_model"], ai_api_key=kwargs["ai_api_key"],
             max_workers=kwargs["max_workers"],
+            sfx_glossary_min_count=kwargs.get("sfx_glossary_min_count", 2),
         )
         progress.done(ok=True)
         return True
@@ -2004,7 +2107,10 @@ def _run_stage2_single(stage: str, images: Path, out_root: Path,
         out_root, images, pages, translated, translations,
         page_directions, dropped_boxes, progress=progress,
         resume=kwargs["resume"], no_pdf=kwargs["no_pdf"],
-        min_font_size=kwargs["min_font_size"], font_name=kwargs["font_name"],
+        min_font_size=kwargs["min_font_size"],
+        sfx_sources=page_texts,
+        sfx_max_font_size=kwargs.get("sfx_max_font_size"),
+        font_name=kwargs["font_name"],
         stroke_divisor=kwargs["stroke_divisor"],
         row_gap_divisor=kwargs["row_gap_divisor"],
         column_gap_divisor=kwargs["column_gap_divisor"],
@@ -2265,6 +2371,8 @@ def _erased_image_for(page_dir: Path, source, active_dataset, extra_regions,
 def erase_and_typeset_page_with(
     dataset_dir, typeset_dir, page, translations, directions, dropped_boxes=None,
     min_font_size: int | None = None,
+    sources: dict[str, str] | None = None,
+    sfx_max_font_size: int | None = None,
     font_name: str | None = None,
     stroke_divisor: int | None = None,
     row_gap_divisor: int | None = None,
@@ -2343,6 +2451,11 @@ def erase_and_typeset_page_with(
     )
     config = TypesetConfig(
         min_font_size=min_font_size if min_font_size else TypesetConfig.min_font_size,
+        sfx_max_font_size=(
+            sfx_max_font_size
+            if sfx_max_font_size is not None
+            else TypesetConfig.sfx_max_font_size
+        ),
         font_name=font_name or TypesetConfig.font_name,
         stroke_divisor=stroke_divisor or TypesetConfig.stroke_divisor,
         row_gap_divisor=row_gap_divisor or TypesetConfig.row_gap_divisor,
@@ -2418,10 +2531,18 @@ def erase_and_typeset_page_with(
         dataset_dir / page, source, active_dataset, extra_regions,
         ErasureConfig(), 800.0,
     )
+    # 拟声词：判据用**日文原文**（不是译文）——短假名/符号才是拟声词，
+    # 正常台词一律不算。它们按 SFX_MAX_FONT_SIZE 封顶，避免大拟声框嵌出
+    # 一个巨型中文拟声盖过对白。
+    sfx_islands = {
+        island_id for island_id, source_text in (sources or {}).items()
+        if is_sfx_like(str(source_text))
+    }
     result = typeset_island_page(
         erased, canonical_dataset, translations, blue_lines, config=config,
         direction_overrides=directions,
         union_overrides=union_overrides,
+        sfx_islands=sfx_islands,
     )
     result.image.save(typeset_dir / f"{page}.typeset.png")
     return result
@@ -2471,6 +2592,19 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--sfx-min-side-page", type=float, default=SFX_MIN_SIDE_PAGE,
         help="大拟音绝对下限：框短边 > N × 页短边（默认 0.10）",
+    )
+    parser.add_argument(
+        "--sfx-max-font-size", type=int, default=SFX_MAX_FONT_SIZE,
+        help="拟声词嵌字字号上限（默认 %(default)s px）。拟声框在原图里往往"
+             "又大又粗，字号跟框走会盖过对白；上限只封顶不放大（框小仍按框"
+             "自适应）",
+    )
+    parser.add_argument(
+        "--sfx-glossary-min-count", type=int,
+        default=SFX_GLOSSARY_MIN_COUNT,
+        help="拟声词自动进术语库的门槛：同一原文 + 同一译法至少出现 N 次"
+             f"（默认 {SFX_GLOSSARY_MIN_COUNT}，0 = 关闭）。入库后全书统一"
+             "译法；同一原文出现两种译法时自动撤出（不锁死可能错的译法）",
     )
     parser.add_argument(
         "--box-source",
@@ -2807,6 +2941,8 @@ def main(argv=None) -> int:
         drop_large_boxes=not args.keep_large_boxes,
         sfx_min_side_ratio=args.sfx_min_side_ratio,
         sfx_min_side_page=args.sfx_min_side_page,
+        sfx_glossary_min_count=args.sfx_glossary_min_count,
+        sfx_max_font_size=args.sfx_max_font_size,
         resume=args.resume,
         no_pdf=args.no_pdf,
         min_font_size=args.min_font_size,

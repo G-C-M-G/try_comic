@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -267,6 +268,92 @@ class PageBatchTest(unittest.TestCase):
                 self.texts,
                 IslandTranslateConfig(precision="local"),
             )
+
+
+class BatchCacheGlossaryTests(unittest.TestCase):
+    """术语表进页级批量缓存签名。
+
+    术语是提示词的一部分（拟声词自动收录会改它）。不进签名就会出现
+    "改了术语表却命中旧缓存、改动毫无效果"——全书统一译法也就无从生效。
+    """
+
+    def setUp(self):
+        self.dataset = _dataset()
+        self.texts = {"island_001": "ぎゅっ♡", "island_002": "どの国も"}
+        self.config = IslandTranslateConfig(
+            precision="online",
+            online_base_url="https://api.example/v1",
+            online_model="deepseek-flash",
+        )
+        self.cache = PageBatchCache(
+            Path(__file__).resolve().parent / "tmp_batch_glossary_cache"
+        )
+
+    def _write_glossary(self, terms):
+        import json
+        import tempfile
+
+        path = Path(tempfile.mkdtemp()) / "glossary.json"
+        path.write_text(
+            json.dumps({"version": 1, "terms": terms}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_glossary_change_changes_signature(self):
+        from manga_localizer.translator import load_glossary
+
+        base = load_glossary(self._write_glossary({}))
+        with_term = load_glossary(
+            self._write_glossary({"ぎゅっ♡": {"translation": "夹紧♡"}})
+        )
+        first = self.cache.signature(self.dataset, self.texts, self.config, base)
+        second = self.cache.signature(self.dataset, self.texts, self.config, with_term)
+        self.assertNotEqual(first, second)
+
+    def test_same_glossary_same_signature(self):
+        from manga_localizer.translator import load_glossary
+
+        base = load_glossary(self._write_glossary({}))
+        self.assertEqual(
+            self.cache.signature(self.dataset, self.texts, self.config, base),
+            self.cache.signature(self.dataset, self.texts, self.config, base),
+        )
+
+    def test_glossary_change_busts_cache(self):
+        from manga_localizer.translator import load_glossary
+
+        path = self._write_glossary({})
+        calls = []
+
+        def chat_fn(messages):
+            calls.append(messages)
+            return "1: 夹紧♡\n2: 哪个国家"
+
+        try:
+            translate_page_batch(
+                self.dataset, self.texts, self.config,
+                glossary=load_glossary(path), cache=self.cache, chat_fn=chat_fn,
+            )
+            self.assertEqual(len(calls), 1)
+            # 术语表变了 → 旧译文是按旧提示词产生的，必须重新请求
+            path.write_text(
+                json.dumps(
+                    {"version": 1, "terms": {"ぎゅっ♡": {"translation": "夹紧♡"}}},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            second = translate_page_batch(
+                self.dataset, self.texts, self.config,
+                glossary=load_glossary(path), cache=self.cache, chat_fn=chat_fn,
+            )
+            self.assertFalse(second.cache_hit)
+            self.assertEqual(len(calls), 2)
+        finally:
+            for stale in self.cache.directory.glob("*.json"):
+                stale.unlink(missing_ok=True)
+            self.cache.directory.rmdir()
 
 
 if __name__ == "__main__":

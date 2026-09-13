@@ -917,6 +917,22 @@ class MainWindow(QMainWindow):
         self.min_font_spin = QSpinBox()
         self.min_font_spin.setRange(12, 80)
         self.min_font_spin.setValue(28)
+        self.sfx_font_spin = QSpinBox()
+        self.sfx_font_spin.setRange(12, 80)
+        self.sfx_font_spin.setValue(30)
+        self.sfx_font_spin.setToolTip(
+            "拟声词嵌字字号上限（默认 30）。\n"
+            "拟声框在原图里又大又粗，字号若跟着框走会嵌出一个盖过对白的巨型"
+            "中文拟声；\n上限只封顶不放大（框小仍按框自适应）。"
+        )
+        self.sfx_glossary_spin = QSpinBox()
+        self.sfx_glossary_spin.setRange(0, 20)
+        self.sfx_glossary_spin.setValue(2)
+        self.sfx_glossary_spin.setToolTip(
+            "拟声词自动进术语库的门槛（默认 2，0 = 关闭）。\n"
+            "同一原文 + 同一译法出现 N 次才收录，收录后全书统一译法；\n"
+            "同一原文出现两种译法时自动撤出（不锁死可能错的译法）。"
+        )
         self.font_combo = QComboBox()
         for name, file in (
             ("微软雅黑 msyh.ttc", "msyh.ttc"),
@@ -1027,6 +1043,8 @@ class MainWindow(QMainWindow):
         type_title = QLabel("嵌字", objectName="cardTitle")
         lay.addWidget(type_title)
         _row("字号下限（px）", self.min_font_spin)
+        _row("拟声词字号上限（px）", self.sfx_font_spin)
+        _row("拟声词进术语库门槛（次）", self.sfx_glossary_spin)
         _row("字体", self.font_combo)
         _row("描边粗细（字号÷N，大=细，默认 10）", self.stroke_spin)
         _row("行间距（横排，字号÷N，默认 4）", self.row_gap_spin)
@@ -1088,6 +1106,10 @@ class MainWindow(QMainWindow):
         index = self.paddle_device_combo.findData(device) if device else -1
         self.paddle_device_combo.setCurrentIndex(index if index >= 0 else 0)
         self.min_font_spin.setValue(self._int_setting(data, "min_font_size", 28))
+        self.sfx_font_spin.setValue(self._int_setting(data, "sfx_max_font_size", 30))
+        self.sfx_glossary_spin.setValue(
+            self._int_setting(data, "sfx_glossary_min_count", 2)
+        )
         font = data.get("font_name", "msyh.ttc")
         index = self.font_combo.findData(font)
         self.font_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -1197,6 +1219,8 @@ class MainWindow(QMainWindow):
             "stage2_engine": self.stage2_engine_combo.currentData(),
             "layout_region": self.region_edit.text().strip() or "2400x1400",
             "min_font_size": self.min_font_spin.value(),
+            "sfx_max_font_size": self.sfx_font_spin.value(),
+            "sfx_glossary_min_count": self.sfx_glossary_spin.value(),
             "font_name": self.font_combo.currentData() or "msyh.ttc",
             "stroke_divisor": self.stroke_spin.value(),
             "row_gap_divisor": self.row_gap_spin.value(),
@@ -1745,6 +1769,10 @@ class MainWindow(QMainWindow):
         args += ["--box-tolerance", str(self.box_tol_spin.value())]
         args += ["--box-area-ratio", str(self.box_area_spin.value() / 100.0)]
         args += ["--min-font-size", str(self.min_font_spin.value())]
+        args += ["--sfx-max-font-size", str(self.sfx_font_spin.value())]
+        args += [
+            "--sfx-glossary-min-count", str(self.sfx_glossary_spin.value()),
+        ]
         args += ["--font", self.font_combo.currentData() or "msyh.ttc"]
         args += ["--stroke-divisor", str(self.stroke_spin.value())]
         args += ["--row-gap-divisor", str(self.row_gap_spin.value())]

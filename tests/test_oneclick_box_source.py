@@ -543,3 +543,81 @@ class FilteredEmptyReviewGateTest(unittest.TestCase):
         pages, manifest = self._run(blocks)
         self.assertEqual(pages, ["1"])
         self.assertFalse(manifest["capture"].get("selection_empty_after_filter", False))
+
+
+class SfxGlossaryWiringTest(unittest.TestCase):
+    """翻译阶段把稳定的拟声词收录进术语库（_sync_sfx_glossary）。
+
+    端到端护栏：登录入库的原文必须是短拟声、译文短且非疑问词、且重复
+    出现同一译法；收录后 glossary.json 的 sha 变化（→ 页级翻译缓存失效），
+    否则"入库"对已缓存的页面毫无作用。
+    """
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.glossary = self.directory / "glossary.json"
+        self.glossary.write_text(
+            json.dumps({"version": 1, "terms": {}, "notes": []}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        patcher = mock.patch("one_click_translate.ROOT", self.directory)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+        (self.directory / "config").mkdir(exist_ok=True)
+        self.glossary.replace(self.directory / "config" / "glossary.json")
+
+    def _progress(self):
+        return mock.Mock()
+
+    def _sync(self, texts, translations, min_count=2):
+        from one_click_translate import _sync_sfx_glossary
+
+        return _sync_sfx_glossary(
+            self.directory, texts, translations, self._progress(),
+            min_count=min_count,
+        )
+
+    def _terms(self):
+        return json.loads(
+            (self.directory / "config" / "glossary.json").read_text(encoding="utf-8")
+        )["terms"]
+
+    def test_repeated_sfx_recorded(self):
+        texts = {"1": {"a": "ぎゅっ♡"}, "2": {"b": "ぎゅっ♡"}}
+        translations = {"1": {"a": "夹紧♡"}, "2": {"b": "夹紧♡"}}
+        report = self._sync(texts, translations)
+        self.assertEqual(report["added"], ["ぎゅっ♡"])
+        self.assertEqual(self._terms()["ぎゅっ♡"]["translation"], "夹紧♡")
+
+    def test_single_occurrence_not_recorded(self):
+        report = self._sync(
+            {"1": {"a": "ぎゅっ♡"}}, {"1": {"a": "夹紧♡"}},
+        )
+        self.assertEqual(report["added"], [])
+        self.assertEqual(self._terms(), {})
+
+    def test_misread_question_word_never_recorded(self):
+        """どうし → "为什么"（就是用户报的那个错）不许进库。"""
+        texts = {"1": {"a": "どうし"}, "2": {"b": "どうし"}}
+        translations = {"1": {"a": "为什么"}, "2": {"b": "为什么"}}
+        report = self._sync(texts, translations)
+        self.assertEqual(report["added"], [])
+        self.assertEqual(self._terms(), {})
+
+    def test_min_count_zero_disables(self):
+        texts = {"1": {"a": "ぎゅっ♡"}, "2": {"b": "ぎゅっ♡"}}
+        translations = {"1": {"a": "夹紧♡"}, "2": {"b": "夹紧♡"}}
+        report = self._sync(texts, translations, min_count=0)
+        self.assertEqual(report["added"], [])
+        self.assertEqual(self._terms(), {})
+
+    def test_recording_changes_glossary_sha(self):
+        from manga_localizer.translator import load_glossary
+
+        target = self.directory / "config" / "glossary.json"
+        before = load_glossary(target).sha256
+        self._sync(
+            {"1": {"a": "ぎゅっ♡"}, "2": {"b": "ぎゅっ♡"}},
+            {"1": {"a": "夹紧♡"}, "2": {"b": "夹紧♡"}},
+        )
+        self.assertNotEqual(before, load_glossary(target).sha256)

@@ -1,10 +1,11 @@
 """OCR engine selection (--ocr-engine / --stage2-engine) tests.
 
 Covers: forced capture-stage engine passthrough in ``stage1_capture``,
-forced ai-ocr stage2 validation/dispatch in ``run_manga``, the unchanged
-default manga-ocr dispatch, and the CLI wiring of both flags through
-``main()`` into the stage functions.  Everything is mocked: no real
-manga-ocr subprocess and no network.
+forced ai-ocr stage2 validation/dispatch in ``run_manga`` (all boxes to the
+vision model, failures falling back to manga-ocr), the unchanged default
+manga-ocr dispatch, and the CLI wiring of both flags through ``main()``
+into the stage functions.  Everything is mocked: no real manga-ocr
+subprocess and no network.
 """
 
 import tempfile
@@ -45,7 +46,7 @@ class RunMangaAiOcrTests(unittest.TestCase):
              mock.patch("manga_localizer.ai_ocr.ai_ocr_readings",
                         return_value={"1:box:a": "あ", "1:box:b": "い"}) as ai, \
              mock.patch("one_click_translate._run_manga_subprocess") as sub:
-            result = run_manga(
+            result, fallbacks = run_manga(
                 self.crops, self.root,
                 ai_ocr_url="https://vision.example",
                 ai_ocr_model="glm-4v",
@@ -53,12 +54,36 @@ class RunMangaAiOcrTests(unittest.TestCase):
                 stage2_engine="ai-ocr",
             )
             self.assertEqual(result, {"1:box:a": "あ", "1:box:b": "い"})
+            self.assertEqual(fallbacks, set())
             self.assertEqual(ai.call_args.args[0], self.crops)
             self.assertEqual(
                 ai.call_args.args[1:],
                 ("https://vision.example", "glm-4v", "secret"),
             )
             sub.assert_not_called()
+
+    def test_ai_ocr_failures_fall_back_to_manga_ocr(self):
+        """AI OCR 读空的框交给 manga-ocr（不是 Sakura），并记入 fallback_ids。"""
+        with mock.patch("one_click_translate._load_readings_cache",
+                        return_value={}), \
+             mock.patch("one_click_translate._select_crop_misses",
+                        return_value=self.crops), \
+             mock.patch("one_click_translate._store_readings_cache"), \
+             mock.patch("manga_localizer.ai_ocr.ai_ocr_readings",
+                        return_value={"1:box:a": "あ"}), \
+             mock.patch("one_click_translate._run_manga_subprocess",
+                        return_value={"1:box:b": "ぎゅっ"}) as sub:
+            result, fallbacks = run_manga(
+                self.crops, self.root,
+                ai_ocr_url="https://vision.example",
+                ai_ocr_model="glm-4v",
+                ai_ocr_api_key="secret",
+                stage2_engine="ai-ocr",
+            )
+            self.assertEqual(result, {"1:box:a": "あ", "1:box:b": "ぎゅっ"})
+            self.assertEqual(fallbacks, {"1:box:b"})
+            self.assertEqual([c["id"] for c in sub.call_args.args[0]],
+                             ["1:box:b"])
 
     def test_ai_ocr_forced_cache_hit_reads_nothing(self):
         with mock.patch("one_click_translate._load_readings_cache",
@@ -68,7 +93,7 @@ class RunMangaAiOcrTests(unittest.TestCase):
              mock.patch("one_click_translate._store_readings_cache") as store, \
              mock.patch("manga_localizer.ai_ocr.ai_ocr_readings") as ai, \
              mock.patch("one_click_translate._run_manga_subprocess") as sub:
-            result = run_manga(
+            result, fallbacks = run_manga(
                 self.crops, self.root,
                 ai_ocr_url="https://vision.example",
                 ai_ocr_model="glm-4v",
@@ -76,6 +101,7 @@ class RunMangaAiOcrTests(unittest.TestCase):
                 stage2_engine="ai-ocr",
             )
             self.assertEqual(result, {"1:box:a": "あ", "1:box:b": ""})
+            self.assertEqual(fallbacks, set())
             ai.assert_not_called()
             sub.assert_not_called()
             store.assert_called_once_with(self.root, {})
@@ -97,8 +123,9 @@ class RunMangaMangaOcrTests(unittest.TestCase):
              mock.patch("manga_localizer.ai_ocr.ai_ocr_readings") as ai, \
              mock.patch("one_click_translate._run_manga_subprocess",
                         return_value={"1:box:a": "あ"}) as sub:
-            result = run_manga(self.crops, self.root)
+            result, fallbacks = run_manga(self.crops, self.root)
             self.assertEqual(result, {"1:box:a": "あ"})
+            self.assertEqual(fallbacks, set())
             sub.assert_called_once()
             ai.assert_not_called()
 
@@ -111,7 +138,7 @@ class RunMangaMangaOcrTests(unittest.TestCase):
              mock.patch("manga_localizer.ai_ocr.ai_ocr_readings",
                         return_value={"1:box:a": "あ"}) as ai, \
              mock.patch("one_click_translate._run_manga_subprocess") as sub:
-            result = run_manga(
+            result, _fallbacks = run_manga(
                 self.crops, self.root,
                 ai_ocr_url="https://vision.example",
                 ai_ocr_model="glm-4v",
@@ -120,6 +147,69 @@ class RunMangaMangaOcrTests(unittest.TestCase):
             self.assertEqual(result, {"1:box:a": "あ"})
             ai.assert_called_once()
             sub.assert_not_called()
+
+
+class SuspiciousFallbackTests(unittest.TestCase):
+    """回退读数可疑 → 判定为假选框（不翻译、保留原文）。"""
+
+    def test_suspicious_fallback_dropped(self):
+        from one_click_translate import _demote_suspicious_fallbacks
+
+        progress = mock.Mock()
+        readings = {"1:box:a": "ぎゅっ♡", "1:box:b": "どうし"}
+        dropped = {"1": set()}
+        out = _demote_suspicious_fallbacks(
+            readings, dropped, {"1:box:a", "1:box:b"}, progress,
+        )
+        self.assertEqual(out["1"], {"a", "b"})
+        self.assertIn("保留原文", progress.log.call_args.args[0])
+
+    def test_normal_fallback_kept(self):
+        """回退读数正常（含汉字/长句）时照常翻译。"""
+        from one_click_translate import _demote_suspicious_fallbacks
+
+        progress = mock.Mock()
+        readings = {"1:box:a": "これはテスト用の長文"}
+        dropped = {"1": set()}
+        out = _demote_suspicious_fallbacks(
+            readings, dropped, {"1:box:a"}, progress,
+        )
+        self.assertEqual(out["1"], set())
+        progress.log.assert_not_called()
+
+    def test_non_fallback_readings_never_demoted(self):
+        """只有回退来的读数才走可疑规则（正常 manga-ocr 短假名不丢）。"""
+        from one_click_translate import _demote_suspicious_fallbacks
+
+        progress = mock.Mock()
+        readings = {"1:box:a": "どうして"}
+        dropped = {"1": set()}
+        out = _demote_suspicious_fallbacks(readings, dropped, set(), progress)
+        self.assertEqual(out["1"], set())
+        progress.log.assert_not_called()
+
+    def test_reread_suffix_id_stripped(self):
+        from one_click_translate import _demote_suspicious_fallbacks
+
+        progress = mock.Mock()
+        readings = {"1:box:a": "ぎゅっ♡"}
+        dropped = {"1": set()}
+        out = _demote_suspicious_fallbacks(
+            readings, dropped, {"1:box:a:reread"}, progress,
+        )
+        self.assertEqual(out["1"], {"a"})
+
+    def test_already_dropped_not_double_counted(self):
+        from one_click_translate import _demote_suspicious_fallbacks
+
+        progress = mock.Mock()
+        readings = {"1:box:a": "ぎゅっ♡"}
+        dropped = {"1": {"a"}}
+        out = _demote_suspicious_fallbacks(
+            readings, dropped, {"1:box:a"}, progress,
+        )
+        self.assertEqual(out["1"], {"a"})
+        progress.log.assert_not_called()
 
 
 class _FakeStream:

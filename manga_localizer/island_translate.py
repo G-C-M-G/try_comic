@@ -33,7 +33,7 @@ from .translator import (
 
 _LOG = logging.getLogger("manga_localizer.island_translate")
 
-ISLAND_PROMPT_VERSION = "island-zh-dialogue-v1-whole-island"
+ISLAND_PROMPT_VERSION = "island-zh-dialogue-v2-whole-island-length"
 
 PRECISION_LOCAL = "local"
 PRECISION_ONLINE = "online"
@@ -258,7 +258,9 @@ def _island_messages(
                 "role": "system",
                 "content": (
                     "你是日文漫画对白翻译器。把下面日文台词翻译成自然、口语化的简体中文，"
-                    "拟声词译成中文拟声。只输出译文一行，不要解释、不要序号、不要引号。\n\n"
+                    "拟声词译成中文拟声。只输出译文一行，不要解释、不要序号、不要引号。"
+                    "译文用于嵌进固定的文字框，长度以原文为准（日译中通常压到七成），"
+                    "宁短勿长；但不要为了压字数丢掉原意。\n\n"
                     f"术语表/人名表：\n{glossary.prompt_text(request.source_text)}"
                 ),
             },
@@ -275,6 +277,8 @@ def _island_messages(
         "可能包含多句。请把它整体意译成自然、简洁、口语化的简体中文，保持人物语气与情绪；"
         "遇到生僻词、咒语、粗话、拟声词（SFX）时按中文语境自然处理，不要回避或加注；"
         "结合本页上下文理解指代，但不要翻译上下文，也不要添加原文没有的信息。"
+        "译文用于嵌进固定的文字框（大小由原文字数决定），长度以原文为准，"
+        "日译中通常压到七成，宁短勿长，但不要为了压字数丢原意。"
         "不要逐字硬译、不要拆列直译、不要输出解释、序号、引号或提示字段，只返回一行译文。"
         "句与句之间用中文标点分隔。\n\n"
         f"本页前文：\n{before}\n\n"
@@ -752,6 +756,8 @@ def _batch_messages(
         "编号即阅读顺序。请把每条整体意译成自然、简洁、口语化的简体中文，"
         "拟声词（SFX）译成中文拟声；结合整页上下文理解指代，不要翻译上下文；"
         "不要逐字硬译、不要加原文没有的信息、不要解释。"
+        "每条译文用于嵌进固定的文字框（大小由该条原文长度决定），"
+        "长度以各自原文为准，日译中通常压到七成，宁短勿长，但不要为了压字数丢原意。"
         "必须逐条输出，格式严格为每行一个『编号: 译文』，不要输出其他任何内容。\n\n"
         f"术语表/人名表：\n{glossary.prompt_text()}"
     )
@@ -806,7 +812,7 @@ def _parse_batch_response(
 class PageBatchCache:
     """Page-level cache for whole-page batched translations."""
 
-    FORMAT_VERSION = 1
+    FORMAT_VERSION = 2
 
     def __init__(self, directory: Path) -> None:
         self.directory = Path(directory).resolve()
@@ -816,6 +822,7 @@ class PageBatchCache:
         dataset: IslandDataset,
         texts: Mapping[str, str],
         config: IslandTranslateConfig,
+        glossary: Optional[Glossary] = None,
     ) -> str:
         ordered = sorted(
             (island for island in dataset.islands if island.id in texts),
@@ -830,6 +837,9 @@ class PageBatchCache:
             "model": config.online_model,
             "temperature": config.temperature,
             "prompt_version": ISLAND_PROMPT_VERSION,
+            # 术语表进签名：术语是提示词的一部分（拟声词自动收录会改它），
+            # 不进签名就会出现"改了术语表但命中旧缓存、改动毫无效果"。
+            "glossary_sha256": glossary.sha256 if glossary is not None else "",
             "texts": {island.id: str(texts[island.id]) for island in ordered},
         }
         return _canonical_sha256(data)
@@ -880,7 +890,7 @@ def translate_page_batch(
         key=lambda island: -island.image_bbox[2],
     )
     numbered = {index: island.id for index, island in enumerate(ordered, 1)}
-    key = active_cache.signature(dataset, texts, config)
+    key = active_cache.signature(dataset, texts, config, active_glossary)
     cached = active_cache.load(key)
     if cached is not None:
         return PageBatchResult(

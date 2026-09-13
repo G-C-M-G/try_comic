@@ -73,11 +73,19 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
                     设置后翻译优先 AI 整页批量，失败回退本地 Sakura；不设则全部走本地
 --ai-ocr-url <url>   AI OCR 视觉接口（OpenAI 兼容，如 GLM-4V/Qwen-VL；留空=本地 manga-ocr）
 --ai-ocr-model <name> AI OCR 视觉模型
---ai-ocr-api-key <key> AI OCR Key（或 AI_OCR_API_KEY 环境变量 / config/api_keys.json）
---ocr-engine {auto,windows-ocr,paddle}  采集期遮罩页 OCR 引擎（默认 auto：Windows OCR 优先、
+--ai-ocr-api-key <key> AI OCR Key（或 AI_OCR_API_KEY 环境变量 / config/api_keys.json）--ocr-engine {auto,windows-ocr,paddle}  采集期遮罩页 OCR 引擎（默认 auto：Windows OCR 优先、
                     Paddle 兜底；强制指定某引擎时，不可用/读不出即报错停止，不回退）
 --stage2-engine {manga-ocr,ai-ocr}  stage2 读蓝框文字引擎（默认 manga-ocr；ai-ocr 需配置
                     --ai-ocr-url/--ai-ocr-model/--ai-ocr-api-key，未配置即报错）
+                    ai-ocr = 全部框交视觉模型，读空的框回退 manga-ocr；回退读数若为
+                    短假名/符号（如 ぎゅっ♡）判为可疑 → 不翻译、保留原文
+--sfx-max-font-size <px>  拟声词嵌字字号上限（默认 30）。拟声框原图里又大又粗，字号跟框走
+                    会盖过对白；只封顶不放大（框小仍按框自适应）。判定用日文原文
+                    （纯假名/符号 ≤6 字），正常台词不受影响
+--sfx-glossary-min-count <n>  拟声词自动进术语库的门槛（默认 2，0 = 关闭）：同一原文 + 同一
+                    译法出现 n 次才收录进 config/glossary.json，此后全书统一译法；
+                    同一原文出现两种译法即自动撤出（不锁死可能错的译法）；
+                    用户手写的条目永不被覆盖或删除
 --resume             断点续跑：跳过已有 typeset 输出的页
 --overwrite          覆盖旧结果（与 --resume 互斥）：重采/重做选中页，自动清除旧产物，无需手动删除文件夹
 --bluebox-fill R,G,B  填黑图填充色（默认 0,0,0 黑；若文字非黑色可用白 255,255,255）

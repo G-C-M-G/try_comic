@@ -15,7 +15,7 @@ from .text_rules import normalize_ellipsis
 from .ocr_contract import OCRContract
 
 
-PROMPT_VERSION = "zh-manga-dialogue-v9-preferred-markers"
+PROMPT_VERSION = "zh-manga-dialogue-v10-length-and-box"
 CACHE_FORMAT_VERSION = 7
 TARGET_LANGUAGE = "zh-CN"
 
@@ -750,7 +750,9 @@ def _translation_messages(
                 "role": "system",
                 "content": (
                     "你是日文漫画对白翻译器。请意译成简洁、自然、符合中文口语习惯的简体中文。"
-                    "不要逐字硬译，不要添加原文没有的人称或解释，并尽量比原文简短。"
+                    "不要逐字硬译，不要添加原文没有的人称或解释，并尽量比原文简短"
+                    "（日译中通常压到七成；译文要嵌进固定大小的文字框，过长只能缩字号，"
+                    "但不要为了压字数丢原意）。"
                     "用户提供的是一条带<1>、<2>等列标记的完整台词。必须原样保留全部标记并按原顺序"
                     "放在对应中文片段前；这些片段共同组成一句译文，不得逐列孤立直译。"
                     "按中文口语补充必要标点，标点放在前一个语义片段末尾。"
