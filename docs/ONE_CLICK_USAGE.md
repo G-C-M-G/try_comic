@@ -38,7 +38,7 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
 > CLI 默认值见下表；**GUI 默认值与 CLI 不同**：并行窗口 6、显示缩放 42%。
 
 ```
---images <dir>      原图目录（默认：D:\workplace\opencode\try_comic\漫画翻译\原文\《甲书》）
+--images <dir>      原图目录（必填；书名 = 目录名）
 --pages <list>      页列表，如 "1-24" 或 "1,3,5"（采集与处理共用；单页重采见下文）
 --parallel <n>      Photos 并行窗口数（CLI 默认 3；GUI 默认 6；6 窗口布局为上3下3）
 --display-scale <p> 窗口显示缩放百分比（CLI 默认 25；GUI 默认 42：窗口=页面×42%，整页完整可见，
@@ -47,6 +47,13 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
 --layout-bottom-shift-up <px> 第二行上移量（贴底基础上，默认 0）
 --layout-row-spacing <px>    上下两排窗口的垂直间距（默认 200）
 --layout-right-gap <px>      最右列窗口距右边缘的间隙（默认 100，防弹出菜单遮挡）
+--scan-wait <s>      点"扫描文本"后到第一次抓帧的等待（默认 0.5）
+--scan-settle <s>    扫描文本界面稳定（边缘彩色 chrome 消失）的最长期限（默认 1.3）
+--select-wait <s>    Ctrl+A 后到抓帧的基础等待（逐次加倍，默认 0.45）
+--regrab-wait <s>    选区仍在渲染时的重抓间隔（默认 0.6）
+--focus-clear-pct <p> 移焦点标题栏点击点 = 扫描按钮中心向右偏移窗口宽度的百分比
+                     （默认 4；点击仍落在按钮/弹窗上时调大，GUI 设置页同名旋钮）
+                     （以上四个等待与偏移在 GUI 设置页「采集等待」分组可调）
 --capture-only      只跑 stage1（采集 + 核对图）
 --process           只跑 stage2（后台处理），跳过采集
 --stage {ocr,translate,typeset}  只跑 stage2 的某一个阶段（--pages 选出该阶段页；前置产物必须已存在，缺前置的页会跳过并提示）

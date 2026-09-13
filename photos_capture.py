@@ -387,7 +387,7 @@ def _move_mouse_off_button(window) -> None:
         pass
 
 
-def _click_focus_off_button(window) -> None:
+def _click_focus_off_button(window, clear_pct: float = 4.0) -> None:
     """Move keyboard focus off the scan-text button via a title-bar click.
 
     The hover reveal is only half the story: Photos keeps the button
@@ -396,12 +396,14 @@ def _click_focus_off_button(window) -> None:
     the window title bar relocates focus without touching the image area
     (a click inside the frame could cancel the Ctrl+A selection).
 
-    The click lands ONE TWELFTH of the window width to the RIGHT of the
-    scan-text button's centre (falling back to the right eighth of the
-    title bar when the button control cannot be fetched): clear of the
-    back-arrow/navigation on the left and away from the bottom-center
-    button itself.  Best-effort: any failure leaves the capture flow
-    untouched.
+    The click lands ``clear_pct`` percent of the window width to the RIGHT
+    of the scan-text button's centre (default 4 -- about 1/25 of the width;
+    raise it via ``--focus-clear-pct`` / the GUI capture settings when the
+    click still lands on the button or its popup, falling back to the
+    right eighth of the title bar when the button control cannot be
+    fetched): clear of the back-arrow/navigation on the left and away from
+    the bottom-center button itself.  Best-effort: any failure leaves the
+    capture flow untouched.
     """
     try:
         import ctypes
@@ -416,7 +418,7 @@ def _click_focus_off_button(window) -> None:
             # Button control unavailable: fall back to the right eighth.
             centre_x = x2 - window_w // 8
         ctypes.windll.user32.SetCursorPos(
-            centre_x + window_w // 25, y1 + 20
+            centre_x + int(window_w * clear_pct / 100), y1 + 20
         )
         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
@@ -1777,6 +1779,7 @@ def _capture_photos_fast_page(
     scan_settle: float = 1.3,
     select_wait: float = 0.45,
     regrab_wait: float = 0.6,
+    focus_clear_pct: float = 4.0,
 ) -> tuple[dict, object]:
     try:
         """One fast-mask page capture; returns ``(manifest, window)`` for reuse.
@@ -1841,6 +1844,7 @@ def _capture_photos_fast_page(
                 window, timeout, screen_capture=True,
                 fixed_window_rect=fixed_window_rect,
                 scan_wait=scan_wait, scan_settle=scan_settle,
+                focus_clear_pct=focus_clear_pct,
             )
             if _display_matches(target_small, base):
                 overlay = (base, active, blocks, active_control)
@@ -3053,6 +3057,7 @@ def _capture_one_page(
     scan_settle: float = 1.3,
     select_wait: float = 0.45,
     regrab_wait: float = 0.6,
+    focus_clear_pct: float = 4.0,
 ) -> tuple[dict, float | None]:
     """Capture one page with per-page retries.
 
@@ -3147,6 +3152,7 @@ def _capture_one_page(
                     scan_settle=scan_settle,
                     select_wait=select_wait,
                     regrab_wait=regrab_wait,
+                    focus_clear_pct=focus_clear_pct,
                 )
                 manifest["source"]["sha256"] = _sha256(image_path)
                 capture = manifest.setdefault("capture", {})
@@ -3279,6 +3285,7 @@ def capture_photos_fast_batch(
     scan_settle: float = 1.3,
     select_wait: float = 0.45,
     regrab_wait: float = 0.6,
+    focus_clear_pct: float = 4.0,
 ) -> dict:
     """Batch fast capture: one Photos window per page, retried up to
     ``max_attempts`` times (a fresh window each attempt; first success
@@ -3398,6 +3405,7 @@ def capture_photos_fast_batch(
                 scan_settle=scan_settle,
                 select_wait=select_wait,
                 regrab_wait=regrab_wait,
+                focus_clear_pct=focus_clear_pct,
             )
             with lock:
                 results.append(result)
@@ -3610,6 +3618,7 @@ def _prepare_overlay(
     fixed_window_rect: tuple[int, int, int, int] | None = None,
     scan_wait: float = 0.5,
     scan_settle: float = 1.3,
+    focus_clear_pct: float = 4.0,
 ):
     """Reset any previous OCR session and capture base/active frames.
 
@@ -3641,7 +3650,7 @@ def _prepare_overlay(
     # Focus also stays on the button after invoke(): click the title
     # bar's left third to relocate focus away from it (a click inside
     # the frame could cancel a later Ctrl+A selection).
-    _click_focus_off_button(window)
+    _click_focus_off_button(window, focus_clear_pct)
     # The scan-text view (dim mask + recognition borders) renders
     # asynchronously.  Wait ``scan_wait`` first, then extend in 0.5s steps
     # while the frame edges still show coloured recognition chrome (manga
@@ -3991,6 +4000,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                  "selection is still rendering (default 0.6)",
         )
         parser.add_argument(
+            "--focus-clear-pct",
+            type=float,
+            default=4.0,
+            help="title-bar click offset right of the scan-text button "
+                 "centre, as percent of window width (default 4.0; raise "
+                 "it when the focus click still lands on the button)",
+        )
+        parser.add_argument(
             "--layout-region",
             default="",
             help="constrain the window layout to WxH px (e.g. 2400x1400 on a "
@@ -4058,6 +4075,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 scan_settle=args.scan_settle,
                 select_wait=args.select_wait,
                 regrab_wait=args.regrab_wait,
+                focus_clear_pct=args.focus_clear_pct,
             )
         else:
             result = capture_photos_batch(

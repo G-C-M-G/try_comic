@@ -875,6 +875,15 @@ class MainWindow(QMainWindow):
         self.regrab_wait_spin.setSingleStep(0.1)
         self.regrab_wait_spin.setDecimals(1)
         self.regrab_wait_spin.setValue(0.6)
+        self.focus_clear_pct_spin = QDoubleSpinBox()
+        self.focus_clear_pct_spin.setRange(0.0, 50.0)
+        self.focus_clear_pct_spin.setSingleStep(1.0)
+        self.focus_clear_pct_spin.setDecimals(1)
+        self.focus_clear_pct_spin.setValue(4.0)
+        self.focus_clear_pct_spin.setToolTip(
+            "移焦点用的标题栏点击点 = 扫描按钮中心向右偏移窗口宽度的百分比。\n"
+            "默认 4（约 1/25 窗宽）；点击仍落在按钮上/弹窗上时调大（如 8、12）。"
+        )
 
         def _row(text, widget):
             row = QHBoxLayout()
@@ -902,6 +911,7 @@ class MainWindow(QMainWindow):
         _row("扫描文本稳定上限（默认 1.3）", self.scan_settle_spin)
         _row("Ctrl+A 后等待（默认 0.45）", self.select_wait_spin)
         _row("选区重抓间隔（默认 0.6）", self.regrab_wait_spin)
+        _row("焦点挪开偏移（窗口宽 %，默认 4，点不上标题栏就调大）", self.focus_clear_pct_spin)
         type_title = QLabel("嵌字", objectName="cardTitle")
         lay.addWidget(type_title)
         _row("字号下限（px）", self.min_font_spin)
@@ -1571,6 +1581,7 @@ class MainWindow(QMainWindow):
         args += ["--scan-settle", str(self.scan_settle_spin.value())]
         args += ["--select-wait", str(self.select_wait_spin.value())]
         args += ["--regrab-wait", str(self.regrab_wait_spin.value())]
+        args += ["--focus-clear-pct", str(self.focus_clear_pct_spin.value())]
         if self.capture_overwrite_check.isChecked():
             args.append("--overwrite")
         self._run(args)

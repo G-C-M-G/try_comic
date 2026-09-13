@@ -117,7 +117,7 @@ def stage1_capture(
     ocr_engine: str = "auto", row_spacing_px: int | None = None,
     right_gap_px: int = 0, scan_wait: float = 0.5,
     scan_settle: float = 1.3, select_wait: float = 0.45,
-    regrab_wait: float = 0.6,
+    regrab_wait: float = 0.6, focus_clear_pct: float = 4.0,
 ) -> bool:
     """Parallel frames-only capture + blue-box check images.
 
@@ -173,6 +173,8 @@ def stage1_capture(
         cmd += ["--select-wait", str(select_wait)]
     if regrab_wait != 0.6:
         cmd += ["--regrab-wait", str(regrab_wait)]
+    if focus_clear_pct != 4.0:
+        cmd += ["--focus-clear-pct", str(focus_clear_pct)]
     if bottom_shift_up:
         cmd += ["--layout-bottom-shift-up", str(bottom_shift_up)]
     if layout_region:
@@ -2094,7 +2096,8 @@ def main(argv=None) -> int:
                             scan_wait=args.scan_wait,
                             scan_settle=args.scan_settle,
                             select_wait=args.select_wait,
-                            regrab_wait=args.regrab_wait)
+                            regrab_wait=args.regrab_wait,
+                            focus_clear_pct=args.focus_clear_pct)
         if not ok:
             print("capture failed", file=sys.stderr)
             return 2
