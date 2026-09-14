@@ -670,3 +670,70 @@ class OversizedBoxNoMergeTest(unittest.TestCase):
         source = inspect.getsource(build_bluebox_dataset)
         self.assertIn("oversized_box_ids", source)
         self.assertIn("no_merge_ids=oversized", source)
+
+
+class OversizedAbsoluteFloorTest(unittest.TestCase):
+    """过大单框判据必须同时超过绝对下限（页短边 8%）。
+
+    只看倍数的话，小字页面的门槛会低到"人人超标"：实测 丙书 页 97 常规字号
+    22px → 门槛 33px → 页上几乎所有框（短边 47~77px）都被判成过大 → 全压到
+    30px、还互相不合并（封顶框 23% → 加下限后 8%）。这与采集期剔除大拟音的
+    判据同形（那条也要求同时超过页短边 10%）。
+    """
+
+    def _page(self, specs, image_size=(1000, 1400)):
+        boxes = [
+            {"id": f"sel_{i:03d}", "image_bbox": list(b), "page_scale": False}
+            for i, b in enumerate(specs, 1)
+        ]
+        data = {
+            "schema_version": 1, "page": "1", "image_size": list(image_size),
+            "contours": True,
+            "islands": [
+                {"id": f"island_{i:03d}", "image_bbox": list(b),
+                 "image_center": [(b[0]+b[2])//2, (b[1]+b[3])//2],
+                 "image_area": float((b[2]-b[0])*(b[3]-b[1]))}
+                for i, b in enumerate(specs, 1)
+            ],
+        }
+        from manga_localizer.island_contract import dataset_from_data
+
+        return boxes, dataset_from_data(data, path=Path(__file__), source_sha256="a"*64)
+
+    def test_small_page_midsize_boxes_not_flagged(self):
+        """小字页面：中等框（1.5×基准但未过页短边 8%）不再被判过大。"""
+        from one_click_translate import oversized_box_ids
+
+        # 6 个小框（短边 20）→ 基准中位 20 → 阈值 30；一个中等框短边 40
+        specs = [(100 + i * 40, 100, 120 + i * 40, 300) for i in range(6)]
+        specs.append((400, 400, 440, 600))
+        boxes, _ = self._page(specs, image_size=(1000, 1400))
+        without_floor = oversized_box_ids(boxes, ratio=1.5)
+        with_floor = oversized_box_ids(boxes, ratio=1.5, page_short_side=1000.0)
+        self.assertEqual(without_floor, {"sel_007"})   # 没下限 → 误判中等框
+        self.assertEqual(with_floor, set())            # 有下限（页短边 8% = 80）→ 放过
+
+    def test_truly_huge_box_still_flagged_with_floor(self):
+        from one_click_translate import oversized_box_ids
+
+        specs = [(100 + i * 40, 100, 120 + i * 40, 300) for i in range(6)]
+        specs.append((400, 400, 600, 1100))            # 短边 200 > 80
+        boxes, _ = self._page(specs, image_size=(1000, 1400))
+        self.assertEqual(
+            oversized_box_ids(boxes, ratio=1.5, page_short_side=1000.0),
+            {"sel_007"},
+        )
+
+    def test_both_sides_agree(self):
+        """编组侧的 oversized_box_ids 与封顶侧的 oversized_single_box_islands 同口径。"""
+        from one_click_translate import (
+            oversized_box_ids, oversized_single_box_islands,
+        )
+
+        specs = [(100 + i * 40, 100, 120 + i * 40, 300) for i in range(6)]
+        specs.append((400, 400, 600, 1100))
+        boxes, dataset = self._page(specs, image_size=(1000, 1400))
+        locked = oversized_box_ids(boxes, ratio=1.5, page_short_side=1000.0)
+        capped = oversized_single_box_islands(dataset, boxes, ratio=1.5)
+        self.assertEqual(locked, {"sel_007"})
+        self.assertEqual(capped, {"island_007"})

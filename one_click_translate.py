@@ -210,12 +210,19 @@ def _direction_baseline(
 def oversized_box_ids(
     boxes: Sequence[dict], *,
     ratio: float = SFX_MIN_SIDE_RATIO, min_group: int = 3,
+    page_short_side: float | None = None,
+    page_floor: float = SFX_MIN_SIDE_PAGE,
 ) -> set[str]:
     """短边远超同方向基准的框（大概率拟声/效果字）。
 
     它们**不参与合并**：把这种框和相邻的竖排框并成一组，组的外接矩形会变得很大、
     字号也跟着撑大（实测页 7/11/19 的巨型字号都是这么来的）；而且原图里它本来就
     是一个独立的超大文字，不该和别的列共享一个排版容器。
+
+    **必须同时超过绝对下限**（``page_short_side × page_floor``，默认页短边 8%）：
+    只看倍数的话，小字页面（页 97 常规字号 22px）的门槛会低到 33px，页上几乎所有
+    框都被判成"过大"→ 全被压到 30px、还互相不合并（实测封顶框 23% → 加下限后 8%）。
+    这与采集期剔除大拟音的判据同形（那条也要求同时超过页短边 10%）。
     """
     if len(boxes) < 3:
         return set()
@@ -223,6 +230,7 @@ def oversized_box_ids(
     page_median = float(np.median(
         [min(b[2] - b[0], b[3] - b[1]) for b in bboxes]
     ))
+    floor_px = (page_floor * float(page_short_side)) if page_short_side else 0.0
     locked: set[str] = set()
     for box in boxes:
         bb = box["image_bbox"]
@@ -230,7 +238,7 @@ def oversized_box_ids(
         baseline = _direction_baseline(bboxes, key, min_group=min_group,
                                        page_median=page_median)
         short = min(bb[2] - bb[0], bb[3] - bb[1])
-        if baseline > 0 and short > ratio * baseline:
+        if baseline > 0 and short > ratio * baseline and short > floor_px:
             locked.add(str(box.get("id") or ""))
     return locked
 
@@ -238,6 +246,7 @@ def oversized_box_ids(
 def oversized_single_box_islands(
     dataset, boxes: Sequence[dict], *,
     ratio: float = SFX_MIN_SIDE_RATIO, min_group: int = 3,
+    page_floor: float = SFX_MIN_SIDE_PAGE,
 ) -> set[str]:
     """**未被合并的框**里，短边远超同方向平均值的岛（大概率是拟声词）。
 
@@ -252,6 +261,7 @@ def oversized_single_box_islands(
     page_median = float(np.median(
         [min(b[2] - b[0], b[3] - b[1]) for b in bboxes]
     ))
+    floor_px = page_floor * float(min(dataset.image_size))
     capped: set[str] = set()
     for island in dataset.islands:
         ix1, iy1, ix2, iy2 = island.image_bbox
@@ -267,7 +277,7 @@ def oversized_single_box_islands(
         baseline = _direction_baseline(bboxes, key, min_group=min_group,
                                        page_median=page_median)
         short = min(box[2] - box[0], box[3] - box[1])
-        if baseline > 0 and short > ratio * baseline:
+        if baseline > 0 and short > ratio * baseline and short > floor_px:
             capped.add(island.id)
     return capped
 
@@ -1311,6 +1321,7 @@ def build_bluebox_dataset(
     oversized = oversized_box_ids(
         [item for item in blocks if not item.get("page_scale")],
         ratio=sfx_min_side_ratio,
+        page_short_side=float(min(image_w, image_h)),
     )
     if oversized:
         print(
@@ -2596,6 +2607,7 @@ def erase_and_typeset_page_with(
     stroke_color: tuple[int, int, int] | None = None,
     background_color: tuple[int, int, int] | None = None,
     sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
+    sfx_min_side_page: float = SFX_MIN_SIDE_PAGE,
     page_font_ceiling_ratio: float = PAGE_FONT_CEILING_RATIO,
 ):
     import dataclasses
@@ -2760,6 +2772,7 @@ def erase_and_typeset_page_with(
     # 几何判据（不需要原文）：未合并的单框、短边远超同方向平均 → 大概率拟声词
     capped_islands |= oversized_single_box_islands(
         dataset, boxes, ratio=sfx_min_side_ratio,
+        page_floor=sfx_min_side_page,
     )
     # 整页字号上限：≤ ratio × 该页常规字号（蓝框短边中位数）。各岛"各自撑满"
     # 会让同页出现 2 倍级差（实测页 7：131px vs 基准 66px），这里按页压回来。
