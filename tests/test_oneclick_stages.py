@@ -499,3 +499,60 @@ class TypesetPngSaveTests(unittest.TestCase):
             _save_typeset_png(self.image, target)
         self.assertIn("被图片查看器", str(ctx.exception))
         self.assertEqual(list(self.dir.glob("*.tmp*")), [])
+
+
+class UnfittableIslandSkipTests(unittest.TestCase):
+    """放不下的岛保留原图（不擦、不写）。
+
+    盒子 15×40px 却要塞 60 个字：12px 绝对下限也放不下，只能被掩膜裁掉 ——
+    成品里是一个看不见的小点，比保留原文更差。实测 丙书 有 17 个这种岛。
+    """
+
+    def _dataset(self, bbox, tmp):
+        from manga_localizer.island_contract import dataset_from_data
+
+        payload = {
+            "schema_version": 1, "page": "1", "image_size": [600, 800],
+            "islands": [{
+                "id": "island_001", "image_bbox": list(bbox),
+                "image_center": [(bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2],
+                "image_area": float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])),
+            }],
+        }
+        return dataset_from_data(payload, path=Path(tmp) / "islands.json",
+                                 source_sha256="t")
+
+    def _probe(self, bbox, text, tmp):
+        from manga_localizer.island_typeset import TypesetConfig
+        from one_click_translate import _unfittable_island_ids
+
+        dataset = self._dataset(bbox, tmp)
+        return _unfittable_island_ids(
+            dataset, {"island_001": text}, TypesetConfig(),
+            directions={"island_001": "vertical"},
+        )
+
+    def test_tiny_box_with_long_text_is_unfittable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                self._probe((100, 100, 115, 140), "六十字的译文" * 10, tmp),
+                {"island_001"},
+            )
+
+    def test_normal_box_is_fittable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._probe((100, 100, 200, 400), "正常译文", tmp), set())
+
+    def test_small_box_with_short_text_is_fittable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._probe((100, 100, 140, 260), "四个字", tmp), set())
+
+    def test_empty_translations_is_noop(self):
+        from manga_localizer.island_typeset import TypesetConfig
+        from one_click_translate import _unfittable_island_ids
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = self._dataset((100, 100, 115, 140), tmp)
+            self.assertEqual(
+                _unfittable_island_ids(dataset, {}, TypesetConfig()), set(),
+            )

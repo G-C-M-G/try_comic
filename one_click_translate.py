@@ -2735,6 +2735,25 @@ def erase_and_typeset_page_with(
     # 擦字范围 = canonical box **再放宽 STROKE_OVERFLOW_MARGIN**：文字描边向外
     # 画，贴着框边时会伸出布局框（裁剪掩膜同样放宽），这一带必须先擦干净，
     # 否则描边会画在原图笔画上。
+    # 预排一遍布局（只算不画）：放不下（12px 绝对下限仍溢出、只能被裁）的岛
+    # **直接跳过**——擦掉却写不下字，等于把原文换成看不见的小点，比保留原图差。
+    # 判定与真正嵌字同一套输入（同 config/方向/并集/封顶/整页上限），所以结果一致。
+    unfittable = _unfittable_island_ids(
+        canonical_dataset, translations, config,
+        directions=directions, union_overrides=union_overrides,
+        capped_islands=capped_islands, font_ceiling_px=font_ceiling_px,
+    )
+    if unfittable:
+        print(f"  {page}: {len(unfittable)} 个岛放不下 → 保留原图（不擦不写）")
+        erase_ids -= unfittable
+        translations = {
+            island_id: text for island_id, text in translations.items()
+            if island_id not in unfittable
+        }
+        if not erase_ids:
+            with Image.open(dataset_dir / page / "original.jpg") as image:
+                image.convert("RGB").save(typeset_dir / f"{page}.typeset.png")
+            return None
     _m = STROKE_OVERFLOW_MARGIN
     extra_regions = {
         island_id: (
@@ -2795,6 +2814,34 @@ def erase_and_typeset_page_with(
     )
     _save_typeset_png(result.image, typeset_dir / f"{page}.typeset.png")
     return result
+
+
+def _unfittable_island_ids(
+    dataset, translations, config, *, directions=None,
+    union_overrides=None, capped_islands=None, font_ceiling_px=None,
+) -> set[str]:
+    """布局预排：找出"连 12px 绝对下限都放不下、只能被裁"的岛。
+
+    这类岛擦掉原文却写不下字（实测 丙书 有 17 个，框只有 8~41px，4~7 个中文字
+    都塞不进），成品里是一个看不见的小点 —— 保留原图反而更好。判定输入与真正
+    嵌字完全一致，所以不会出现"预排说放不下、实排又放下了"。
+    """
+    from PIL import Image as _Image
+
+    from manga_localizer.island_typeset import typeset_island_page
+
+    if not translations:
+        return set()
+    blank = _Image.new("RGB", dataset.image_size, (255, 255, 255))
+    probe = typeset_island_page(
+        blank, dataset, translations, [], config=config,
+        direction_overrides=directions, union_overrides=union_overrides,
+        capped_islands=capped_islands, font_ceiling_px=font_ceiling_px,
+    )
+    return {
+        audit.island_id for audit in probe.audits
+        if any("rendered and clipped" in reason for reason in audit.reasons)
+    }
 
 
 def _save_typeset_png(image, target: Path) -> None:
