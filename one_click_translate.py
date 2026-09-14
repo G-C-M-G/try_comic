@@ -2735,9 +2735,37 @@ def erase_and_typeset_page_with(
     # 擦字范围 = canonical box **再放宽 STROKE_OVERFLOW_MARGIN**：文字描边向外
     # 画，贴着框边时会伸出布局框（裁剪掩膜同样放宽），这一带必须先擦干净，
     # 否则描边会画在原图笔画上。
-    # 预排一遍布局（只算不画）：放不下（12px 绝对下限仍溢出、只能被裁）的岛
-    # **直接跳过**——擦掉却写不下字，等于把原文换成看不见的小点，比保留原图差。
-    # 判定与真正嵌字同一套输入（同 config/方向/并集/封顶/整页上限），所以结果一致。
+    # 字号封顶的岛：判据用**日文原文**（不是译文）——(a) 拟声词（短假名/符号），
+    # (b) 短原文（≤ SHORT_SOURCE_MAX_CHARS 字，默认 6，用户要求"少于 6 个字就
+    # 严格限制"）。两者都按 SFX_MAX_FONT_SIZE 封顶：漫画里 2~3 个字的台词，
+    # 蓝框往往很大（原文字本来就写得大），字号跟框走会嵌出一个 80~90px 的中文
+    # 短句，与整页文字失衡。只封顶不放大。
+    capped_islands = {
+        island_id for island_id, source_text in (sources or {}).items()
+        if is_sfx_like(str(source_text))
+        or short_source(str(source_text), short_source_max_chars)
+    }
+    # 几何判据（不需要原文）：未合并的单框、短边远超同方向平均 → 大概率拟声词
+    capped_islands |= oversized_single_box_islands(
+        dataset, boxes, ratio=sfx_min_side_ratio,
+        page_floor=sfx_min_side_page,
+    )
+    # 整页字号上限：≤ ratio × 该页常规字号（蓝框短边中位数）。各岛"各自撑满"
+    # 会让同页出现 2 倍级差（实测页 7：131px vs 基准 66px），这里按页压回来。
+    font_ceiling_px = None
+    if page_font_ceiling_ratio and page_font_ceiling_ratio > 0 and boxes:
+        import statistics as _statistics
+
+        baseline = float(_statistics.median([
+            min(b["image_bbox"][2] - b["image_bbox"][0],
+                b["image_bbox"][3] - b["image_bbox"][1])
+            for b in boxes
+        ]))
+        font_ceiling_px = max(1, int(round(page_font_ceiling_ratio * baseline)))
+    # 预排一遍布局（只算不画）：连 12px 绝对下限也放不下、只能被裁的岛
+    # **直接跳过**——擦掉原文却写不出看得见的字，比保留原文更差（实测 丙书 有 17 个
+    # 这种岛，框只有 8~41px）。判定输入与真正嵌字完全一致，所以不会"预排说放不下、
+    # 实排又放下了"。
     unfittable = _unfittable_island_ids(
         canonical_dataset, translations, config,
         directions=directions, union_overrides=union_overrides,
@@ -2750,6 +2778,10 @@ def erase_and_typeset_page_with(
             island_id: text for island_id, text in translations.items()
             if island_id not in unfittable
         }
+        active_dataset = dataclasses.replace(
+            canonical_dataset,
+            islands=tuple(i for i in canonical_dataset.islands if i.id in erase_ids),
+        )
         if not erase_ids:
             with Image.open(dataset_dir / page / "original.jpg") as image:
                 image.convert("RGB").save(typeset_dir / f"{page}.typeset.png")
@@ -2778,33 +2810,6 @@ def erase_and_typeset_page_with(
         dataset_dir / page, source, active_dataset, extra_regions,
         ErasureConfig(), 800.0,
     )
-    # 字号封顶的岛：判据用**日文原文**（不是译文）——(a) 拟声词（短假名/符号），
-    # (b) 短原文（≤ SHORT_SOURCE_MAX_CHARS 字，默认 6，用户要求"少于 6 个字就
-    # 严格限制"）。两者都按 SFX_MAX_FONT_SIZE 封顶：漫画里 2~3 个字的台词，
-    # 蓝框往往很大（原文字本来就写得大），字号跟框走会嵌出一个 80~90px 的中文
-    # 短句，与整页文字失衡。只封顶不放大。
-    capped_islands = {
-        island_id for island_id, source_text in (sources or {}).items()
-        if is_sfx_like(str(source_text))
-        or short_source(str(source_text), short_source_max_chars)
-    }
-    # 几何判据（不需要原文）：未合并的单框、短边远超同方向平均 → 大概率拟声词
-    capped_islands |= oversized_single_box_islands(
-        dataset, boxes, ratio=sfx_min_side_ratio,
-        page_floor=sfx_min_side_page,
-    )
-    # 整页字号上限：≤ ratio × 该页常规字号（蓝框短边中位数）。各岛"各自撑满"
-    # 会让同页出现 2 倍级差（实测页 7：131px vs 基准 66px），这里按页压回来。
-    font_ceiling_px = None
-    if page_font_ceiling_ratio and page_font_ceiling_ratio > 0 and boxes:
-        import statistics as _statistics
-
-        baseline = float(_statistics.median([
-            min(b["image_bbox"][2] - b["image_bbox"][0],
-                b["image_bbox"][3] - b["image_bbox"][1])
-            for b in boxes
-        ]))
-        font_ceiling_px = max(1, int(round(page_font_ceiling_ratio * baseline)))
     result = typeset_island_page(
         erased, canonical_dataset, translations, blue_lines, config=config,
         direction_overrides=directions,
