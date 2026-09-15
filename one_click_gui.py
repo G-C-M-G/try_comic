@@ -902,6 +902,19 @@ class MainWindow(QMainWindow):
             "判据 = 框短边 > 2×同方向基准 且 > 页短边 10%。\n"
             "按方向分组比较（横比横、竖比竖），横排文字行不会被误删。"
         )
+        self.drop_art_boxes_check = QCheckBox("剔除非气泡的手绘字/拟声框")
+        self.drop_art_boxes_check.setChecked(False)
+        self.drop_art_boxes_check.setToolTip(
+            "剔除直接画在画面上的效果字/拟声词（岛底不是平坦的底 + 原文 ≤ 10 字）：\n"
+            "只看几何、不依赖 OCR；压在画面上的印刷正文（封面警示语、后记段落）\n"
+            "因为字数超限而不受影响。\n"
+            "闸门按书自标定：先用这本书自己的长文本岛（≥12 字，几乎必然是对白）\n"
+            "自证「气泡基准」（p25 ≥ 0.65 才算），自证得住才判，自证不住整本禁用\n"
+            "（一个岛都不丢）。运行日志会打印走的是哪条。\n"
+            "**默认关**：这条判据分不开拟声词与「没气泡、直接画在画面上的对白」，\n"
+            "在不适用的书上硬跑会丢错一半对白（实测某本书闸门 0.60 时精确率 67.6%、\n"
+            "召回率 30.8%）。确认这本书的手绘字以拟声为主再开。"
+        )
         self.paddle_device_combo = QComboBox()
         self.paddle_device_combo.addItem("自动（有 GPU 就用，默认）", "auto")
         self.paddle_device_combo.addItem("GPU", "gpu")
@@ -1063,6 +1076,7 @@ class MainWindow(QMainWindow):
         _row("读字引擎（嵌字前）", self.stage2_engine_combo)
         _row("OCR 设备（采集，Paddle）", self.paddle_device_combo)
         _row("大拟音过滤", self.drop_large_boxes_check)
+        _row("手绘字过滤", self.drop_art_boxes_check)
         cap_title = QLabel("采集", objectName="cardTitle")
         lay.addWidget(cap_title)
         region_row = _row("采集区域（宽×高，屏 2560×1600 留边界用 2400×1400）", self.region_edit)
@@ -1136,6 +1150,8 @@ class MainWindow(QMainWindow):
         self._sync_box_source(self.box_source_combo)
         self.drop_large_boxes_check.setChecked(
             bool(data.get("drop_large_boxes", True)))
+        self.drop_art_boxes_check.setChecked(
+            bool(data.get("drop_art_boxes", False)))
         stage2_engine = data.get("stage2_engine")
         index = self.stage2_engine_combo.findData(stage2_engine) if stage2_engine else -1
         self.stage2_engine_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -1269,6 +1285,7 @@ class MainWindow(QMainWindow):
             "ai_ocr_api_key": self.ai_ocr_key_edit.text().strip(),
             "box_source": self.box_source_combo.currentData(),
             "drop_large_boxes": self.drop_large_boxes_check.isChecked(),
+            "drop_art_boxes": self.drop_art_boxes_check.isChecked(),
             "ocr_engine": self.ocr_engine_combo.currentData(),
             "paddle_device": self.paddle_device_combo.currentData(),
             "stage2_engine": self.stage2_engine_combo.currentData(),
@@ -1808,6 +1825,8 @@ class MainWindow(QMainWindow):
             args += ["--box-source", box_source]
         if not self.drop_large_boxes_check.isChecked():
             args.append("--keep-large-boxes")
+        if self.drop_art_boxes_check.isChecked():
+            args.append("--drop-art-boxes")
         engine = self.ocr_engine_combo.currentData()
         if engine and engine != "auto":
             args += ["--ocr-engine", engine]

@@ -41,6 +41,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -65,6 +66,17 @@ from manga_localizer.text_rules import (
     short_source,
 )
 from manga_localizer.thresholds import (
+    ART_TEXT_BALLOON_MIN_CHARS,
+    ART_TEXT_BALLOON_MIN_P25,
+    ART_TEXT_BALLOON_RATIO,
+    ART_TEXT_FLAT_RATIO,
+    ART_TEXT_FLAT_RANGE,
+    ART_TEXT_MAX_CHARS,
+    ART_TEXT_GATE_MAX,
+    ART_TEXT_GATE_MIN,
+    ART_TEXT_PAD,
+    ART_TEXT_VERTICAL_RATIO,
+    ART_TEXT_VISION_CONTEXT,
     PAGE_FONT_CEILING_RATIO,
     SFX_MAX_FONT_SIZE,
     SHORT_SOURCE_MAX_CHARS,
@@ -327,6 +339,32 @@ def _filter_large_sfx(
                 kept.append(box)
     kept.sort(key=lambda box: (box[1], -box[2]))
     return kept, dropped
+
+
+def flat_background_ratio(
+    gray, box, *, flat_range: int = ART_TEXT_FLAT_RANGE, inset: int = 0,
+) -> float | None:
+    """矩形内"局部平坦"像素占比（3×3 亮度极差 < ``flat_range``）。
+
+    气泡（白）、纯色色块、白底都平坦 → 接近 1；网点、集中线、渐变画面不平坦
+    → 接近 0。用 3×3 邻域而不是逐像素：网点本身就是黑白点阵，单像素看再密的
+    网点也有一半点是白的。返回 ``None`` = 矩形太小、判据无法自证，调用方应当
+    保守地当作"不是手绘字"。
+
+    ``inset`` 默认 0：调用方给的应当就是**已经收好的取样矩形**（见
+    ``ART_TEXT_PAD``），这里不再二次内缩。
+    """
+    x1, y1, x2, y2 = (int(value) for value in box)
+    x1, y1 = max(0, x1 + inset), max(0, y1 + inset)
+    x2, y2 = min(gray.shape[1], x2 - inset), min(gray.shape[0], y2 - inset)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    crop = np.asarray(gray[y1:y2, x1:x2], dtype=np.float32)
+    windows = np.lib.stride_tricks.sliding_window_view(
+        np.pad(crop, 1, mode="edge"), (3, 3),
+    )
+    spread = windows.max(axis=(2, 3)) - windows.min(axis=(2, 3))
+    return float((spread < flat_range).mean())
 
 
 def capture_boxes_with_paddle(
@@ -929,7 +967,8 @@ def _load_page_texts(out_root: Path, pages: list[str]) -> tuple[dict, dict, dict
             box_id for box_id in unit["blocks"]
             if f"{page}:box:{box_id}" not in readings
         }
-    texts, directions = build_page_texts(units, readings, dropped)
+    texts, directions = build_page_texts(
+        units, readings, dropped, vision_judge=make_vision_judge(out_root))
     return texts, directions, dropped
 
 
@@ -1098,7 +1137,8 @@ def _group_boxes_by_overlap(
     boxes: Sequence[dict],
     *,
     pad: int = 6,
-    gap_ratio: float = 0.30,
+    gap_ratio: float = 0.20,
+    top_align_px: int = 6,
     overlap_ratio: float = 0.40,
     no_merge_ids: Sequence[str] = (),
 ) -> list[tuple[tuple[int, int, int, int], list[str]]]:
@@ -1116,20 +1156,25 @@ def _group_boxes_by_overlap(
     Merge test on the raw boxes -- only the text layout, never the OCR
     padding (padding is an engineering allowance, not a layout fact):
 
-    * two VERTICAL boxes merge when the raw horizontal gap is below
-      30% of the smaller box's width AND their vertical ranges overlap by
-      more than 40% of the LARGER box's height;
-    * two HORIZONTAL boxes merge when the raw vertical gap is below
-      30% of the smaller box's height AND their horizontal ranges overlap
-      by more than 40% of the LARGER box's width;
+    * two VERTICAL boxes merge when their **top edges align within
+      ``top_align_px``** AND the raw horizontal gap is below 20% of the
+      smaller box's width;
+    * two HORIZONTAL boxes merge when the raw vertical gap is below 20%
+      of the smaller box's height AND their horizontal ranges overlap by
+      more than 40% of the LARGER box's width;
     * mixed-orientation pairs never merge.
 
-    (30% on raw geometry replaces the earlier "20% on padded geometry":
+    **竖排用"顶端对齐"而不是"纵向重叠比例"**（用户实书反馈后改，2026-09）：
+    一句话被拆成几列时，各列**顶端对齐**，但**长度可以差很多**——3 行的短列
+    挨着 10 行的长列时，重叠只有较长列的 30%，过不了"重叠 > 较大框 40%"那条
+    旧判据，于是同一句话被拆成两个岛。顶端对齐（而且长列短列的顶端几乎必然
+    对齐）正是竖排的排版事实。横排暂未同步（横排要对齐的是**左端**）。
+
+    (20% on raw geometry replaces the earlier "20% on padded geometry":
     padding used to add ~2*pad px to every gap -- a large constant
     relative to small boxes.  The raw form is scale-invariant.  Measured
     on 图源样张 (532 boxes): 0.6/0.5/0.4/0.3/0.2 -> 261/265/266/271/274
-    groups; lower ratios split multi-column sentences apart, and 0.3 was
-    chosen by review of the affected pages.)
+    groups.)
 
     Returns ``[(group_bbox, [member_ids])]`` sorted top-to-bottom,
     right-to-left.  ``boxes`` must carry ``id`` and ``image_bbox``.
@@ -1185,9 +1230,8 @@ def _group_boxes_by_overlap(
             x_overlap = min(pa[2], pb[2]) - max(pa[0], pb[0])
             y_overlap = min(pa[3], pb[3]) - max(pa[1], pb[1])
             if a_vertical:
-                if x_gap < gap_ratio * min_pw and y_overlap > overlap_ratio * max(
-                    pa[3] - pa[1], pb[3] - pb[1]
-                ):
+                # 竖排：顶端对齐 + 横向够近 → 同一句话的相邻列
+                if abs(pa[1] - pb[1]) <= top_align_px and x_gap < gap_ratio * min_pw:
                     union(i, j)
             else:
                 if y_gap < gap_ratio * min_ph and x_overlap > overlap_ratio * max(
@@ -1262,11 +1306,73 @@ def _resolve_group_yields(rects, *, limit_ratio: float = 0.5,
     return shifts
 
 
+def attach_bg_flatness(
+    islands: Sequence[dict], gray, *, pad: int = ART_TEXT_PAD,
+) -> None:
+    """给每个岛记下 ``bg_flat_ratio``（取样矩形内"局部平坦"像素占比）。
+
+    取样矩形 = **成员框原样并集**（``members_bbox``）± ``pad``。**没有成员并集
+    时退回 ``image_bbox``**（老数据集 / 兜底数据集）：那个带着编组扩边 6px，会
+    把邻居的墨迹吃进取样范围（见 ``ART_TEXT_PAD`` 的说明）。
+
+    **判据要的是整岛，不是单个框**：同一句对白的几个框各读一截
+    （"あの♡" / "でもももも…"），逐框判会把一句完好印在气泡里的对白判成手绘
+    字。岛矩形 = 这句话在版面上的占位，气泡上 → 平坦，画面上 → 不平坦。
+
+    存**比例**而不是布尔：以后调阈值不必重建 dataset（重建要重跑整条链）。
+    """
+    for island in islands:
+        bbox = list(island.get("members_bbox") or island.get("image_bbox") or [])
+        if len(bbox) != 4:
+            continue
+        # 框本身太小就不判（判据无法自证）——按**原始框**判，不按扩边后的
+        # 取样矩形判，否则扩边会把"太小"掩盖成"刚好够判"。
+        if min(bbox[2] - bbox[0], bbox[3] - bbox[1]) < 4:
+            continue
+        rect = [bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad]
+        ratio = flat_background_ratio(gray, rect)
+        if ratio is not None:
+            island["bg_flat_ratio"] = round(ratio, 4)
+
+
+def art_text_island(source_text: str, bg_flat_ratio, *, vertical: bool = False,
+                    flat_ratio: float = ART_TEXT_FLAT_RATIO,
+                    max_chars: int = ART_TEXT_MAX_CHARS,
+                    vertical_ratio: float = ART_TEXT_VERTICAL_RATIO) -> bool:
+    """这个岛是不是"画在画面上的手绘效果字/拟声词"（该保留原图、不译不嵌）。
+
+    **岛底不像气泡** + **够短（或竖排且更不像气泡）**：
+
+    * ``bg_flat_ratio`` < ``flat_ratio``(0.70) —— 取样矩形里"局部平坦"像素占比
+      达不到气泡的水平。气泡对白实测 ≥ 0.74，而"底色没那么深"的手绘拟声落在
+      0.40~0.66（实测 どきっ 0.40 / キェツ♡ 0.52 / ゴゴゴ 0.63），两者有空档，
+      所以上限能放到 0.70（见 thresholds 的标定表）。
+    * 原文 ≤ ``max_chars``(10) 字 —— 挡"压在画面上的印刷正文"（封面警示语、
+      后记段落）。
+    * **竖排且占比 < ``vertical_ratio``(0.40) 时无视字数护栏**：长拟声确实存在
+      （`びくっぷるぷるふるふるえる` / `ぬるっと♡じゅっ必ずい`），而长印刷正文
+      （封面警示语、后记段落）是**横排长行**——方向把它们分开。
+
+    只看几何、字数与排版方向，**不看语义**：这些框读出来往往是一句像模像样的话
+    （实测「よろしく」「だいすき」「だめ」「ごめんなさい」全是手绘字），语义判据
+    分不开（字符级规则、字形特征都测过，见 开发记录）。
+    """
+    if not source_text or bg_flat_ratio is None:
+        return False
+    ratio = float(bg_flat_ratio)
+    if ratio >= flat_ratio:
+        return False
+    if short_source(source_text, max_chars):
+        return True
+    return bool(vertical and ratio < vertical_ratio)
+
+
 def build_bluebox_dataset(
     manifest_path, page_dir, source_path, min_island_area: float = 800.0, pad: int = 0,
     drop_large_boxes: bool = True,
     sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
     sfx_min_side_page: float = SFX_MIN_SIDE_PAGE,
+    drop_art_boxes: bool = False,
 ) -> list[dict]:
     """islands.json purely from the Photos blue boxes (original image space).
 
@@ -1276,8 +1382,9 @@ def build_bluebox_dataset(
 
     **两条框来源共用同一套过滤**（`manga_localizer.thresholds`）：整页大框
     （面积 > 20% 页）在采集期已丢；这里再丢**大号拟音/效果字**（短边 >
-    2.0×同方向基准 且 > 页短边 10%）。放在共用阶段而非采集期，Photos 与
-    Paddle 两条路径才会得到同一结果。
+    2.0×同方向基准 且 > 页短边 10%），并给每个岛记下**岛底平坦度**
+    （``bg_flat_ratio``，手绘字判据的几何侧，见 ``attach_bg_flatness``）。
+    放在共用阶段而非采集期，Photos 与 Paddle 两条路径才会得到同一结果。
     Raises ValueError when the page has no usable blue boxes -- the caller
     keeps the page untouched then.  Also writes selection_blocks.json
     (typeset column positions + the re-grouped groups) and a copy of the
@@ -1394,6 +1501,16 @@ def build_bluebox_dataset(
             "image_area": round(area, 1),
             "from_selection_group": True,
         }
+        # 成员框**原样**并集：手绘字判据用它取样（见 ART_TEXT_PAD）。`image_bbox`
+        # 带着编组扩边 6px，是给填黑/擦字/嵌字的版面余量，拿它判文字会把邻居的
+        # 墨迹吃进来。
+        member_boxes = [boxes_by_id[m]["image_bbox"] for m in members
+                        if m in boxes_by_id]
+        if member_boxes:
+            island_record["members_bbox"] = [
+                min(b[0] for b in member_boxes), min(b[1] for b in member_boxes),
+                max(b[2] for b in member_boxes), max(b[3] for b in member_boxes),
+            ]
         shift = group.get("typeset_shift")
         if shift:
             # 让位位移：stage2 据此把**布局框**挪开（擦字范围会一并覆盖让位处）
@@ -1404,6 +1521,16 @@ def build_bluebox_dataset(
             f"page {Path(page_dir).name}: no usable blue boxes "
             "(nothing to process, page kept original)"
         )
+    if drop_art_boxes:
+        # 手绘字判据的几何侧：岛底平坦度。读数侧（字数护栏 + 判定）在
+        # build_page_texts —— 这里只采集，不丢岛。
+        try:
+            with Image.open(source_path) as handle:
+                gray = np.asarray(handle.convert("L"))
+        except (OSError, ValueError):
+            gray = None
+        if gray is not None:
+            attach_bg_flatness(islands, gray)
     page_dir.mkdir(parents=True, exist_ok=True)
     (page_dir / "islands.json").write_text(
         json.dumps(
@@ -1450,16 +1577,230 @@ def build_bluebox_dataset(
     return islands
 
 
-def build_page_texts(units, readings, dropped_boxes):
+# 手绘字分组用的装饰符号：读数里 ♡♥…～ 这类只是装饰，不参与"同一处字"的比较
+_ART_TEXT_DECOR = re.compile(r"[\s♡♥★☆♪…、。．.！？!?～〜→←↑↓・「」『』（）()\[\]{}]+")
+
+
+def _art_text_key(text: str) -> str:
+    """比较"同一处字"用的归一化读数（去掉装饰符号与空白）。"""
+    return _ART_TEXT_DECOR.sub("", text or "")
+
+
+def _same_lettering(a: str, b: str) -> bool:
+    """两段读数是不是"同一处字"：归一化后一短一长、短的落在长的开头。
+
+    同一团手绘字常被检出成两个**重叠**框（横竖不同向时编组规则不合并），两个
+    框读出来的是同一条字的不同截法（实测「ぬるっと♡じゅっ」/「ぬるっと♡じゅっ
+    必ずい」、「かわいい♥」/「かわい♡」）。不把它们当一条字，同一个字就会拿到
+    两个相反的判定。
+    """
+    left, right = _art_text_key(a), _art_text_key(b)
+    if len(left) < 2 or len(right) < 2:
+        return False
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    return long.startswith(short)
+
+
+def _island_rect(island: dict) -> tuple[int, int, int, int] | None:
+    """判据的取样矩形（成员框原样并集 ± ART_TEXT_PAD），拿不到就是 None。"""
+    bbox = list(island.get("members_bbox") or island.get("image_bbox") or [])
+    if len(bbox) != 4:
+        return None
+    pad = ART_TEXT_PAD
+    return (bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad)
+
+
+def _rects_overlap(a, b) -> bool:
+    return (min(a[2], b[2]) - max(a[0], b[0]) > 0
+            and min(a[3], b[3]) - max(a[1], b[1]) > 0)
+
+
+def art_text_gate(units, texts_by_page) -> tuple[float | None, str]:
+    """按书自标定闸门。返回 ``(闸门 或 None, 说明)``。
+
+    ``None`` = 这本书自证不住气泡基准 → **禁用几何判据**（宁可全部保留原图，
+    也不要在无信号的页面上丢一半对白）。
+
+    基准 = 这本书自己**长文本岛**（≥12 字，几乎必然是对白）的平坦占比，量的是
+    **p25**——长文本岛里必然混着少数不该算气泡基准的岛（横排印刷长文、偶然被
+    读出 ≥12 字的手绘字），p10 那个位置由它们决定，同一本书换个编组就会从 0.67
+    掉到 0.37（见 thresholds 的实测）。
+    """
+    values = []
+    for page, unit in units.items():
+        page_texts = (texts_by_page or {}).get(page) or {}
+        for iid, island in unit["islands"].items():
+            ratio = island.get("bg_flat_ratio")
+            if ratio is None:
+                continue
+            if len(page_texts.get(iid, "")) >= ART_TEXT_BALLOON_MIN_CHARS:
+                values.append(float(ratio))
+    if len(values) < 8:
+        return None, f"长文本岛只有 {len(values)} 个，样本不足"
+    import statistics as _st
+
+    ordered = sorted(values)
+    median = float(_st.median(ordered))
+    p25 = ordered[max(0, int(len(ordered) * 0.25))]
+    if p25 < ART_TEXT_BALLOON_MIN_P25:
+        return None, (f"长文本岛占比中位 {median:.2f} 但 p25 只有 {p25:.2f}"
+                      f"（< {ART_TEXT_BALLOON_MIN_P25}）→ 自证不住气泡基准")
+    gate = min(ART_TEXT_GATE_MAX, max(ART_TEXT_GATE_MIN, median * ART_TEXT_BALLOON_RATIO))
+    return round(gate, 4), f"长文本岛占比中位 {median:.2f} / p25 {p25:.2f}"
+
+
+def make_vision_judge(out_root: Path, *, progress=None):
+    """自证不住的书用的视觉判据回调；没配视觉接口时返回 None。
+
+    返回的 ``judge(units, page_texts) -> set[str]`` 给出**该丢弃的岛**（``页:岛``）：
+    模型答 ``S``（拟声/效果字）或 ``U``（图里没有清晰可读的日文）都丢，答 ``D`` 照常翻译。
+
+    跳过两类岛（实测"跳过长文本是免费的"：调用数 431→264，F1 只差 0.004）：
+
+    * **无读数的岛**――管线本来就不翻译它（文本为空 → 保留原图），不必问；
+    * **长文本岛**（≥ ``ART_TEXT_BALLOON_MIN_CHARS`` 字）――几乎必然是对白。
+
+    判定结果落盘 ``art_text_judge.json`` 缓存（键含岛框，编组一变自动失效），
+    重跑（含 ``--stage typeset``）不会重复花钱。
+    """
+    config = _load_api_config()
+    url = str(config.get("ai_ocr_url") or "")
+    model = str(config.get("ai_ocr_model") or "")
+    key = str(config.get("ai_ocr_api_key") or config.get("deepseek_api_key") or "")
+    if not (url and model and key):
+        return None
+
+    from manga_localizer.sfx_judge import DEFAULT_WORKERS, judge_crops
+
+    def judge(units, page_texts) -> set[str]:
+        cache_path = out_root / "art_text_judge.json"
+        cached: dict[str, str] = {}
+        if cache_path.is_file():
+            try:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    cached = {str(k): str(v) for k, v in payload.items()}
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                cached = {}
+        pending, keyed = [], {}
+        for page, unit in units.items():
+            texts = page_texts.get(page) or {}
+            source = out_root / "dataset" / page / "original.jpg"
+            for iid, island in unit["islands"].items():
+                text = texts.get(iid, "")
+                if not text.strip() or len(text) >= ART_TEXT_BALLOON_MIN_CHARS:
+                    continue
+                box = list(island.get("members_bbox") or island["image_bbox"])
+                cache_key = f"{page}:{iid}:" + ",".join(str(int(v)) for v in box)
+                keyed[cache_key] = f"{page}:{iid}"
+                if cache_key not in cached:
+                    pending.append({"id": cache_key, "source": str(source),
+                                    "bbox": box, "pad": ART_TEXT_VISION_CONTEXT})
+        if pending:
+            if progress is not None:
+                progress.log(f"视觉判据：送 {len(pending)} 个岛（自证不住，改用看图判定）")
+            cached.update(judge_crops(
+                pending, url, model, key, progress=progress,
+                max_workers=DEFAULT_WORKERS))
+            _write_cache_json(cache_path, cached)
+        drop = set()
+        for cache_key, island_key in keyed.items():
+            answer = str(cached.get(cache_key) or "").upper()[:1]
+            if answer in ("S", "U"):
+                drop.add(island_key)
+        return drop
+
+    return judge
+
+
+def _art_text_verdicts(by_island: dict, texts: dict[str, str],
+                       directions: dict[str, str],
+                       flat_gate: float | None = None) -> set[str]:
+    """该按"手绘字"处理的岛（判据 + 重叠同判）。
+
+    先按"同一处字 + 矩形相交"把岛并成组（``_same_lettering``），组内**同判**：
+    占比取组内最小（任一段明显落在画面上，整团就算画在画面上）、原文取最长
+    的一段（取最短会把印刷长句的碎片误杀）。单岛自成一组，行为与逐岛判一致。
+    """
+    ids = list(by_island)
+    parent = {iid: iid for iid in ids}
+
+    def find(iid):
+        while parent[iid] != iid:
+            parent[iid] = parent[parent[iid]]
+            iid = parent[iid]
+        return iid
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for index, left in enumerate(ids):
+        rect_left = _island_rect(by_island[left])
+        if rect_left is None:
+            continue
+        for right in ids[index + 1:]:
+            if not _same_lettering(texts.get(left, ""), texts.get(right, "")):
+                continue
+            rect_right = _island_rect(by_island[right])
+            if rect_right is not None and _rects_overlap(rect_left, rect_right):
+                union(left, right)
+
+    groups: dict[str, list[str]] = {}
+    for iid in ids:
+        groups.setdefault(find(iid), []).append(iid)
+
+    verdicts: set[str] = set()
+    for members in groups.values():
+        ratios = [
+            by_island[iid].get("bg_flat_ratio") for iid in members
+            if by_island[iid].get("bg_flat_ratio") is not None
+        ]
+        if not ratios:
+            continue
+        longest = max((texts.get(iid, "") for iid in members), key=len, default="")
+        # 组内方向取任一成员（同一条字被切开的碎片方向一致；不一致时保守当横排）
+        vertical = all(directions.get(iid) == "vertical" for iid in members)
+        if art_text_island(longest, min(ratios), vertical=vertical,
+                           flat_ratio=flat_gate):
+            verdicts.update(members)
+    return verdicts
+
+
+def build_page_texts(units, readings, dropped_boxes,
+                     flat_gate: float | None = None, vision_judge=None):
     """Join blue-box manga readings into per-island sentence texts.
 
     Dropped boxes (false selections) never join a sentence and never set a
     direction.  Islands whose members all read empty get an empty text so
     the caller keeps them untouched (no erasure, no typesetting).
     Returns ``(page_texts, page_directions)``.
+
+    标了 ``bg_flat_ratio`` 且**原文很短**的岛整岛不参与：岛底不平坦说明这些
+    "字"是画在画面上的手绘效果字/拟声词，读出来往往是"像模像样的一句话"
+    （实测「よろしく」「だいすき」），照译照嵌只是往画面上盖一行中文。原文长的
+    （压在画面上的封面警示语、后记段落）照旧参与——这才是
+    ``ART_TEXT_MAX_CHARS`` 这条字数护栏的作用。判空文本 = 保留原图（不擦、
+    不译、不嵌），与"读不出字的假选框"同一出口。判据见 ``art_text_island``。
+
+    两条护栏在这里生效，都是被实测逼出来的：
+
+    * **AI 说明性输出按空读数处理**（``is_ocr_commentary``）。视觉模型读不到字时
+      会回一句"图片中没有任何日文文本…"，它不算读数，但**字数很多**——当成原文
+      就会一路翻成中文塞进原框，而且会把字数护栏骗过去（实测页 4 island_014：
+      占比 0.23 本该判成手绘字，就因为这 37 字的说明文字被放行了）。
+    * **同一处字被切成几个岛时同判**（``_same_lettering`` + 矩形相交）。两个框
+      盖着同一团手绘字时，矩形只差一点、占比却可能分居阈值两侧（实测页 17
+      「かわいい♥」0.46 留 /「かわい♡」0.37 丢；另一处「ぬるっと♡じゅっ」8 字
+      丢 /「ぬるっと♡じゅっ必ずい」11 字靠字数护栏漏过）。同判取**最小占比**
+      （任一段明显落在画面上就算整团都在画面上）+ **最长的一段原文**（用最短的
+      会把印刷长句的碎片误杀）。
     """
     page_texts: dict[str, dict[str, str]] = {}
     page_directions: dict[str, dict[str, str]] = {}
+    art_text_islands: set[str] = set()
+    commentary_boxes = 0
     for page, unit in units.items():
         by_island = unit["islands"]
         box_by_id = unit["blocks"]
@@ -1477,7 +1818,11 @@ def build_page_texts(units, readings, dropped_boxes):
                         continue
                     bx1, by1, bx2, by2 = box["image_bbox"]
                     if ix1 <= (bx1 + bx2) // 2 <= ix2 and iy1 <= (by1 + by2) // 2 <= iy2:
-                        members.append((box, readings.get(f"{page}:box:{mid}", "")))
+                        reading = readings.get(f"{page}:box:{mid}", "")
+                        if is_ocr_commentary(reading):
+                            commentary_boxes += 1
+                            reading = ""
+                        members.append((box, reading))
                 if members:
                     horiz = sum(
                         1 for box, _ in members
@@ -1494,6 +1839,48 @@ def build_page_texts(units, readings, dropped_boxes):
             directions[iid] = "horizontal" if horizontal else "vertical"
         page_texts[page] = texts
         page_directions[page] = directions
+    # 手绘字（画在画面上的效果字/拟声词）：**整岛判**——同一句对白的几个框各读
+    # 一截，逐框判会把印在气泡里的对白判成手绘字。判空岛文本 = 该岛保留原图
+    # （不擦、不译、不嵌），与"读不出字的假选框"同一出口。
+    # 闸门**按书自标定**：先用整本书的长文本岛（几乎必然是对白）自证"气泡基准"，
+    # 自证不住就整本禁用（见 art_text_gate / thresholds 里的实测数据）。
+    if flat_gate is not None:
+        gate, basis = float(flat_gate), "调用方指定（跳过按书自标定）"
+    else:
+        gate, basis = art_text_gate(units, page_texts)
+    measured = any(
+        island.get("bg_flat_ratio") is not None
+        for unit in units.values() for island in unit["islands"].values()
+    )
+    if gate is None:
+        # 没有平坦度数据 = 这个功能根本没开（dataset 阶段没算）→ 绝不调接口
+        vision_drop = (vision_judge(units, page_texts)
+                       if (vision_judge and measured) else set())
+        if vision_drop:
+            print(f"手绘字判据：本书自证不住几何基准（{basis}）→ 改用视觉判据，"
+                  f"丢 {len(vision_drop)} 个岛（拟声/无字）")
+            for island_key in vision_drop:
+                page, _, iid = island_key.partition(":")
+                if iid and page in page_texts and iid in page_texts[page]:
+                    page_texts[page][iid] = ""
+                    art_text_islands.add(island_key)
+        else:
+            print(f"手绘字判据：本书禁用（{basis}）→ 不丢任何岛，全部照常翻译")
+    else:
+        print(f"手绘字判据：本书闸门 {gate:.2f}（{basis}）")
+        for page, unit in units.items():
+            for iid in _art_text_verdicts(
+                    unit["islands"], page_texts[page], page_directions[page],
+                    flat_gate=gate):
+                art_text_islands.add(f"{page}:{iid}")
+                page_texts[page][iid] = ""
+    if art_text_islands:
+        print(
+            f"丢弃 {len(art_text_islands)} 个手绘字岛（画在画面上、原文 ≤ "
+            f"{ART_TEXT_MAX_CHARS} 字）→ 保留原图，不译不嵌"
+        )
+    if commentary_boxes:
+        print(f"按空读数处理 {commentary_boxes} 个 AI 说明性输出框（不是文字）")
     return page_texts, page_directions
 
 
@@ -1514,6 +1901,7 @@ def stage2_process(
     drop_large_boxes: bool = True,
     sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
     sfx_min_side_page: float = SFX_MIN_SIDE_PAGE,
+    drop_art_boxes: bool = False,
     resume: bool = False,
     no_pdf: bool = False,
     min_font_size: int | None = None,
@@ -1561,6 +1949,7 @@ def stage2_process(
         drop_large_boxes=drop_large_boxes,
         sfx_min_side_ratio=sfx_min_side_ratio,
         sfx_min_side_page=sfx_min_side_page,
+        drop_art_boxes=drop_art_boxes,
     )
     page_texts, page_directions, dropped_boxes = _stage2_ocr(
         out_root, active_pages, progress=progress, overwrite=overwrite,
@@ -1688,13 +2077,35 @@ def _mark_review_required(out_root: Path, page: str, reason: str) -> None:
             pass
 
 
+def _dataset_has_bg_flatness(islands_path: Path) -> bool:
+    """数据集里有没有手绘字判据要的两个字段（见 ``attach_bg_flatness``）。
+
+    判据的取样矩形来自 ``members_bbox``（成员框原样并集），占比存在
+    ``bg_flat_ratio``。缺任一个都说明这份 dataset 是旧规则算出来的。
+
+    读不了（损坏/半截）也当"没有" —— 重建一次比复用坏产物便宜。
+    """
+    try:
+        payload = json.loads(islands_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    islands = payload.get("islands") or []
+    return bool(islands) and all(
+        isinstance(item, dict)
+        and item.get("bg_flat_ratio") is not None
+        and item.get("members_bbox")
+        for item in islands
+    )
+
+
 def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
                     progress: "ProgressFile", *,
                     overwrite: bool = False,
                     box_source: str = "paddle",
                     drop_large_boxes: bool = True,
                     sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
-                    sfx_min_side_page: float = SFX_MIN_SIDE_PAGE) -> list[str]:
+                    sfx_min_side_page: float = SFX_MIN_SIDE_PAGE,
+                    drop_art_boxes: bool = False) -> list[str]:
     """Build islands from capture (one island per blue-box selection
     group).  Returns the pages that ended up with a dataset (active)."""
     from island_extract import build_fallback_dataset
@@ -1733,12 +2144,21 @@ def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
                 islands_mtime = islands_path.stat().st_mtime
             except OSError:
                 manifest_mtime = islands_mtime = 0.0
-            if islands_mtime >= manifest_mtime:
+            # 规则也参与"新不新"：数据集是规则算出来的产物，规则变了（这里：
+            # 多算一个 bg_flat_ratio）旧 dataset 就得重建——否则改了规则却
+            # 静默复用旧产物，看起来"改了没用"。
+            stale_rules = (
+                drop_art_boxes and not _dataset_has_bg_flatness(islands_path)
+            )
+            if islands_mtime >= manifest_mtime and not stale_rules:
                 continue
             import shutil
 
             shutil.rmtree(page_dir, ignore_errors=True)
             print(
+                f"{page}: dataset 缺 bg_flat_ratio（手绘字判据新增字段），"
+                "重建 islands"
+                if stale_rules else
                 f"{page}: capture re-done after dataset, rebuilding islands "
                 "(check image and OCR now share the same blue boxes)"
             )
@@ -1758,6 +2178,7 @@ def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
                 drop_large_boxes=drop_large_boxes,
                 sfx_min_side_ratio=sfx_min_side_ratio,
                 sfx_min_side_page=sfx_min_side_page,
+                drop_art_boxes=drop_art_boxes,
             )
         except ValueError as error:
             # No usable blue boxes: nothing to process, the page stays
@@ -1879,7 +2300,9 @@ def _stage2_ocr(out_root: Path, pages: list[str], *,
     dropped_boxes = _demote_suspicious_fallbacks(
         readings, dropped_boxes, fallback_ids, progress,
     )
-    page_texts, page_directions = build_page_texts(units, readings, dropped_boxes)
+    page_texts, page_directions = build_page_texts(
+        units, readings, dropped_boxes,
+        vision_judge=make_vision_judge(out_root, progress=progress))
     return page_texts, page_directions, dropped_boxes
 
 
@@ -2262,6 +2685,7 @@ def _run_stage2_single(stage: str, images: Path, out_root: Path,
             images, out_root, pages, progress, overwrite=overwrite,
             box_source=kwargs.get("box_source", "paddle"),
             drop_large_boxes=kwargs.get("drop_large_boxes", True),
+            drop_art_boxes=kwargs.get("drop_art_boxes", False),
             sfx_min_side_ratio=kwargs.get("sfx_min_side_ratio", SFX_MIN_SIDE_RATIO),
         page_font_ceiling_ratio=kwargs.get(
             "page_font_ceiling_ratio", PAGE_FONT_CEILING_RATIO),
@@ -2648,7 +3072,15 @@ def erase_and_typeset_page_with(
     # islands whose boxes all read empty (false selections) or whose text
     # could not be read keep their original pixels untouched -- never erase
     # what we cannot replace.
-    erase_ids = {island_id for island_id in boxed_ids if translations.get(island_id)}
+    # **还要"这一轮确实读出了原文"**：`translations.json` 是跨轮持久化的，判据变了
+    # （或某岛被判成手绘字）之后只跑 `--stage typeset` 时旧译文仍在文件里；只看
+    # 译文就会照旧擦字嵌字，让人以为开关没生效。`sources` 为 None 表示调用方没给
+    # 原文，此时保持原行为（不知道原文就不拦）。
+    erase_ids = {
+        island_id for island_id in boxed_ids
+        if translations.get(island_id)
+        and (sources is None or sources.get(island_id))
+    }
     if not erase_ids:
         # No erasure-worthy islands: nothing to erase or typeset, the page
         # stays exactly as the original.
@@ -2913,6 +3345,13 @@ def main(argv=None) -> int:
         "--keep-large-boxes", action="store_true",
         help="保留大号拟音/效果字框（默认剔除：短边 > 2×同方向基准且 "
              "> 页短边 10%%）。该处理只作用于 --box-source paddle",
+    )
+    parser.add_argument(
+        "--drop-art-boxes", action="store_true",
+        help="把画在画面上的手绘字当非台词丢掉（岛底不平坦且原文 ≤ %d 字的岛"
+             "不译、不擦、不嵌，保留原图）。默认关——这条判据只看几何，分不开"
+             "拟声词与「没气泡、直接画在画面上的对白」（实测 159 个命中岛里 41 个"
+             "是真对白），要开请先确认这本书的手绘字以拟声为主" % ART_TEXT_MAX_CHARS,
     )
     parser.add_argument(
         "--sfx-min-side-ratio", type=float, default=SFX_MIN_SIDE_RATIO,
@@ -3301,6 +3740,7 @@ def main(argv=None) -> int:
         ai_ocr_workers=args.ai_ocr_workers,
         stage2_engine=args.stage2_engine,
         drop_large_boxes=not args.keep_large_boxes,
+        drop_art_boxes=args.drop_art_boxes,
         sfx_min_side_ratio=args.sfx_min_side_ratio,
         sfx_min_side_page=args.sfx_min_side_page,
         sfx_glossary_min_count=args.sfx_glossary_min_count,

@@ -105,3 +105,32 @@ class OcrCommentaryTests(unittest.TestCase):
         self.assertFalse(is_ocr_commentary("これはテスト用の長文"))
         self.assertFalse(is_ocr_commentary("图片中有一只猫"))   # 不是"没有文字"
         self.assertFalse(is_ocr_commentary(""))
+
+
+class CommentaryRealSamplesTest(unittest.TestCase):
+    """实书跑出来的说明性输出样本（都是"当读数用会一路翻成中文"的原句）。
+
+    这批是用户逐条核对时点出来的：它们字数很多，会把"原文 ≤10 字"那条护栏
+    撑爆，于是被当成印刷长文保留、最后翻成中文塞进原来的小框。
+    """
+
+    def test_leaked_forms_are_caught(self):
+        from manga_localizer.text_rules import is_ocr_commentary
+
+        for text in (
+            "图片中无任何可识别的日文文本，仅含手绘爱心轮廓与网点纹理，无法输出文字。",
+            "这张图是一个漫画风格的黑白图形，看起来是某个图案或文字的局部放大，"
+            "不是完整的文字页面，所以我没法像 OCR 那样从中提取出可读的日文文本。",
+            "图片左右翻转了。识别内容如下：う",
+            "オレは未识别到日文内容。",
+            "图上没有可识别的日文文字。",
+            "```texth♡```",
+        ):
+            self.assertTrue(is_ocr_commentary(text), text)
+
+    def test_real_readings_still_pass(self):
+        from manga_localizer.text_rules import is_ocr_commentary
+
+        for text in ("んっ♡", "だいすき♡", "公認", "どきっ", "びくっぷるぷるふるふるえる",
+                     "图片中有一只猫", "未来", "識別"):
+            self.assertFalse(is_ocr_commentary(text), text)

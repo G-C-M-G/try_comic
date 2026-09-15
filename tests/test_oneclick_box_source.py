@@ -140,10 +140,10 @@ class PaddleBoxCaptureTest(unittest.TestCase):
         self.assertTrue(manifest["capture"]["black_page"])
 
     def test_groups_written_and_merge_side_by_side(self):
-        # 两个竖排框纵向重叠、横向紧邻 → 同一组（20% 间距 / 40% 重叠规则）
+        # 两个竖排框顶端对齐、横向紧邻 → 同一组（顶端对齐 + 20% 间距规则）
         ok, manifest = self._capture([
             {"polygon": _poly(200, 60, 240, 300), "text": "あ", "confidence": 0.9},
-            {"polygon": _poly(248, 60, 288, 300), "text": "い", "confidence": 0.9},
+            {"polygon": _poly(247, 60, 287, 300), "text": "い", "confidence": 0.9},
         ])
         groups = manifest["capture"]["selection_groups"]
         self.assertEqual(len(groups), 1)
@@ -152,7 +152,7 @@ class PaddleBoxCaptureTest(unittest.TestCase):
     def test_group_helper_accepts_generated_blocks(self):
         blocks = [
             {"id": "sel_001", "image_bbox": [200, 60, 240, 300], "page_scale": False},
-            {"id": "sel_002", "image_bbox": [248, 60, 288, 300], "page_scale": False},
+            {"id": "sel_002", "image_bbox": [247, 60, 287, 300], "page_scale": False},
         ]
         grouped = _group_boxes_by_overlap(blocks)
         self.assertEqual(len(grouped), 1)
@@ -737,3 +737,224 @@ class OversizedAbsoluteFloorTest(unittest.TestCase):
         capped = oversized_single_box_islands(dataset, boxes, ratio=1.5)
         self.assertEqual(locked, {"sel_007"})
         self.assertEqual(capped, {"island_007"})
+
+
+
+def _art_page_image(size=(600, 600)):
+    """左半边平坦白底（气泡/色块），右半边 1px 黑白条纹（模拟网点/画面）。
+
+    条纹的 3×3 亮度极差 = 255，所以"局部平坦"判据在右半边为 0、左半边为 1。
+    用它可以直接验证判据分得开"印在平坦底上"和"画在画面上"。
+    """
+    array = np.full((size[1], size[0]), 255, dtype=np.uint8)
+    array[:, size[0] // 2:] = 0
+    array[::2, size[0] // 2:] = 255
+    return Image.fromarray(array, mode="L")
+
+
+class BgFlatnessTest(unittest.TestCase):
+    """手绘字判据的几何侧（flat_background_ratio / attach_bg_flatness）。
+
+    判据是**几何**（岛底平坦度），不是读数——这里锁的是几条容易写错的边界：
+    平坦底给高分、条纹底给零分、纯色（非白）色块也算平坦、测不了就不给值。
+    """
+
+    def setUp(self):
+        self.gray = np.asarray(_art_page_image(), dtype=np.uint8)
+
+    def test_flat_and_art_areas_are_at_the_extremes(self):
+        from one_click_translate import flat_background_ratio
+
+        self.assertEqual(flat_background_ratio(self.gray, [50, 50, 250, 250]), 1.0)
+        self.assertEqual(flat_background_ratio(self.gray, [350, 50, 550, 250]), 0.0)
+
+    def test_unusable_box_yields_none(self):
+        from one_click_translate import flat_background_ratio
+
+        self.assertIsNone(flat_background_ratio(self.gray, [50, 50, 53, 53]))
+
+    def test_tinted_flat_area_counts_as_flat(self):
+        """纯色色块（不是白）也是"平坦的底"：封面标题印在浅粉色块上，要留住。"""
+        from one_click_translate import flat_background_ratio
+
+        tinted = np.full((600, 600), 150, dtype=np.uint8)
+        self.assertEqual(flat_background_ratio(tinted, [50, 50, 250, 250]), 1.0)
+
+    def test_attach_writes_ratio_per_island(self):
+        from one_click_translate import attach_bg_flatness
+
+        islands = [
+            {"id": "island_001", "image_bbox": [50, 50, 250, 250]},
+            {"id": "island_002", "image_bbox": [350, 50, 550, 250]},
+            {"id": "island_003", "image_bbox": [50, 50, 53, 53]},
+        ]
+        attach_bg_flatness(islands, self.gray)
+        self.assertEqual(islands[0]["bg_flat_ratio"], 1.0)
+        self.assertEqual(islands[1]["bg_flat_ratio"], 0.0)
+        self.assertNotIn("bg_flat_ratio", islands[2])   # 太小，不判
+
+
+class ArtTextIslandTest(unittest.TestCase):
+    """岛级判定：几何 + 字数两条缺一不可。"""
+
+    def _is_art(self, text, ratio):
+        from one_click_translate import art_text_island
+
+        return art_text_island(text, ratio)
+
+    def test_short_text_on_art_is_art(self):
+        self.assertTrue(self._is_art("よろしく", 0.08))
+
+    def test_long_text_on_art_is_not_art(self):
+        """压在画面上的印刷正文（封面警示语、后记段落）字数超限 → 不是手绘字。"""
+        self.assertFalse(
+            self._is_art("・普通の性行為が見たい方は回れ右した方が賢明です", 0.17)
+        )
+
+    def test_short_text_on_flat_background_is_not_art(self):
+        self.assertFalse(self._is_art("んっ♡", 0.90))
+
+    def test_missing_measurement_is_not_art(self):
+        """老数据集没有 bg_flat_ratio → 判据无法自证 → 保守地不当作手绘字。"""
+        self.assertFalse(self._is_art("よろしく", None))
+        self.assertFalse(self._is_art("", 0.05))
+
+
+class DatasetBgFlatnessTest(unittest.TestCase):
+    """bg_flat_ratio 必须落到 islands.json，并且能被"规则变新"判断看见。"""
+
+    def _capture(self, root: Path):
+        images = root / "images"
+        images.mkdir(exist_ok=True)
+        page = images / "1.jpg"
+        _art_page_image().convert("RGB").save(page)
+        capture = root / "out" / "capture" / "paddle" / "1"
+        capture.mkdir(parents=True, exist_ok=True)
+        (capture / "capture.json").write_text(
+            json.dumps({
+                "source": {"path": str(page), "width": 600, "height": 600},
+                "capture": {
+                    "box_source": "paddle", "complete": True,
+                    "selection_blocks": [
+                        {"id": "sel_001", "image_bbox": [50, 50, 250, 250],
+                         "page_scale": False},
+                        {"id": "sel_002", "image_bbox": [350, 50, 550, 250],
+                         "page_scale": False},
+                    ],
+                },
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return capture / "capture.json", page
+
+    def test_ratio_written_to_islands_json(self):
+        from one_click_translate import _dataset_has_bg_flatness
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, page = self._capture(Path(tmp))
+            page_dir = Path(tmp) / "out" / "dataset" / "1"
+            build_bluebox_dataset(manifest, page_dir, page, drop_art_boxes=True)
+            islands = json.loads(
+                (page_dir / "islands.json").read_text(encoding="utf-8")
+            )["islands"]
+            self.assertEqual(
+                sorted(item["bg_flat_ratio"] for item in islands), [0.0, 1.0]
+            )
+            self.assertTrue(_dataset_has_bg_flatness(page_dir / "islands.json"))
+
+    def test_marking_can_be_disabled(self):
+        from one_click_translate import _dataset_has_bg_flatness
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, page = self._capture(Path(tmp))
+            page_dir = Path(tmp) / "out" / "dataset" / "1"
+            build_bluebox_dataset(manifest, page_dir, page, drop_art_boxes=False)
+            islands = json.loads(
+                (page_dir / "islands.json").read_text(encoding="utf-8")
+            )["islands"]
+            self.assertFalse(any("bg_flat_ratio" in item for item in islands))
+            # 关掉判据时数据集里本就没有该字段；"规则过期"的检查只在该判据
+            # 打开时生效，不会因为缺字段反复重建。
+            self.assertFalse(_dataset_has_bg_flatness(page_dir / "islands.json"))
+
+
+class StaleDatasetRulesTest(unittest.TestCase):
+    """规则变了要重建 dataset，不能静默复用旧产物。
+
+    ``bg_flat_ratio`` 是手绘字判据新增的字段：老数据集没有它，判据就无从判定，
+    而"islands.json 比 capture.json 新"这条跳过规则会把老数据集一直复用下去
+    （看起来"改了规则没用"，开发记录 里踩过一次）。
+    """
+
+    def _run(self, *, drop_art_boxes, islands_payload):
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+
+        from one_click_translate import _stage2_dataset
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        images = root / "images"
+        images.mkdir()
+        page = images / "1.jpg"
+        _art_page_image().convert("RGB").save(page)
+        capture = root / "out" / "capture" / "paddle" / "1"
+        capture.mkdir(parents=True)
+        manifest = capture / "capture.json"
+        manifest.write_text(json.dumps({
+            "source": {"path": str(page), "width": 600, "height": 600},
+            "capture": {
+                "box_source": "paddle", "complete": True,
+                "selection_blocks": [
+                    {"id": "sel_001", "image_bbox": [50, 50, 250, 250],
+                     "page_scale": False},
+                    {"id": "sel_002", "image_bbox": [350, 50, 550, 250],
+                     "page_scale": False},
+                ],
+            },
+        }, ensure_ascii=False), encoding="utf-8")
+        dataset = root / "out" / "dataset" / "1"
+        dataset.mkdir(parents=True)
+        islands_path = dataset / "islands.json"
+        islands_path.write_text(json.dumps(islands_payload), encoding="utf-8")
+        selection_path = dataset / "selection_blocks.json"
+        selection_path.write_text(json.dumps({"selection_blocks": []}),
+                                  encoding="utf-8")
+        # 让 islands.json 比 capture.json 新：跳过规则本该命中
+        import os
+        os.utime(islands_path, (manifest.stat().st_mtime + 10,) * 2)
+
+        class _Progress:
+            def log(self, *_a, **_k): pass
+            def progress(self, *_a, **_k): pass
+            def set_stage(self, *_a, **_k): pass
+
+        _stage2_dataset(images, root / "out", ["1"], _Progress(),
+                        overwrite=False, drop_art_boxes=drop_art_boxes)
+        return json.loads(islands_path.read_text(encoding="utf-8"))
+
+    OLD_ISLANDS = {
+        "schema_version": 1, "page": "1", "image_size": [600, 600],
+        "contours": True, "fill_mode": "black", "min_island_area": 800,
+        "blue_boxes_only": True,
+        "islands": [
+            {"id": "island_001", "image_bbox": [44, 44, 256, 256],
+             "image_center": [150, 150], "image_area": 44944.0},
+        ],
+    }
+
+    def test_old_dataset_rebuilt_when_geometry_rule_needs_it(self):
+        islands = self._run(drop_art_boxes=True, islands_payload=self.OLD_ISLANDS)
+        self.assertTrue(
+            all(item.get("bg_flat_ratio") is not None
+                for item in islands["islands"])
+        )
+        self.assertEqual(len(islands["islands"]), 2)
+
+    def test_old_dataset_reused_when_rule_is_off(self):
+        islands = self._run(drop_art_boxes=False, islands_payload=self.OLD_ISLANDS)
+        self.assertNotIn("bg_flat_ratio", islands["islands"][0])
+        self.assertEqual(len(islands["islands"]), 1)   # 原样复用，没重建
