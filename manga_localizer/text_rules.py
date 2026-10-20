@@ -72,6 +72,32 @@ def suspicious_short_kana(text: str) -> bool:
     return is_sfx_like(text)
 
 
+def is_numeric_passthrough(text: str) -> bool:
+    """纯数字/符号串（至少含一个数字）→ 不必翻译，原样保留。
+
+    例：``１２０`` ``８１３`` ``２０２４`` ``１２，３４５`` ``〇〇１``。
+    这类岛送引擎只会换来一次无意义的调用，还可能把 ``１２０`` 翻成"一百二十"——
+    画面上的数字被改成汉字，比不翻译更糟。
+
+    判据与参考实现 ``TranslationPassthroughPolicy`` 一致：**至少一个数字，且每个
+    字符都属于数字/标点/符号/组合记号/分隔符**。含字母（``R18``）不算——字母可能
+    是要翻译的词的一部分，交给引擎更稳。
+    """
+    import unicodedata
+
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return False
+    has_number = False
+    for char in cleaned:
+        category = unicodedata.category(char)
+        if category.startswith("N"):
+            has_number = True
+        elif category[0] not in "PSMZ":
+            return False
+    return has_number
+
+
 # AI 视觉 OCR 的"说明性输出"：模型没读到字时会给一句描述/道歉，而不是空。
 # 实测拿到的原文级样本：'图片中没有任何日文文本。它看起来像是…'、
 # '图片中没有文字。' —— 这些被当成读数就会一路翻成中文，塞进原来的小框

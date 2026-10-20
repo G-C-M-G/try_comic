@@ -5,12 +5,13 @@
 字（风格化手绘），读错一次就会被译成完全不相关的词。
 
 做法：把**已经译好、且译法稳定**的拟声词回灌进 ``config/glossary.json``，
-下一轮（含全书重跑）所有页面都用同一译法。三个护栏保证"只有准确的才进库"：
+下一轮（含全书重跑）所有页面都用同一译法。四个护栏保证"只有准确的才进库"：
 
 1. 原文必须是 ``is_sfx_like``（纯假名/符号 ≤6 字）——不会把正常台词收进来；
-2. 译文必须短（≤6 字）且不在"疑问词黑名单"里——``ぎゅっ♡`` 被读成
+2. **原文不能整条都是功能词/标点**（见 ``is_function_word_only``）；
+3. 译文必须短（≤6 字）且不在"疑问词黑名单"里——``ぎゅっ♡`` 被读成
    ``どうし`` 再译成"为什么"这类失败样本，永远不会被收进术语库；
-3. 译法必须**一致且重复出现**（同一原文至少 2 次、且只有一种译法）。
+4. 译法必须**一致且重复出现**（同一原文至少 2 次、且只有一种译法）。
    一旦同一原文出现第二种译法，说明 AI 自己都没把握，直接撤出术语库，
    宁可让它每次现译，也不要锁死一个可能是错的译法。
 
@@ -30,6 +31,52 @@ AUTO_NOTE_PREFIX = "自动收录"
 
 # 译文长度上限：拟声词译文超过这个长度就不是拟声词了（AI 在编句子）
 MAX_TARGET_CHARS = 6
+
+# 功能词/标点的词性（fugashi 的 pos1）。**整条都属于这个集合**才算功能词。
+# * 含 ``接続詞``：孤立的一个 `が` / `けど` / `じゃ` 会被标成接続詞，而它们作为
+#   术语表键是有害的（`が` 出现在大量句子里）。
+# * 刻意**不含** ``記号``：感叹词（`あ` `ち` `ぷ` `オ`）被标成 記号，而它们正是
+#   合理的拟声/语气收录对象。
+# * 已知残留缺口：``や``（形状詞）与 ``わ``（記号）和感叹词同词性，POS 分不开，
+#   偶尔会漏进来。要彻底解决得按语料统计（"出现在超过 X% 的岛里"）而不是词性。
+_FUNCTION_POS = frozenset({"助詞", "助動詞", "補助記号", "接続詞"})
+
+_TAGGER = None
+
+
+def _tagger():
+    global _TAGGER
+    if _TAGGER is None:
+        from fugashi import Tagger
+
+        _TAGGER = Tagger()
+    return _TAGGER
+
+
+def is_function_word_only(text: str) -> bool:
+    """整条都是助词/助动词/标点 → 不是拟声词，不能进术语库。
+
+    `is_sfx_like` 只看"纯假名/符号且 ≤6 字"，**分不开助词和拟声**——两者都是
+    短假名串。实测（2026-09-17 从 AI 读数换回 manga-ocr 之后）术语库被塞进
+    ``の -> 的``、``は -> 哈``、``ン -> 嗯``：而 ``の`` 几乎出现在每个日文句子里，
+    于是**几乎每个岛的提示词**都会被注入"の 译作 的"——这是系统性扭曲译文，
+    比漏收几个拟声词严重得多。所以补一道词性闸。
+
+    fugashi 缺失时返回 ``False``（不加闸，维持原行为——这道闸是收紧，不是必需）。
+    """
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return True
+    try:
+        tokens = list(_tagger()(cleaned))
+    except Exception:                      # noqa: BLE001 - 词性不可用就不加闸
+        return False
+    if not tokens:
+        return True
+    return all(
+        str(getattr(token.feature, "pos1", "") or "") in _FUNCTION_POS
+        for token in tokens
+    )
 
 # 疑问词黑名单：manga-ocr 把风格化拟声词读成 どうし/どんな/どういう 之后，
 # AI 会照字面译成这些词。命中说明原文本身就是错读数，绝不能进术语库。
@@ -54,7 +101,7 @@ def collect_observations(
 ) -> dict[str, dict[str, int]]:
     """从本次翻译结果里挑出候选拟声词：``{原文: {译文: 次数}}``。
 
-    只看通过护栏 1、2 的配对；跨页累计次数，所以同一拟声词出现两次以上
+    只看通过护栏 1、2、3 的配对；跨页累计次数，所以同一拟声词出现两次以上
     才可能入库。
     """
     observations: dict[str, dict[str, int]] = {}
@@ -65,6 +112,8 @@ def collect_observations(
             if not target or "\n" in target:
                 continue
             if not is_sfx_like(source):
+                continue
+            if is_function_word_only(source):
                 continue
             if _target_chars(target) > MAX_TARGET_CHARS:
                 continue
@@ -85,10 +134,12 @@ def sync_sfx_terms(
 
     ``min_count`` 是"同一原文 + 同一译法"至少出现的次数（0 表示关闭自动收录）。
     冲突（同一原文出现多种译法）时撤出自动条目；手写条目不动。
+
+    顺带**自愈**：已入库的自动条目里，若原文其实是功能词/纯标点（历史遗留，
+    见 ``is_function_word_only``），一并撤出——否则旧库里那些 ``の -> 的``
+    永远留在那里继续污染提示词。
     """
     report: dict[str, list[str]] = empty_report()
-    if min_count <= 0 or not observations:
-        return report
     path = Path(path)
     data: dict = {}
     if path.is_file():
@@ -103,7 +154,11 @@ def sync_sfx_terms(
         terms = {}
         data["terms"] = terms
 
-    changed = False
+    changed = _drop_function_word_entries(terms, report)
+    if min_count <= 0 or not observations:
+        if changed:
+            _write_atomic(path, data)
+        return report
     for source, targets in sorted(observations.items()):
         existing = terms.get(source)
         is_auto = isinstance(existing, dict) and str(
@@ -137,6 +192,20 @@ def sync_sfx_terms(
     if changed:
         _write_atomic(path, data)
     return report
+
+
+def _drop_function_word_entries(terms: dict, report: dict) -> bool:
+    """撤出"原文其实是功能词/纯标点"的**自动**条目（手写条目不动）。"""
+    stale = [
+        source for source in list(terms)
+        if isinstance(terms.get(source), dict)
+        and str(terms[source].get("note") or "").startswith(AUTO_NOTE_PREFIX)
+        and is_function_word_only(source)
+    ]
+    for source in stale:
+        del terms[source]
+        report["removed"].append(source)
+    return bool(stale)
 
 
 def _write_atomic(path: Path, data: dict) -> None:

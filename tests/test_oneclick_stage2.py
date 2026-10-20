@@ -1,5 +1,6 @@
 """Stage 2 helpers: box joining, dropped false selections, typeset lines."""
 
+import csv
 import json
 import tempfile
 import unittest
@@ -41,6 +42,19 @@ def _unit(islands, blocks, groups):
         "blocks": blocks,
         "groups": groups,
     }
+
+
+
+def _pin_geometry_decision(case):
+    """这些用例测的是**视觉/页级路由**，与"用哪个岛级决策函数"无关 → 钉成几何，
+    免得分类器（书无关，对所有页生效）干扰路由断言。"""
+    from unittest import mock as _mock
+
+    import one_click_translate as _m
+
+    patcher = _mock.patch.object(_m, "ART_TEXT_DECISION", "geometry")
+    patcher.start()
+    case.addCleanup(patcher.stop)
 
 
 class BuildPageTextsTests(unittest.TestCase):
@@ -670,6 +684,7 @@ class ArtTextGateTests(unittest.TestCase):
         self.assertIsNone(gate)
 
     def test_disabled_book_drops_nothing(self):
+        _pin_geometry_decision(self)
         """禁用时一个岛都不丢（全部照常翻译）。"""
         units = self._units([0.10] * 10)
         readings = {f"1:box:b{i}": "ぎゅっ♡" for i in range(1, 11)}
@@ -709,6 +724,7 @@ class VisionJudgeTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_self_check_failure_routes_to_vision(self):
+        _pin_geometry_decision(self)
         """自检不住（没有长文本岛可自证）→ 走视觉判据；S/U 丢、D 留。"""
         units, readings = self._units(ratios=(0.30, 0.30, 0.30),
                                       texts=("ぎゅっ", "ぎゅっ", "ぎゅっ"))
@@ -724,6 +740,7 @@ class VisionJudgeTests(unittest.TestCase):
         self.assertEqual(texts["1"]["island_003"], "")
 
     def test_self_certifying_book_does_not_call_vision(self):
+        _pin_geometry_decision(self)
         """自证得住的书（长文本岛又多又稳）→ 走几何判据，不调接口。"""
         islands = {}
         for index in range(1, 11):
@@ -741,6 +758,378 @@ class VisionJudgeTests(unittest.TestCase):
         build_page_texts({"1": unit}, readings, {},
                          vision_judge=lambda u, t: calls.append(1) or set())
         self.assertEqual(calls, [])
+
+
+class ArtTextPageRoutingTests(unittest.TestCase):
+    """逐页路由：书级自证只当先验（art_text_book_baseline + art_text_page_gates）。
+
+    书级是个二选一（整本几何 / 整本视觉），混合的书没有位置——同一本里正片与
+    后记/版权页/彩页的性质可以完全不同。逐页规则刻意**不对称**：样本不足继承
+    书级结论（不判断、不花钱），只有明确的反向证据才改判。实测甲书 24 页里
+    只有页 22（后记：本地中位 0.34 vs 书级 0.77）被降级，其余 23 页照旧几何、
+    依旧 0 次接口调用。
+    """
+
+    def _units(self, pages):
+        """``{页: [每个长文本岛的占比]}``（调用方再自己决定哪些岛是短文本）。
+
+        每个岛竖着隔开 500px，保证"框中心落在岛内"只命中自己那一个框。
+        """
+        units = {}
+        for page, ratios in pages.items():
+            islands, blocks, groups = {}, {}, {}
+            for index, ratio in enumerate(ratios, 1):
+                iid, bid = f"island_{index:03d}", f"b{index}"
+                top = (index - 1) * 500
+                islands[iid] = {"id": iid, "image_bbox": [0, top, 200, top + 400],
+                                "members_bbox": [0, top, 200, top + 400],
+                                "bg_flat_ratio": ratio}
+                blocks[bid] = {"id": bid,
+                               "image_bbox": [20, top + 20, 180, top + 380],
+                               "page_scale": False}
+                groups[f"g{index}"] = {"id": f"g{index}", "members": [bid]}
+            units[page] = _unit(islands, blocks, groups)
+        return units
+
+    def _long_texts(self, units):
+        return {page: {iid: "あ" * 40 for iid in unit["islands"]}
+                for page, unit in units.items()}
+
+    def _readings(self, texts):
+        """按岛序号配框序号（``island_003`` ↔ ``b3``）——不能依赖字典顺序。"""
+        readings = {}
+        for page, page_texts in texts.items():
+            for index in range(1, len(page_texts) + 1):
+                readings[f"{page}:box:b{index}"] = page_texts[f"island_{index:03d}"]
+        return readings
+
+    def _gates(self, pages, *, promote=None):
+        from one_click_translate import (
+            art_text_book_baseline, art_text_page_gates,
+        )
+
+        units = self._units(pages)
+        texts = self._long_texts(units)
+        baseline = art_text_book_baseline(units, texts)
+        gates = art_text_page_gates(units, texts, baseline, promote=promote)
+        return units, texts, baseline, gates
+
+    def test_page_that_refutes_the_book_baseline_goes_to_vision(self):
+        """后记那种页（本地长文本岛其实是横排印刷正文）单独转视觉。"""
+        _, _, baseline, gates = self._gates(
+            {"1": [0.77] * 4, "2": [0.77] * 4, "3": [0.77] * 4,
+             "4": [0.77] * 4, "5": [0.30] * 3},
+        )
+        self.assertAlmostEqual(baseline["gate"], 0.69, places=2)
+        self.assertIsNone(gates["5"])
+        for page in ("1", "2", "3", "4"):
+            self.assertAlmostEqual(gates[page], 0.69, places=2)
+
+    def test_too_few_samples_never_demotes(self):
+        """样本不足的页不做判断——页级样本天然稀少（实测中位只有 3~6 个）。"""
+        _, _, baseline, gates = self._gates(
+            {"1": [0.77] * 6, "2": [0.77] * 6, "3": [0.30] * 2},
+        )
+        self.assertIsNotNone(baseline["gate"])
+        self.assertAlmostEqual(gates["3"], 0.69, places=2)
+
+    def test_mixed_page_with_enough_samples_can_also_demote(self):
+        """样本够多（≥5）时，本地 p25 低于书级门槛也算自证不住。"""
+        _, _, baseline, gates = self._gates(
+            {"1": [0.77] * 8, "2": [0.77] * 8,
+             "3": [0.85, 0.85, 0.85, 0.85, 0.30, 0.30]},
+        )
+        self.assertAlmostEqual(baseline["gate"], 0.69, places=2)
+        self.assertIsNone(gates["3"])
+
+    def test_failed_book_sends_every_page_to_vision_by_default(self):
+        """书级自证不住 → 默认整本视觉（升级默认关）。"""
+        chichi = [0.40, 0.46, 0.50, 0.53, 0.55, 0.56, 0.60, 0.62, 0.64, 0.66,
+                  0.68, 0.70, 0.70, 0.71, 0.72, 0.72, 0.73, 0.74, 0.75, 0.76]
+        _, _, baseline, gates = self._gates(
+            {"1": chichi[:10], "2": chichi[10:]},
+        )
+        self.assertIsNone(baseline["gate"])
+        self.assertTrue(all(value is None for value in gates.values()))
+
+    def test_promote_needs_stronger_evidence_than_the_book_level(self):
+        """promote 打开后，只有本地 p25 ≥ 0.70 且样本 ≥ 4 的页才升回几何。"""
+        _, _, baseline, gates = self._gates(
+            {"1": [0.40] * 6, "2": [0.40] * 6, "3": [0.77] * 4}, promote=True)
+        self.assertIsNone(baseline["gate"])
+        self.assertAlmostEqual(gates["3"], 0.69, places=2)
+        self.assertIsNone(gates["1"])
+        self.assertIsNone(gates["2"])
+        # 证据不够（只有 3 个样本）就不升
+        _, _, _, weak = self._gates(
+            {"1": [0.40] * 6, "2": [0.40] * 6, "3": [0.77] * 3}, promote=True)
+        self.assertIsNone(weak["3"])
+
+    def test_promoted_page_is_not_sent_to_vision(self):
+        _pin_geometry_decision(self)
+        """升级的页走几何（不花钱），其余页才送视觉判据。"""
+        from unittest import mock
+
+        import one_click_translate
+
+        units, texts, _, _ = self._gates(
+            {"1": [0.40] * 6, "2": [0.40] * 6, "3": [0.77] * 4 + [0.30]},
+            promote=True)
+        texts["3"]["island_005"] = "ぎゅっ"        # 该页的短拟声（占比 0.30）
+        readings = self._readings(texts)
+        asked = []
+
+        def judge(units_arg, _texts_arg):
+            asked.extend(sorted(units_arg))
+            return set()
+
+        with mock.patch.object(one_click_translate, "ART_TEXT_PAGE_PROMOTE", True):
+            result, _ = build_page_texts(units, readings, {}, vision_judge=judge)
+        self.assertEqual(asked, ["1", "2"])                 # 页 3 没被问
+        self.assertEqual(result["3"]["island_005"], "")     # 几何丢掉了它（0.30）
+        self.assertEqual(result["3"]["island_001"], "あ" * 40)   # 长文本岛照旧入译
+
+    def test_demoted_page_drops_nothing_without_a_vision_endpoint(self):
+        _pin_geometry_decision(self)
+        """没配视觉接口时，被降级的页一个岛都不丢（照常翻译）。"""
+        from one_click_translate import build_page_texts
+
+        units, texts, _, gates = self._gates(
+            {"1": [0.77] * 4, "2": [0.77] * 4, "3": [0.77] * 4,
+             "4": [0.30] * 3 + [0.10]},
+        )
+        self.assertIsNone(gates["4"])
+        texts["4"]["island_004"] = "ぎゅっ"        # 页 4 的短拟声（占比 0.10）
+        readings = self._readings(texts)
+        result, _ = build_page_texts(units, readings, {}, vision_judge=None)
+        # 页 4 被判"本地自证不住"却没人可问 → 那个短岛保留（不丢）
+        self.assertEqual(result["4"]["island_004"], "ぎゅっ")
+        # 页 1 用几何：占比 0.77 的岛本来就当气泡 → 保留
+        self.assertEqual(result["1"]["island_001"], "あ" * 40)
+
+
+class VisionJudgeFailClosedTests(unittest.TestCase):
+    """视觉判据判不出来 → **保留原图、不翻译**（fail-closed）。
+
+    照译才是错的：这类岛的读数本来就不可信（接口失败、或回复里没有 S/D/U），
+    盖成中文就是往画面上写错字。代价是接口大面积故障时会整片不译，所以失败
+    必须**可见**：日志报数量，某页失败过半且 ≥3 个时标进审核页。
+    """
+
+    def _units_and_texts(self, count=3, text="ぎゅっ"):
+        islands, blocks, groups, page_texts = {}, {}, {}, {}
+        for index in range(1, count + 1):
+            iid, bid = f"island_{index:03d}", f"b{index}"
+            islands[iid] = {"id": iid, "image_bbox": [0, 0, 200, 400],
+                            "members_bbox": [0, 0, 200, 400],
+                            "bg_flat_ratio": 0.30}
+            blocks[bid] = {"id": bid, "image_bbox": [20, 20, 180, 380],
+                           "page_scale": False}
+            groups[f"g{index}"] = {"id": f"g{index}", "members": [bid]}
+            page_texts[iid] = text
+        return {"1": _unit(islands, blocks, groups)}, {"1": page_texts}
+
+    def _judge(self, root, answer_for):
+        from unittest import mock
+
+        import one_click_translate
+
+        def fake_crops(crops, *_args, **_kwargs):
+            return {crop["id"]: answer_for(crop["id"]) for crop in crops}
+
+        with mock.patch.object(one_click_translate, "_load_api_config",
+                               return_value={"ai_ocr_url": "http://x",
+                                             "ai_ocr_model": "m",
+                                             "ai_ocr_api_key": "k"}), \
+                mock.patch("manga_localizer.sfx_judge.judge_crops", fake_crops):
+            return one_click_translate.make_vision_judge(Path(root))
+
+    def _manifest(self, root):
+        path = Path(root) / "capture" / "paddle" / "1" / "capture.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"capture": {}}), encoding="utf-8")
+        return path
+
+    def test_unanswered_island_is_kept_original(self):
+        """拿不到有效回答 → 丢（保留原图），不是照译。"""
+        with tempfile.TemporaryDirectory(prefix="sfx_fail_") as tmp:
+            units, texts = self._units_and_texts()
+            judge = self._judge(tmp, lambda _key: "")
+            self.assertEqual(judge(units, texts),
+                             {"1:island_001", "1:island_002", "1:island_003"})
+
+    def test_only_d_means_translate(self):
+        """三档语义：只有 D 才照常翻译。"""
+        with tempfile.TemporaryDirectory(prefix="sfx_fail_") as tmp:
+            units, texts = self._units_and_texts()
+            answers = {"island_001": "S", "island_002": "D", "island_003": "U"}
+            judge = self._judge(tmp, lambda key: answers[key.split(":")[1]])
+            self.assertEqual(judge(units, texts),
+                             {"1:island_001", "1:island_003"})
+
+    def test_mass_failure_marks_the_page_for_review(self):
+        """整页都判不出来时该页进审核页——否则"整片不译"是静默的。"""
+        with tempfile.TemporaryDirectory(prefix="sfx_fail_") as tmp:
+            manifest = self._manifest(tmp)
+            units, texts = self._units_and_texts()
+            self._judge(tmp, lambda _key: "")(units, texts)
+            written = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertTrue(written["capture"]["selection_review_required"])
+            self.assertIn("视觉判据", written["capture"]["selection_review_reason"])
+
+    def test_partial_failure_does_not_mark_the_page(self):
+        """失败不过半就不打扰人工（只是照 fail-closed 保留原图）。"""
+        with tempfile.TemporaryDirectory(prefix="sfx_fail_") as tmp:
+            manifest = self._manifest(tmp)
+            units, texts = self._units_and_texts(count=6)
+            judge = self._judge(
+                tmp, lambda key: "" if key.split(":")[1] == "island_001" else "D")
+            self.assertEqual(judge(units, texts), {"1:island_001"})
+            written = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertNotIn("selection_review_required", written["capture"])
+
+
+class ArtTextKeepAndDumpTests(unittest.TestCase):
+    """保台词机制：被丢清单（可见）+ 强制保留清单（可救回）。
+
+    为什么不做成判据：实测**四路信号都分不开**"手绘台词"与"手绘拟声"——几何占比
+    （最低那一档也只有约 70% 是"不翻译"）、看图模型（这批上它判 S 的仍有 28 个是台词）、
+    日文词性/词典（只是长度代理，误杀降 9 个的同时漏拟声涨到 147/173）、中文侧判定
+    （F1 0.194）。所以"台词不丢"做成机制：每次丢弃都落表，人工核对后把误杀的岛写进
+    `art_text_keep.txt`，重跑就不再丢。
+    """
+
+    def _units(self, ratio=0.10, text="ぎゅっ"):
+        island = {"id": "island_001", "image_bbox": [0, 0, 200, 400],
+                  "members_bbox": [0, 0, 200, 400], "bg_flat_ratio": ratio}
+        return {"1": _unit(
+            {"island_001": island},
+            {"a": {"id": "a", "image_bbox": [20, 20, 180, 380],
+                   "page_scale": False}},
+            {"g1": {"id": "g1", "members": ["a"]}},
+        )}, {"1:box:a": text}
+
+    def test_dropped_island_is_dropped_and_listed(self):
+        """默认行为不变（短 + 岛底不平 → 丢），同时把这次丢弃落表。"""
+        from one_click_translate import build_page_texts
+
+        units, readings = self._units()
+        with tempfile.TemporaryDirectory(prefix="art_drop_") as tmp:
+            dump = Path(tmp) / "art_text_dropped.csv"
+            texts, _ = build_page_texts(units, readings, {"1": set()},
+                                        flat_gate=0.70, dump_path=dump)
+            self.assertEqual(texts["1"]["island_001"], "")
+            self.assertTrue(dump.is_file())
+            self.assertTrue(dump.with_suffix(".html").is_file())
+            rows = list(csv.DictReader(dump.open(encoding="utf-8-sig")))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["岛"], "1:island_001")
+            self.assertEqual(rows[0]["来源"], "几何")
+            self.assertEqual(rows[0]["原文"], "ぎゅっ")
+            self.assertEqual(rows[0]["保留"], "")
+
+    def test_kept_island_survives_and_is_marked(self):
+        """在保留清单里的岛不被丢（且表里标明"保留=是"，便于统计救回数）。"""
+        from one_click_translate import build_page_texts
+
+        units, readings = self._units()
+        with tempfile.TemporaryDirectory(prefix="art_keep_") as tmp:
+            dump = Path(tmp) / "art_text_dropped.csv"
+            texts, _ = build_page_texts(units, readings, {"1": set()},
+                                        flat_gate=0.70, keep={"1:island_001"},
+                                        dump_path=dump)
+            self.assertEqual(texts["1"]["island_001"], "ぎゅっ")
+            rows = list(csv.DictReader(dump.open(encoding="utf-8-sig")))
+            self.assertEqual(rows[0]["保留"], "是")
+
+    def test_keep_list_file_tolerates_comments_and_blanks(self):
+        """`art_text_keep.txt`：一行一个 `页:岛`，`#` 注释与空行忽略。"""
+        from one_click_translate import art_text_keep_list
+
+        with tempfile.TemporaryDirectory(prefix="art_keep_file_") as tmp:
+            path = Path(tmp) / "art_text_keep.txt"
+            path.write_text("# 误杀的手绘台词\n7:island_011  # よろしく\n\n"
+                            "10:island_012\n", encoding="utf-8")
+            self.assertEqual(art_text_keep_list(tmp),
+                             {"7:island_011", "10:island_012"})
+            self.assertEqual(art_text_keep_list(Path(tmp) / "nope"), set())
+
+
+class ArtTextDialogueGuardTests(unittest.TestCase):
+    """保台词档位：几何候选只丢"模型也判拟声/无字"的（全自动，无人工）。
+
+    为什么不靠判据保证：七个信号都分不开"手绘台词"与"手绘拟声"（几何占比 / 裁剪图
+    视觉判据 / 整页+红框视觉判据 / fugashi 词性 / 中文侧 / deepseek 看日文 /
+    日文母语 Sarashina2.2-3B），根本原因是判别信号在图上、文本里没有。所以做成档位，
+    实测代价写在 `thresholds.ART_TEXT_DIALOGUE_GUARD` 旁边。
+    """
+
+    def _units(self, ratios):
+        """每个岛竖着隔开 500px（否则框中心会同时落进别的岛，文本被串起来）。"""
+        islands, blocks, groups = {}, {}, {}
+        for index, ratio in enumerate(ratios, 1):
+            iid, bid = f"island_{index:03d}", f"b{index}"
+            top = (index - 1) * 500
+            islands[iid] = {"id": iid, "image_bbox": [0, top, 200, top + 400],
+                            "members_bbox": [0, top, 200, top + 400],
+                            "bg_flat_ratio": ratio}
+            blocks[bid] = {"id": bid,
+                           "image_bbox": [20, top + 20, 180, top + 380],
+                           "page_scale": False}
+            groups[f"g{index}"] = {"id": f"g{index}", "members": [bid]}
+        return {"1": _unit(islands, blocks, groups)}
+
+    def _readings(self, count, text="ぎゅっ"):
+        return {f"1:box:b{i}": text for i in range(1, count + 1)}
+
+    def test_default_off_keeps_current_behaviour(self):
+        units = self._units([0.10, 0.10])
+        texts, _ = build_page_texts(units, self._readings(2), {"1": set()},
+                                    flat_gate=0.70)
+        self.assertEqual([texts["1"][key] for key in texts["1"]], ["", ""])
+
+    def test_agree_only_drops_what_the_model_also_calls_sfx(self):
+        """模型判 D 的候选照常翻译（台词被救回），判 S 的才丢。"""
+        from unittest import mock
+
+        import one_click_translate
+
+        units = self._units([0.10, 0.10])
+        with mock.patch.object(one_click_translate,
+                               "ART_TEXT_DIALOGUE_GUARD", "agree"):
+            texts, _ = build_page_texts(
+                units, self._readings(2), {"1": set()}, flat_gate=0.70,
+                vision_judge=lambda u, t: {"1:island_001"})
+        self.assertEqual(texts["1"]["island_001"], "")
+        self.assertEqual(texts["1"]["island_002"], "ぎゅっ")
+
+    def test_strict_also_requires_a_low_flatness_ratio(self):
+        """strict 档：模型说拟声但占比不够低（0.55 > 0.40）也不丢。"""
+        from unittest import mock
+
+        import one_click_translate
+
+        units = self._units([0.10, 0.55])
+        judge = lambda u, t: {"1:island_001", "1:island_002"}  # noqa: E731
+        with mock.patch.object(one_click_translate,
+                               "ART_TEXT_DIALOGUE_GUARD", "strict"):
+            texts, _ = build_page_texts(units, self._readings(2), {"1": set()},
+                                        flat_gate=0.70, vision_judge=judge)
+        self.assertEqual(texts["1"]["island_001"], "")        # 0.10 < 0.40 → 丢
+        self.assertEqual(texts["1"]["island_002"], "ぎゅっ")   # 0.55 → 保住
+
+    def test_guard_without_an_endpoint_falls_back_to_off(self):
+        """配不上视觉接口就退回现状——绝不因为缺接口而改变行为。"""
+        from unittest import mock
+
+        import one_click_translate
+
+        units = self._units([0.10])
+        with mock.patch.object(one_click_translate,
+                               "ART_TEXT_DIALOGUE_GUARD", "agree"):
+            texts, _ = build_page_texts(units, self._readings(1), {"1": set()},
+                                        flat_gate=0.70, vision_judge=None)
+        self.assertEqual(texts["1"]["island_001"], "")
 
 
 class SfxJudgeModuleTests(unittest.TestCase):
@@ -791,3 +1180,125 @@ class SfxJudgeModuleTests(unittest.TestCase):
                                    side_effect=RuntimeError("boom")):
                 self.assertEqual(sfx_judge.judge_crops([crop], "u", "m", "k"),
                                  {crop["id"]: ""})
+
+class TypesetPageOrderTests(unittest.TestCase):
+    """PDF 页序必须按**页号数字**排（1, 2, 10, 11…），不是字典序。
+
+    踩过的坑：`Path("10.typeset.png").stem` == "10.typeset"（只剥最后一个后缀），
+    永远不是纯数字 → 排序落进字符串分支 → PDF 变成 1, 10, 100, 101…（实测 160 页
+    只有第 1 页对）。
+    """
+
+    def test_numeric_page_order(self):
+        from one_click_translate import _typeset_page_sort_key
+
+        names = ["10.typeset.png", "2.typeset.png", "1.typeset.png",
+                 "100.typeset.png", "11.typeset.png", "3.typeset.png"]
+        ordered = sorted(names, key=_typeset_page_sort_key)
+        self.assertEqual(ordered, ["1.typeset.png", "2.typeset.png",
+                                   "3.typeset.png", "10.typeset.png",
+                                   "11.typeset.png", "100.typeset.png"])
+
+    def test_non_numeric_names_go_last(self):
+        from one_click_translate import _typeset_page_sort_key
+
+        names = ["cover.typeset.png", "2.typeset.png", "1.typeset.png"]
+        ordered = sorted(names, key=_typeset_page_sort_key)
+        self.assertEqual(ordered[0], "1.typeset.png")
+        self.assertEqual(ordered[-1], "cover.typeset.png")
+
+
+class StrictUnionDropTests(unittest.TestCase):
+    """严格联合版岛级裁决（用户 2026-09-30 定稿，开发记录 六之前四）：
+
+        留日文 = (P(台词) < ART_TEXT_CLASSIFIER_THRESHOLD ∨ sfx_soft_flag)
+                 ∧ 字数 < ART_TEXT_STRICT_MAX_CHARS
+
+    要锁住的边界：
+    * **≥护栏字数的岛结构上不因拟声判据留日文**——哪怕框级标记了、分类器给了
+      极低分（成句台词零伤害是逻辑保证，不依赖模型可靠度）；
+    * 框级软标记是独立于分类器的一票：标记本身就足以丢掉短岛（分类器给高分
+      也拦不回——它只进复核清单/丢弃清单供人工翻案）；
+    * 人工 force_drop 优先于护栏（用户明确判过的岛不受护栏保护）；
+    * k=5 交叠带（被标记 ∧ 字数 5~6）自动按 k=7 丢，但必须进复核清单。
+    """
+
+    def _units(self, *, flag=False, ratio=0.50):
+        island = {"id": "island_001", "image_bbox": [0, 0, 200, 400],
+                  "members_bbox": [0, 0, 200, 400], "bg_flat_ratio": ratio}
+        if flag:
+            island["sfx_soft_flag"] = True
+        return {"1": _unit(
+            {"island_001": island},
+            {"a": {"id": "a", "image_bbox": [20, 20, 180, 380],
+                   "page_scale": False}},
+            {"g1": {"id": "g1", "members": ["a"]}},
+        )}, {"1:box:a": "ぎゅっ"}
+
+    @staticmethod
+    def _weights(b):
+        """全零权重 + 偏置 b → P(台词) 恒为 sigmoid(b)，与特征无关。"""
+        return {"mean": [0.0] * 11, "std": [1.0] * 11, "w": [0.0] * 11,
+                "b": b, "trained_on": {"islands": 1542}}
+
+    def _run(self, units, readings, b, **kwargs):
+        from unittest import mock
+
+        from manga_localizer import sfx_classifier
+
+        with mock.patch.object(sfx_classifier, "load_weights",
+                               return_value=self._weights(b)):
+            return build_page_texts(units, readings, {"1": set()}, **kwargs)
+
+    def test_flagged_short_island_dropped_even_with_high_score(self):
+        """框级标记单独是一票：分类器判台词（高分）也拦不回短岛。"""
+        units, readings = self._units(flag=True, ratio=0.90)
+        texts, _ = self._run(units, readings, b=5.0)
+        self.assertEqual(texts["1"]["island_001"], "")
+
+    def test_flagged_long_island_rescued_by_char_guard(self):
+        """护栏：被标记的 ≥7 字岛照常翻译（结构性，不依赖模型）。"""
+        units, _ = self._units(flag=True, ratio=0.10)
+        readings = {"1:box:a": "よろしくおねがいします"}   # 11 字
+        texts, _ = self._run(units, readings, b=-5.0)
+        self.assertEqual(texts["1"]["island_001"], "よろしくおねがいします")
+
+    def test_low_score_short_island_dropped(self):
+        units, readings = self._units(flag=False, ratio=0.50)
+        texts, _ = self._run(units, readings, b=-5.0)   # P≈0.007 < 0.6
+        self.assertEqual(texts["1"]["island_001"], "")
+
+    def test_low_score_long_island_kept_by_guard(self):
+        units, _ = self._units(flag=False, ratio=0.50)
+        readings = {"1:box:a": "ちょっと待っててね今日は"}   # 12 字
+        texts, _ = self._run(units, readings, b=-5.0)
+        self.assertEqual(texts["1"]["island_001"], readings["1:box:a"])
+
+    def test_high_score_short_island_kept(self):
+        units, readings = self._units(flag=False, ratio=0.90)
+        texts, _ = self._run(units, readings, b=5.0)    # P≈0.993 ≥ 0.6
+        self.assertEqual(texts["1"]["island_001"], "ぎゅっ")
+
+    def test_force_drop_overrides_char_guard(self):
+        """人工判定优先：force_drop 的岛不受字数护栏保护。"""
+        units, _ = self._units(flag=False, ratio=0.90)
+        readings = {"1:box:a": "よろしくおねがいします"}
+        texts, _ = self._run(units, readings, b=5.0,
+                             force_drop={"1:island_001"})
+        self.assertEqual(texts["1"]["island_001"], "")
+
+    def test_k5_band_flagged_islands_land_in_review(self):
+        """复核加厚带：被标记 ∧ 字数 5~6 → 自动按 k=7 丢，但必须进复核清单。"""
+        import csv as _csv
+        import tempfile as _tempfile
+
+        units, _ = self._units(flag=True, ratio=0.50)
+        readings = {"1:box:a": "だいすき♡"}   # 5 字，落在 [5, 7) 交叠带
+        with tempfile.TemporaryDirectory(prefix="strict_k5_") as tmp:
+            dump = Path(tmp) / "art_text_dropped.csv"
+            texts, _ = self._run(units, readings, b=5.0, dump_path=dump)
+            self.assertEqual(texts["1"]["island_001"], "")   # 照 k=7 丢
+            rows = list(_csv.DictReader(
+                dump.with_name("art_text_review.csv").open(encoding="utf-8-sig")))
+            self.assertIn("1:island_001", {r["岛"] for r in rows})
+            self.assertEqual(rows[0]["决定"], "丢")

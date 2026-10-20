@@ -135,6 +135,37 @@ class OpenAICompatibleTranslatorHTTPTest(unittest.TestCase):
         self.assertIn("request failed", str(caught.exception))
         self.assertIn("connection refused", str(caught.exception))
 
+    def test_bare_timeout_raises_translation_timeout(self):
+        """超时要单独报——以前所有传输故障都塌成 "request failed"，分不出来。"""
+        from manga_localizer.errors import TranslationTimeoutError
+
+        with mock.patch(
+            "manga_localizer.translator.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ):
+            with self.assertRaises(TranslationTimeoutError) as caught:
+                _translator().translate(_request(), _GLOSSARY)
+        self.assertIn("timed out after 90s", str(caught.exception))
+
+    def test_wrapped_timeout_also_detected(self):
+        """urlopen 的超时也会被 URLError(reason=TimeoutError) 包着，同样要认出来。"""
+        from manga_localizer.errors import TranslationTimeoutError
+
+        with mock.patch(
+            "manga_localizer.translator.urlopen",
+            side_effect=urllib.error.URLError(TimeoutError("timed out")),
+        ):
+            with self.assertRaises(TranslationTimeoutError):
+                _translator().translate(_request(), _GLOSSARY)
+
+    def test_timeout_is_a_translation_error(self):
+        """调用方按 TranslationError 捕获的老代码不会因为新类型而漏接。"""
+        from manga_localizer.errors import (
+            TranslationError, TranslationTimeoutError,
+        )
+
+        self.assertTrue(issubclass(TranslationTimeoutError, TranslationError))
+
     def test_non_2xx_status_raises(self):
         with mock.patch(
             "manga_localizer.translator.urlopen",

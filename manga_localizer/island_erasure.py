@@ -23,6 +23,7 @@ from .eraser import (
     Inpainter,
     LocalStatisticsStyleClassifier,
     OpenCVFSRInpainter,
+    select_inpainter,
     PixelDifferenceAudit,
     RGBColor,
     sample_ring_color,
@@ -134,7 +135,7 @@ def erase_island_image(
         combined=combined,
         union_pixel_count=combined.histogram()[255],
     )
-    active_inpainter = inpainter or OpenCVFSRInpainter()
+    active_inpainter = inpainter or select_inpainter(config)
     working = source.copy()
     execution: Dict[str, Tuple[str, Optional[RGBColor]]] = {}
     inpaint_groups: Dict[str, Tuple[Inpainter, Image.Image]] = {}

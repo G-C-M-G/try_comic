@@ -81,6 +81,41 @@ class ShortSourceTests(unittest.TestCase):
         self.assertFalse(short_source("   ", 6))
 
 
+class NumericPassthroughTests(unittest.TestCase):
+    """纯数字/符号串不必翻译（省一次调用，且避免数字被改成汉字）。"""
+
+    def test_pure_numbers_pass_through(self):
+        from manga_localizer.text_rules import is_numeric_passthrough
+
+        for text in ("120", "８１３", "１２０", "２０２４", "１２，３４５", "０７",
+                     "〇〇１", "（３）", "1-2", "１２００．"):
+            with self.subTest(text=text):
+                self.assertTrue(is_numeric_passthrough(text))
+
+    def test_letters_block_passthrough(self):
+        """含字母不算——字母可能是要翻译的词的一部分（``R18`` 交给引擎更稳）。"""
+        from manga_localizer.text_rules import is_numeric_passthrough
+
+        for text in ("R18", "DOJIN", "２年Ａ組", "vol.3"):
+            with self.subTest(text=text):
+                self.assertFalse(is_numeric_passthrough(text))
+
+    def test_kana_and_kanji_block_passthrough(self):
+        from manga_localizer.text_rules import is_numeric_passthrough
+
+        for text in ("１２０ｃｍ", "18歳未満", "２時間", "あ", "一"):
+            with self.subTest(text=text):
+                self.assertFalse(is_numeric_passthrough(text))
+
+    def test_symbols_without_a_digit_are_not_passthrough(self):
+        """没有数字的纯符号串不走这条（那条由 _is_short_symbol 管）。"""
+        from manga_localizer.text_rules import is_numeric_passthrough
+
+        for text in ("♡", "……", "！？", "", "   "):
+            with self.subTest(text=text):
+                self.assertFalse(is_numeric_passthrough(text))
+
+
 class OcrCommentaryTests(unittest.TestCase):
     """AI OCR 的说明性输出不是读数（实测：被当读数翻成中文塞进原框）。"""
 

@@ -10,7 +10,11 @@ from typing import Any, Dict, Mapping, Optional, Protocol, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .errors import TranslationError, TranslationResponseError
+from .errors import (
+    TranslationError,
+    TranslationResponseError,
+    TranslationTimeoutError,
+)
 from .text_rules import normalize_ellipsis
 from .ocr_contract import OCRContract
 
@@ -258,6 +262,13 @@ class OpenAICompatibleTranslator:
                 f"{self.name} HTTP {error.code}: {detail or error.reason}"
             ) from error
         except (URLError, TimeoutError, OSError) as error:
+            # 超时单独报：urlopen 的超时可能是 TimeoutError，也可能是
+            # URLError(reason=TimeoutError) 包着，两种都要认出来。
+            reason = getattr(error, "reason", None)
+            if isinstance(error, TimeoutError) or isinstance(reason, TimeoutError):
+                raise TranslationTimeoutError(
+                    f"{self.name} timed out after {self.timeout_seconds:g}s"
+                ) from error
             raise TranslationError(f"{self.name} request failed: {error}") from error
         if not 200 <= int(status) < 300:
             raise TranslationError(f"{self.name} returned HTTP {status}")

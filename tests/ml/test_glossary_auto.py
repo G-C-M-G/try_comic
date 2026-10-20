@@ -1,7 +1,8 @@
 """拟声词自动进术语库（manga_localizer.glossary_auto）的测试。
 
-三道护栏各自成测：原文必须是短拟声、译文必须短且不是疑问词、译法必须
-一致且重复出现；另外验证手写条目不被覆盖、冲突时自动撤出、以及收集
+四道护栏各自成测：原文必须是短拟声、**原文不能整条都是功能词/标点**、
+译文必须短且不是疑问词、译法必须一致且重复出现；另外验证手写条目不被
+覆盖、冲突时自动撤出、历史遗留的功能词条目会被自愈撤出、以及收集
 （collect_observations）只看通过护栏的配对。
 """
 
@@ -13,6 +14,7 @@ from pathlib import Path
 from manga_localizer.glossary_auto import (
     AUTO_NOTE_PREFIX,
     collect_observations,
+    is_function_word_only,
     sync_sfx_terms,
 )
 
@@ -164,6 +166,76 @@ class SyncSfxTermsTests(unittest.TestCase):
         after = load_glossary(self.path)
         self.assertNotEqual(before, after.sha256)
         self.assertIn("ちゅっ♡ -> 啾♡", after.prompt_text("ちゅっ♡"))
+
+
+class FunctionWordGuardTests(unittest.TestCase):
+    """护栏 2：整条是功能词/标点的原文不能进术语库。
+
+    实测背景（2026-09-17 把读数从 AI 视觉模型换回 manga-ocr 之后）：短假名读数
+    变多，`is_sfx_like` 只看"纯假名/符号 ≤6 字"、分不开助词与拟声，于是术语库
+    被塞进 `の -> 的`、`は -> 哈`、`が -> ？`。而 `の` 几乎出现在每个日文句子里，
+    于是几乎每个岛的提示词都会被注入"の 译作 的"——系统性扭曲译文。
+    """
+
+    def test_particles_and_auxiliaries_are_function_words(self):
+        for text in ("の", "は", "を", "と", "も", "って", "が", "けど", "じゃ",
+                     "にゃ", "ン", "かわ♡"):
+            with self.subTest(text=text):
+                self.assertTrue(is_function_word_only(text))
+
+    def test_pure_punctuation_is_function_word_only(self):
+        for text in ("。", "！", "！！", "？", "…", "♡", "〜", "，、。", "   "):
+            with self.subTest(text=text):
+                self.assertTrue(is_function_word_only(text))
+
+    def test_interjections_and_real_sfx_are_kept(self):
+        """感叹词被标成 記号，不能一起挡掉——它们正是要收录的对象。"""
+        for text in ("あ", "ち", "ぷ", "オ", "ぎゅっ♡", "ドキドキ", "はぁ",
+                     "おっ", "うん", "もみもみ", "ちゅっ♡"):
+            with self.subTest(text=text):
+                self.assertFalse(is_function_word_only(text))
+
+    def test_collect_observations_skips_function_words(self):
+        texts = {"1": {"a": "の", "b": "ぎゅっ♡", "c": "は"}}
+        translations = {"1": {"a": "的", "b": "夹紧♡", "c": "哈"}}
+        observations = collect_observations(texts, translations)
+        self.assertNotIn("の", observations)
+        self.assertNotIn("は", observations)
+        self.assertIn("ぎゅっ♡", observations)
+
+    def test_sync_removes_legacy_function_word_entries(self):
+        """历史遗留的 `の -> 的` 会被自愈撤出（不必等重新收集）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "glossary.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "terms": {
+                    "の": {"translation": "的",
+                           "note": AUTO_NOTE_PREFIX + "·拟声词（重复 9 次）"},
+                    "ぎゅっ♡": {"translation": "夹紧♡",
+                                "note": AUTO_NOTE_PREFIX + "·拟声词（重复 3 次）"},
+                    "手写词": {"translation": "手工", "note": "人工加的"},
+                },
+            }, ensure_ascii=False), encoding="utf-8")
+            report = sync_sfx_terms(path, {}, min_count=0)
+            self.assertIn("の", report["removed"])
+            terms = json.loads(path.read_text(encoding="utf-8"))["terms"]
+            self.assertNotIn("の", terms)
+            self.assertIn("ぎゅっ♡", terms)          # 正常自动条目保留
+            self.assertIn("手写词", terms)             # 手写条目永不动
+
+    def test_sync_keeps_hand_written_function_word(self):
+        """手写的条目即便像功能词也不动——护栏只作用于自动条目。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "glossary.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "terms": {"の": {"translation": "之", "note": "用户手写"}},
+            }, ensure_ascii=False), encoding="utf-8")
+            report = sync_sfx_terms(path, {}, min_count=0)
+            self.assertEqual(report["removed"], [])
+            self.assertIn("の", json.loads(
+                path.read_text(encoding="utf-8"))["terms"])
 
 
 if __name__ == "__main__":

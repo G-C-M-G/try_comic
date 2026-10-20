@@ -1,7 +1,9 @@
 """One-click manga translation.
 
-Stage 1 (capture-only, default): parallel Photos frames + blue-box capture
-with fixed tiled windows; every page gets a ``{page}.bluebox_check.png``
+Stage 1 (capture-only, default): PaddleOCR full-page text detection
+(``--box-source paddle``); ``--box-source photos`` switches back to the
+legacy parallel Photos frames + blue-box capture with fixed tiled windows.
+Every page gets a ``{page}.bluebox_check.png``
 annotation (islands gold, blue boxes blue) so the user can inspect the OCR
 units before anything else runs.
 
@@ -75,6 +77,21 @@ from manga_localizer.thresholds import (
     ART_TEXT_GATE_MAX,
     ART_TEXT_GATE_MIN,
     ART_TEXT_PAD,
+    ART_TEXT_PAGE_DEMOTE_MARGIN,
+    ART_TEXT_PAGE_DEMOTE_MIN_SAMPLES,
+    ART_TEXT_PAGE_MIN_SAMPLES,
+    ART_TEXT_PAGE_PROMOTE,
+    ART_TEXT_PAGE_PROMOTE_MIN_SAMPLES,
+    ART_TEXT_PAGE_PROMOTE_P25,
+    ART_TEXT_GUARD_RATIO,
+    ART_TEXT_DIALOGUE_GUARD,
+    ART_TEXT_DECISION,
+    ART_TEXT_CLASSIFIER_THRESHOLD,
+    ART_TEXT_REVIEW_BAND,
+    ART_TEXT_SOFT_FLAG_PAGE,
+    ART_TEXT_SOFT_FLAG_RATIO,
+    ART_TEXT_SOFT_REVIEW_MIN_CHARS,
+    ART_TEXT_STRICT_MAX_CHARS,
     ART_TEXT_VERTICAL_RATIO,
     ART_TEXT_VISION_CONTEXT,
     PAGE_FONT_CEILING_RATIO,
@@ -88,6 +105,13 @@ from manga_localizer.thresholds import (
     bbox_pad as source_bbox_pad,
     glyph_margin as source_glyph_margin,
 )
+
+# 擦字修复后端默认值。``auto``：有 LaMa 模型就用它（实测更准——FSR 会留黑残块 /
+# 糊掉"白带+黑盒"结构 / 把网点抹成一片白灰，LaMa 在三个病态案例上全胜；见
+# 开发记录 §13.4）。代价是**CPU 上慢 4~6 倍**（本机 onnxruntime 只有 CPU
+# provider；实测页7 38.2s vs 5.8s、页60 20.9s vs 6.0s）。想要速度改 ``"fsr"``。
+# 这个值进擦字缓存键，所以来回切换会自动重擦。
+ERASE_INPAINTER = "auto"
 
 BLUEBOX_FILL = (0, 0, 0)  # fill colour outside blue boxes (--bluebox-fill)
 
@@ -339,6 +363,36 @@ def _filter_large_sfx(
                 kept.append(box)
     kept.sort(key=lambda box: (box[1], -box[2]))
     return kept, dropped
+
+
+def soft_flag_large_sfx(
+    bboxes: list[list[int]], image_w: int, image_h: int, *,
+    ratio: float = ART_TEXT_SOFT_FLAG_RATIO,
+    page_floor: float = ART_TEXT_SOFT_FLAG_PAGE, min_group: int = 3,
+) -> list[list[int]]:
+    """框级软标记：大拟音硬过滤（2.0×/10%）的**放宽档，只标记不丢框**。
+
+    严格联合版（开发记录 六之前四）的框级票：放宽到 1.2×同方向基准 且 > 页短边
+    5% 的框打上"疑似效果字"标记，**框和文本都留在数据集里**——成岛后由岛级
+    裁决（拿到 OCR 全文与分类器分数那一刻），被标记的岛 ≥ART_TEXT_STRICT_MAX_CHARS
+    字就整岛救回、全文翻译。不丢框是救援的前提：丢了框，救回的岛就缺一段墨、
+    断一句文。实测（CV）软标记贡献了严格版 453 个拦截里的 424 个。
+    判据形态与 ``_filter_large_sfx`` 同族（短边/同方向基准 + 页短边绝对下限），
+    基准算法共用（某方向样本 < min_group 回落全页中位）。
+    """
+    if len(bboxes) < 3:
+        return []
+    short = [min(box[2] - box[0], box[3] - box[1]) for box in bboxes]
+    page_median = float(np.median(short))
+    floor_px = page_floor * min(image_w, image_h)
+    flagged: list[list[int]] = []
+    for key, indices in _direction_groups(bboxes).items():
+        baseline = _direction_baseline(bboxes, key, min_group=min_group,
+                                       page_median=page_median)
+        for index in indices:
+            if short[index] > ratio * baseline and short[index] > floor_px:
+                flagged.append(bboxes[index])
+    return flagged
 
 
 def flat_background_ratio(
@@ -775,29 +829,82 @@ def _load_readings_cache(out_root: Path) -> dict:
     }
 
 
-def _store_readings_cache(out_root: Path, readings: dict) -> None:
+def _load_readings_engines(out_root: Path) -> dict[str, str]:
+    """读数由哪个引擎产出（``{crop_id: "manga-ocr" | "ai-ocr"}``）。
+
+    和 ``ocr_readings.json`` 分开存，是为了**不动那份缓存的结构**（多处读它、
+    测试也锁着）。缺这个文件 = 旧格式缓存（出处未知）；那时按"出处不符"处理，
+    整本重读一次把出处补齐——否则"缓存里混着两个引擎的读数"会一直查不出来
+    （2026-09 实测：乙书 是 manga-ocr 读的、甲书 是视觉模型读的，半个月
+    无人察觉，正是因为没有这个字段）。
+    """
+    path = out_root / "ocr_readings.engines.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in payload.items()
+        if isinstance(value, str) and value.strip()
+    }
+
+
+def _store_readings_cache(out_root: Path, readings: dict,
+                          engines: dict[str, str] | None = None) -> None:
     """Merge ``readings`` into the persisted OCR cache (atomic replace).
 
     The write merges with the on-disk state, so parallel segment
     processes do not lose each other's entries (the last writer wins only
     for entries written concurrently between load and store).
+
+    ``engines`` records the producing engine per crop id（同一轮里也可能有两种：
+    强制 ai-ocr 时读空的框会回退 manga-ocr）。只给真正写进缓存的键记出处。
     """
+    stored = {key: text for key, text in readings.items() if str(text or "").strip()}
     merged = _load_readings_cache(out_root)
-    merged.update(
-        {key: text for key, text in readings.items() if str(text or "").strip()}
-    )
+    merged.update(stored)
     path = out_root / "ocr_readings.json"
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
+    if engines:
+        merged_engines = _load_readings_engines(out_root)
+        merged_engines.update(
+            {key: engines[key] for key in stored if engines.get(key)}
+        )
+        engines_path = out_root / "ocr_readings.engines.json"
+        engines_tmp = engines_path.with_suffix(".json.tmp")
+        engines_tmp.write_text(
+            json.dumps(merged_engines, ensure_ascii=False), encoding="utf-8")
+        engines_tmp.replace(engines_path)
 
-def _select_crop_misses(crops: list[dict], cached: dict) -> list[dict]:
-    """Crops without a cached non-empty reading (these need OCR)."""
-    return [
-        crop for crop in crops
-        if not str((cached.get(crop["id"]) or "")).strip()
-    ]
+
+def _select_crop_misses(crops: list[dict], cached: dict,
+                        engines: dict[str, str] | None = None,
+                        engine: str = "") -> list[dict]:
+    """Crops without a cached non-empty reading (these need OCR).
+
+    ``engine`` 给了就顺带把"**缓存是别的引擎读的**"也算成 miss：换引擎时读数
+    不该被静默复用（甲书 的视觉模型读数就是这样一路留下来的）。出处**缺失**
+    （旧格式缓存）同样算 miss，重读一次补上出处；代价是换引擎那一次要整本重读
+    （manga-ocr 免费），换来的是"缓存里混着两个引擎"从此可查。
+    """
+    engines = engines or {}
+    out = []
+    for crop in crops:
+        text = str(cached.get(crop["id"]) or "").strip()
+        if not text:
+            out.append(crop)
+            continue
+        if engine and engines.get(crop["id"]) != engine:
+            out.append(crop)
+    return out
 
 
 def _write_cache_json(path: Path, payload: dict) -> None:
@@ -886,6 +993,18 @@ def _purge_page_artifacts(out_root: Path, pages: list[str], *,
                 for key in stale:
                     del payload[key]
                 _write_cache_json(path, payload)
+        # 出处侧车跟着一起清，否则重采后旧出处会盖在新的读数上
+        engines_path = out_root / "ocr_readings.engines.json"
+        if engines_path.is_file():
+            engines_payload = _load_readings_engines(out_root)
+            stale_engines = [
+                key for key in engines_payload
+                if key.split(":", 1)[0] in selected
+            ]
+            if stale_engines:
+                for key in stale_engines:
+                    del engines_payload[key]
+                _write_cache_json(engines_path, engines_payload)
     if translations:
         path = out_root / "translations.json"
         if path.is_file():
@@ -941,6 +1060,8 @@ def _page_units(dataset_dir: Path, page: str) -> dict | None:
         "islands": {i["id"]: i for i in islands["islands"]},
         "blocks": box_by_id,
         "groups": {g["id"]: g for g in groups},
+        # 页尺寸（分类器的 area_ratio 特征要用真实值，不能用岛 bbox 估算）
+        "image_size": list(islands.get("image_size") or []),
     }
 
 
@@ -968,7 +1089,10 @@ def _load_page_texts(out_root: Path, pages: list[str]) -> tuple[dict, dict, dict
             if f"{page}:box:{box_id}" not in readings
         }
     texts, directions = build_page_texts(
-        units, readings, dropped, vision_judge=make_vision_judge(out_root))
+        units, readings, dropped, vision_judge=make_vision_judge(out_root),
+        keep=art_text_keep_list(out_root),
+        force_drop=art_text_force_drop_list(out_root),
+        dump_path=Path(out_root) / "art_text_dropped.csv")
     return texts, directions, dropped
 
 
@@ -983,20 +1107,49 @@ def run_manga(
     ai_ocr_workers: int = AI_OCR_DEFAULT_WORKERS,
     stage2_engine: str = "manga-ocr",
 ) -> tuple[dict, set[str]]:
-    """OCR every crop: AI vision model when configured, else manga-ocr.
+    """OCR every crop with the **local manga-ocr** model.
 
-    The AI path (OpenAI-compatible vision, e.g. GLM-4V / Qwen-VL) posts
-    each crop as an image message; without a configured vision endpoint
-    manga-ocr runs in one subprocess (model loads once).
+    The AI vision path (OpenAI-compatible, e.g. GLM-4V / Qwen-VL) is
+    **opt-in only** —— 它在 ``stage2_engine == "ai-ocr"`` 时才跑，**不再**
+    因为 ``ai_ocr_*`` 配着就自动接管。以前不是这样：第二个分支是
+    "只要 url/model/key 配全就用视觉模型读全部"，于是 ``stage2_engine =
+    "manga-ocr"`` 名存实亡、每本新书白花"框数"次付费调用（实测 乙书 829 /
+    甲书 586）。
+
+    为什么默认改回 manga-ocr（2026-09，甲书 同一批裁剪上两臂对照）：随机抽 32
+    个两臂不一致的框逐张看图判定，**manga-ocr 对 23 / 视觉模型对 3**（赢的三例
+    都是印刷体拉丁：`[出版社]` 标志、`[印刷体日文]`、`発行：[出版社]`）。视觉
+    模型输在手绘竖排——画面一整列 7 个字只读出 `素敵`、`そっ！！` 读成 `毛`、
+    `す`+`で` 读成 `です`；另有三种格式性故障：返回 markdown 代码围栏、逐字加
+    换行、回中文元评论（`图片中没有任何日文文本。它看起来是一个图形设计或标志…`
+    / `图片中没有文字。` / `（无文字）`）。后者占全书 9/590 = 1.5%，会被
+    ``is_ocr_commentary`` 过滤成空读数 → **该框台词直接丢失**。详见
+    ``开发记录`` §五之后.1。
 
     OCR readings are persisted to ``out_root/ocr_readings.json`` (non-empty
     only): crops with a cached reading skip the OCR pass entirely, so
     re-running stage 2 (re-grouping, re-typesetting, PDF merge) costs no
     re-recognition.  Boxes that read empty are never cached and are OCRed
-    again on every run (the two-pass false-selection check).
+    again on every run (the two-pass false-selection check).  读数由哪个引擎
+    产出记在 ``ocr_readings.engines.json``：旧版没有这个字段，"缓存里混着两个
+    引擎的读数"因此查不出来（乙书 是 manga-ocr 读的、甲书 是视觉模型读的，
+    半个月无人察觉）。换引擎时按出处**整本重读**。
     """
     cached = _load_readings_cache(out_root)
-    misses = _select_crop_misses(crops, cached)
+    engines_cached = _load_readings_engines(out_root)
+    misses = _select_crop_misses(crops, cached, engines_cached, stage2_engine)
+    stale_engine = [
+        crop for crop in misses if str((cached.get(crop["id"]) or "")).strip()
+    ]
+    if stale_engine and progress is not None:
+        recorded = sorted({
+            engines_cached.get(crop["id"]) or "出处未知"
+            for crop in stale_engine
+        })
+        progress.log(
+            f"读数引擎与缓存不符（缓存是 {'/'.join(recorded)}，本次 "
+            f"{stage2_engine}）→ {len(stale_engine)} 框重读一遍"
+        )
     fallback_ids: set[str] = set()
     if stage2_engine == "ai-ocr":
         if not (ai_ocr_url and ai_ocr_model and ai_ocr_api_key):
@@ -1026,13 +1179,6 @@ def run_manga(
         else:
             # all crops cached: nothing to read, even in forced ai-ocr mode
             readings = {}
-    elif misses and (ai_ocr_url and ai_ocr_model and ai_ocr_api_key):
-        from manga_localizer.ai_ocr import ai_ocr_readings
-
-        readings = ai_ocr_readings(
-            misses, ai_ocr_url, ai_ocr_model, ai_ocr_api_key,
-            progress=progress, max_workers=ai_ocr_workers,
-        )
     elif misses:
         readings = _run_manga_subprocess(misses, out_root, progress)
     else:
@@ -1047,7 +1193,10 @@ def run_manga(
         del readings[key]
     if dropped_commentary and progress is not None:
         progress.log(f"丢弃 {len(dropped_commentary)} 条 OCR 说明性输出（不是文字）")
-    _store_readings_cache(out_root, readings)
+    _store_readings_cache(
+        out_root, readings,
+        {crop["id"]: ("manga-ocr" if crop["id"] in fallback_ids else stage2_engine)
+         for crop in misses})
     result = {}
     for crop in crops:
         value = str(readings.get(crop["id"]) or cached.get(crop["id"]) or "")
@@ -1399,6 +1548,7 @@ def build_bluebox_dataset(
     image_w = int(source["width"])
     image_h = int(source["height"])
     # 共用的大拟音/效果字过滤（Photos 与 Paddle 同一规则；见 thresholds）
+    box_dropped: list[dict] = []
     if drop_large_boxes and blocks:
         atomic_boxes = [b for b in blocks if not b.get("page_scale")]
         if len(atomic_boxes) >= 3:
@@ -1412,6 +1562,19 @@ def build_bluebox_dataset(
                     b["id"] for b in atomic_boxes
                     if tuple(b["image_bbox"]) not in keep_set
                 }
+                page_short = float(min(image_w, image_h))
+                for item in atomic_boxes:
+                    if item["id"] not in removed:
+                        continue
+                    box = list(item["image_bbox"])
+                    short = min(box[2] - box[0], box[3] - box[1])
+                    box_dropped.append({
+                        "页": Path(page_dir).name, "框": item["id"], "原因": "大拟音/效果字框",
+                        "box": box, "短边": int(short),
+                        "页短边比": round(short / max(1.0, page_short), 3),
+                        "说明": f"短边 > {sfx_min_side_ratio}×同方向基准 且 > "
+                                f"{sfx_min_side_page:.0%} 页短边",
+                    })
                 blocks = [
                     b for b in blocks
                     if b.get("page_scale") or b["id"] not in removed
@@ -1420,6 +1583,29 @@ def build_bluebox_dataset(
                     f"page {Path(page_dir).name}: 过滤 {len(dropped_large)} 个大拟音/"
                     f"效果字框（短边 > {sfx_min_side_ratio}×同方向基准 且 > "
                     f"{sfx_min_side_page:.0%} 页短边）"
+                )
+
+    # 框级软标记（严格联合版第一段）：放宽档只标记不丢框——框和文本都留下，
+    # 成岛后由岛级裁决（见 thresholds.ART_TEXT_SOFT_FLAG_* 的标定说明）。
+    # **与 bg_flat_ratio 同一门控**（drop_art_boxes）：功能没开时绝不写标记，
+    # 否则功能关着的书也会被岛级裁决丢岛。
+    soft_ids: set[str] = set()
+    if drop_art_boxes and blocks:
+        surviving = [b for b in blocks if not b.get("page_scale")]
+        if len(surviving) >= 3:
+            soft_flagged = soft_flag_large_sfx(
+                [list(b["image_bbox"]) for b in surviving], image_w, image_h,
+            )
+            soft_set = {tuple(box) for box in soft_flagged}
+            soft_ids = {
+                b["id"] for b in surviving
+                if tuple(b["image_bbox"]) in soft_set
+            }
+            if soft_ids:
+                print(
+                    f"page {Path(page_dir).name}: {len(soft_ids)} 个框软标记"
+                    f"（短边 > {ART_TEXT_SOFT_FLAG_RATIO}×同方向基准 且 > "
+                    f"{ART_TEXT_SOFT_FLAG_PAGE:.0%} 页短边，疑似效果字 → 岛级裁决）"
                 )
 
     atomic_ids = {item["id"] for item in blocks if not item.get("page_scale")}
@@ -1490,6 +1676,12 @@ def build_bluebox_dataset(
             continue
         area = float((x2 - x1) * (y2 - y1))
         if area < min_island_area:
+            box_dropped.append({
+                "页": Path(page_dir).name, "框": "/".join(members), "原因": "微框（面积不达标）",
+                "box": [x1, y1, x2, y2], "短边": int(min(x2 - x1, y2 - y1)),
+                "页短边比": round(min(x2 - x1, y2 - y1) / max(1.0, min(image_w, image_h)), 3),
+                "说明": f"面积 {int(area)} < min_island_area {int(min_island_area)}",
+            })
             continue
         island_record = {
             "id": f"island_{len(islands) + 1:03d}",
@@ -1511,6 +1703,10 @@ def build_bluebox_dataset(
                 min(b[0] for b in member_boxes), min(b[1] for b in member_boxes),
                 max(b[2] for b in member_boxes), max(b[3] for b in member_boxes),
             ]
+        if any(m in soft_ids for m in members):
+            # 框级软标记（疑似效果字）：岛级裁决用它投"像拟声"一票（与分类器
+            # P<阈值 同权），字数护栏 ≥ART_TEXT_STRICT_MAX_CHARS 的岛照常翻译。
+            island_record["sfx_soft_flag"] = True
         shift = group.get("typeset_shift")
         if shift:
             # 让位位移：stage2 据此把**布局框**挪开（擦字范围会一并覆盖让位处）
@@ -1542,6 +1738,7 @@ def build_bluebox_dataset(
                 "fill_mode": "bbox",
                 "min_island_area": min_island_area,
                 "blue_boxes_only": True,
+                "soft_flag_version": 1,
                 "islands": islands,
                 "dropped_tiny": [],
                 "splits": [],
@@ -1573,6 +1770,21 @@ def build_bluebox_dataset(
         ),
         encoding="utf-8",
     )
+    # 框级"被丢清单"：**框级过滤从来没有人工真值覆盖**（被丢的框在编组前就消失、
+    # 从不进核对表），所以"筛框到底杀了多少台词"此前无人知道。这里把它落表，
+    # 便于将来核对（与岛级的 art_text_dropped.csv 同一思路）。
+    if box_dropped:
+        import csv as _csv
+
+        drop_path = page_dir / "dropped_boxes.csv"
+        fields = ["页", "框", "原因", "短边", "页短边比", "说明", "box"]
+        with drop_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = _csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for row in box_dropped:
+                row = dict(row)
+                row["box"] = ",".join(str(int(v)) for v in row["box"])
+                writer.writerow(row)
     shutil.copyfile(source_path, page_dir / "original.jpg")
     return islands
 
@@ -1615,11 +1827,32 @@ def _rects_overlap(a, b) -> bool:
             and min(a[3], b[3]) - max(a[1], b[1]) > 0)
 
 
-def art_text_gate(units, texts_by_page) -> tuple[float | None, str]:
-    """按书自标定闸门。返回 ``(闸门 或 None, 说明)``。
+def _balloon_ratios(unit, texts) -> list[float]:
+    """一页（或一本书）的"气泡样本"：长文本岛（≥12 字，几乎必然是对白）的平坦占比。"""
+    values = []
+    for iid, island in unit["islands"].items():
+        ratio = island.get("bg_flat_ratio")
+        if ratio is None:
+            continue
+        if len((texts or {}).get(iid, "")) >= ART_TEXT_BALLOON_MIN_CHARS:
+            values.append(float(ratio))
+    return values
 
-    ``None`` = 这本书自证不住气泡基准 → **禁用几何判据**（宁可全部保留原图，
-    也不要在无信号的页面上丢一半对白）。
+
+def _balloon_stats(values) -> tuple[float, float, float]:
+    """``(中位, p25, 闸门)``——书级与页级共用同一套统计，免得两边口径漂移。"""
+    import statistics as _st
+
+    ordered = sorted(values)
+    median = float(_st.median(ordered))
+    p25 = float(ordered[max(0, int(len(ordered) * 0.25))])
+    gate = min(ART_TEXT_GATE_MAX,
+               max(ART_TEXT_GATE_MIN, median * ART_TEXT_BALLOON_RATIO))
+    return median, p25, gate
+
+
+def art_text_book_baseline(units, texts_by_page) -> dict:
+    """整本书的气泡基准：``{gate, median, p25, n, basis}``（``gate=None`` = 自证不住）。
 
     基准 = 这本书自己**长文本岛**（≥12 字，几乎必然是对白）的平坦占比，量的是
     **p25**——长文本岛里必然混着少数不该算气泡基准的岛（横排印刷长文、偶然被
@@ -1628,32 +1861,85 @@ def art_text_gate(units, texts_by_page) -> tuple[float | None, str]:
     """
     values = []
     for page, unit in units.items():
-        page_texts = (texts_by_page or {}).get(page) or {}
-        for iid, island in unit["islands"].items():
-            ratio = island.get("bg_flat_ratio")
-            if ratio is None:
-                continue
-            if len(page_texts.get(iid, "")) >= ART_TEXT_BALLOON_MIN_CHARS:
-                values.append(float(ratio))
+        values.extend(_balloon_ratios(unit, (texts_by_page or {}).get(page)))
     if len(values) < 8:
-        return None, f"长文本岛只有 {len(values)} 个，样本不足"
-    import statistics as _st
-
-    ordered = sorted(values)
-    median = float(_st.median(ordered))
-    p25 = ordered[max(0, int(len(ordered) * 0.25))]
+        return {"gate": None, "median": None, "p25": None, "n": len(values),
+                "basis": f"长文本岛只有 {len(values)} 个，样本不足"}
+    median, p25, gate = _balloon_stats(values)
     if p25 < ART_TEXT_BALLOON_MIN_P25:
-        return None, (f"长文本岛占比中位 {median:.2f} 但 p25 只有 {p25:.2f}"
-                      f"（< {ART_TEXT_BALLOON_MIN_P25}）→ 自证不住气泡基准")
-    gate = min(ART_TEXT_GATE_MAX, max(ART_TEXT_GATE_MIN, median * ART_TEXT_BALLOON_RATIO))
-    return round(gate, 4), f"长文本岛占比中位 {median:.2f} / p25 {p25:.2f}"
+        return {"gate": None, "median": median, "p25": p25, "n": len(values),
+                "basis": (f"长文本岛占比中位 {median:.2f} 但 p25 只有 {p25:.2f}"
+                          f"（< {ART_TEXT_BALLOON_MIN_P25}）→ 自证不住气泡基准")}
+    return {"gate": round(gate, 4), "median": median, "p25": p25, "n": len(values),
+            "basis": f"长文本岛占比中位 {median:.2f} / p25 {p25:.2f}"}
+
+
+def art_text_gate(units, texts_by_page) -> tuple[float | None, str]:
+    """按书自标定闸门。返回 ``(闸门 或 None, 说明)``。
+
+    ``None`` = 这本书自证不住气泡基准 → **书级**禁用几何判据（宁可全部保留原图，
+    也不要在无信号的页面上丢一半对白）。逐页路由见 ``art_text_page_gates``。
+    """
+    baseline = art_text_book_baseline(units, texts_by_page)
+    return baseline["gate"], baseline["basis"]
+
+
+def art_text_page_gates(units, texts_by_page, baseline,
+                        *, promote: bool | None = None,
+                        ) -> dict[str, float | None]:
+    """逐页定闸门：``{页: 闸门 或 None}``，``None`` = 该页交给视觉判据（或没有
+    视觉接口时不丢任何岛）。
+
+    ``promote=None`` 时读 ``ART_TEXT_PAGE_PROMOTE``（默认关，理由见 thresholds）。
+
+    书级结论（``baseline``）只当**先验**，页级规则刻意不对称：样本不足就继承
+    书级结论（不判断、也就不花钱），只有明确的反向证据才改判。两个方向：
+
+    * 书级自证得住 → 该页本地中位比书级低 ``ART_TEXT_PAGE_DEMOTE_MARGIN``
+      （或样本够多且本地 p25 比书级 p25 低同样多）→ 这页的"气泡基准"不成立，
+      转视觉；其余页仍用**书级闸门**（页级闸门在实测里只差 0.03 上下，用书级
+      更稳）。两条判据都拿**书级同统计量**做比较、都带同一个边距：直接与绝对
+      门槛比会被边界噪声推走（实测甲书 页 2 的 p25 = 0.649，与 0.65 只差
+      0.001，却会把一页正常的页整页转走）。
+    * 书级自证不住 → 只有 ``promote`` 且页级证据**更强**（更高 p25、更多样本）
+      才升回几何，且用该页自己的闸门。
+    """
+    if promote is None:
+        promote = ART_TEXT_PAGE_PROMOTE
+    book_gate = baseline.get("gate")
+    book_median = baseline.get("median")
+    book_p25 = baseline.get("p25")
+    gates: dict[str, float | None] = {}
+    for page, unit in units.items():
+        values = _balloon_ratios(unit, (texts_by_page or {}).get(page))
+        if len(values) < ART_TEXT_PAGE_MIN_SAMPLES:
+            gates[page] = book_gate               # 样本不足 → 继承书级
+            continue
+        median, p25, page_gate = _balloon_stats(values)
+        if book_gate is not None:
+            demote = median < float(book_median) - ART_TEXT_PAGE_DEMOTE_MARGIN
+            if not demote and len(values) >= ART_TEXT_PAGE_DEMOTE_MIN_SAMPLES:
+                demote = p25 < float(book_p25) - ART_TEXT_PAGE_DEMOTE_MARGIN
+            gates[page] = None if demote else book_gate
+            continue
+        promote_ok = (promote
+                      and len(values) >= ART_TEXT_PAGE_PROMOTE_MIN_SAMPLES
+                      and p25 >= ART_TEXT_PAGE_PROMOTE_P25)
+        gates[page] = page_gate if promote_ok else None
+    return gates
 
 
 def make_vision_judge(out_root: Path, *, progress=None):
-    """自证不住的书用的视觉判据回调；没配视觉接口时返回 None。
+    """自证不住的书（或页）用的视觉判据回调；没配视觉接口时返回 None。
 
-    返回的 ``judge(units, page_texts) -> set[str]`` 给出**该丢弃的岛**（``页:岛``）：
-    模型答 ``S``（拟声/效果字）或 ``U``（图里没有清晰可读的日文）都丢，答 ``D`` 照常翻译。
+    返回的 ``judge(units, page_texts) -> set[str]`` 给出**该丢弃的岛**（``页:岛``）。
+    逐页路由只把"几何不可信"的页放进 ``units`` 送过来，所以判据只问这些页；模型答
+    ``S``（拟声/效果字）或 ``U``（图里没有清晰可读的日文）都丢，**答 D 才照常翻译**。
+
+    **判不出来（重试后仍失败、或回复里没有 S/D/U）按"保留原图、不翻译"处理**
+    （fail-closed）：这类岛的读数本来就不可信，照译等于把拟声/读废的字盖成中文；
+    代价是接口大面积故障时会整片不译，**所以失败要显式可见**——日志报数量，某页
+    失败过半且 ≥3 个时把该页标进审核页。
 
     跳过两类岛（实测"跳过长文本是免费的"：调用数 431→264，F1 只差 0.004）：
 
@@ -1698,16 +1984,41 @@ def make_vision_judge(out_root: Path, *, progress=None):
                                     "bbox": box, "pad": ART_TEXT_VISION_CONTEXT})
         if pending:
             if progress is not None:
-                progress.log(f"视觉判据：送 {len(pending)} 个岛（自证不住，改用看图判定）")
+                progress.log(f"视觉判据：送 {len(pending)} 个岛（几何不可信，改用看图判定）")
             cached.update(judge_crops(
                 pending, url, model, key, progress=progress,
                 max_workers=DEFAULT_WORKERS))
             _write_cache_json(cache_path, cached)
         drop = set()
+        failed_by_page: dict[str, int] = {}
+        asked_by_page: dict[str, int] = {}
         for cache_key, island_key in keyed.items():
             answer = str(cached.get(cache_key) or "").upper()[:1]
-            if answer in ("S", "U"):
-                drop.add(island_key)
+            page = island_key.partition(":")[0]
+            asked_by_page[page] = asked_by_page.get(page, 0) + 1
+            if answer == "D":
+                continue                    # 明确判成台词 → 照常翻译
+            if answer not in ("S", "U"):
+                # 判不出来：当"保留原图、不翻译"（fail-closed）。照译才是错的——
+                # 读数本来就不可信，盖成中文就是往画面上写错字。
+                failed_by_page[page] = failed_by_page.get(page, 0) + 1
+            drop.add(island_key)
+        failed = sum(failed_by_page.values())
+        if failed:
+            message = (f"视觉判据：{failed}/{len(keyed)} 个岛没得到有效回答"
+                       f"（接口失败或回复不合格式）→ 按保留原图处理，不翻译")
+            if progress is not None:
+                progress.log(message)
+            else:
+                print(message)
+            for page, count in sorted(failed_by_page.items(),
+                                      key=lambda item: -item[1]):
+                if count >= 3 and count * 2 >= asked_by_page.get(page, count):
+                    _mark_review_required(
+                        out_root, page,
+                        f"视觉判据 {count}/{asked_by_page.get(page, count)} 个岛判"
+                        f"不出（已按保留原图处理，请复核该页）",
+                    )
         return drop
 
     return judge
@@ -1768,8 +2079,169 @@ def _art_text_verdicts(by_island: dict, texts: dict[str, str],
     return verdicts
 
 
+def art_text_keep_list(out_root: Path) -> set[str]:
+    """读 ``out_root/art_text_keep.txt``：**强制保留**清单（``页:岛``，``#`` 注释）。
+
+    为什么需要它：实测**没有任何信号**能把"手绘台词"与"手绘拟声"分开——几何占比
+    （最低那一档也只有约 70% 是"不翻译"）、看图模型（在这批上前者判 S 的仍有 28 个
+    是台词）、日文词性/词典（只是长度的代理，误杀降 9 个的同时漏拟声涨到 147/173）、
+    中文侧判定（F1 0.194）。所以"保证台词不丢"不做成判据，做成**机制**：
+
+    1. 每次跑都把被丢的岛写成 ``art_text_dropped.csv`` + 同名 ``.html``（带裁剪图，
+       见 ``_write_art_text_dropped``）；
+    2. 人工核对后把误杀的写进 ``art_text_keep.txt``（一行一个 ``页:岛``）；
+    3. 再跑——这些岛**不再丢**，且不用重跑 OCR/翻译（读数缓存还在，只重排受影响页）。
+
+    两个调用点（``_stage2_ocr`` 与 ``_load_page_texts``）都读这个文件，保证
+    "重跑 typeset" 与首次跑的口径一致（否则救回的岛会被重新丢掉）。
+    """
+    path = Path(out_root) / "art_text_keep.txt"
+    if not path.is_file():
+        return set()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return set()
+    return {line.split("#", 1)[0].strip() for line in lines
+            if line.split("#", 1)[0].strip()}
+
+
+def art_text_force_drop_list(out_root: Path) -> set[str]:
+    """`out_root/art_text_force_drop.txt`：**强制丢弃**清单（``页:岛``）——人工复核后
+    认为"该岛确实是拟声/不该翻译"时写进去（与 `art_text_keep.txt` 对称）。"""
+    path = Path(out_root) / "art_text_force_drop.txt"
+    if not path.is_file():
+        return set()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return set()
+    return {line.split("#", 1)[0].strip() for line in lines
+            if line.split("#", 1)[0].strip()}
+
+
+def _write_art_text_review(path: Path, rows: list[dict]) -> None:
+    """复核清单：概率落在阈值附近、判据没把握的岛（用户要求"可疑的交给我判"）。"""
+    import csv
+
+    fields = ["岛", "概率", "决定", "原文"]
+    with Path(path).open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _record_art_text_drop(drops: list[dict], keep: set[str], island_key: str,
+                          source: str, answer: str, island: dict,
+                          direction: str, text: str) -> None:
+    """记一条"被丢"（给清单用）。``keep`` 里的岛仍记账，便于统计救回数。"""
+    drops.append({
+        "岛": island_key,
+        "来源": source,
+        "模型答案": answer,
+        "占比": island.get("bg_flat_ratio"),
+        "方向": "竖" if direction == "vertical" else "横",
+        "字数": len([c for c in (text or "").strip() if not c.isspace()]),
+        "原文": " ".join((text or "").split()),
+        "保留": "是" if island_key in keep else "",
+    })
+
+
+def _write_art_text_dropped(path: Path, drops: list[dict], units) -> None:
+    """被丢清单：CSV（机器读）+ HTML（带裁剪图，人工核）。
+
+    这张表就是"台词不丢"的兜底：每次丢弃都在表里，人工扫一眼把误杀的岛写进
+    ``art_text_keep.txt`` 即可救回。裁剪图直接内嵌（data URL），不依赖原图路径。
+    """
+    import base64
+    import csv
+    import html as _html
+    import io as _io
+
+    fields = ["岛", "来源", "模型答案", "占比", "方向", "字数", "原文", "保留"]
+    csv_path = Path(path)
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(drops)
+
+    parts = ["<!doctype html><meta charset='utf-8'>",
+             "<title>被丢的手绘字岛</title>",
+             "<style>body{font-family:sans-serif;font-size:13px}"
+             "table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px;"
+             "vertical-align:middle}img{max-height:110px}</style>",
+             f"<h3>被丢的手绘字岛（{len(drops)} 个）</h3>",
+             "<p>核对：误杀的岛写进同目录 <code>art_text_keep.txt</code>"
+             "（一行一个 <code>页:岛</code>）后重跑，即不再丢。</p><table>",
+             "<tr><th>岛<th>来源<th>模型<th>占比<th>方向<th>字数<th>原文"
+             "<th>裁剪<th>已在保留清单</tr>"]
+    for row in drops:
+        page, _, island_id = row["岛"].partition(":")
+        image_tag = ""
+        unit = units.get(page)
+        island = (unit or {}).get("islands", {}).get(island_id)
+        source = Path("dataset") / page / "original.jpg"
+        if island is not None:
+            try:
+                with Image.open(Path(path).parent / source) as handle:
+                    x1, y1, x2, y2 = (island.get("members_bbox")
+                                      or island["image_bbox"])
+                    pad = 8
+                    crop = handle.convert("RGB").crop(
+                        (max(0, x1 - pad), max(0, y1 - pad),
+                         min(handle.width, x2 + pad), min(handle.height, y2 + pad)))
+                    scale = min(2.5, 220 / max(1, crop.width), 220 / max(1, crop.height))
+                    crop = crop.resize((max(1, int(crop.width * scale)),
+                                        max(1, int(crop.height * scale))),
+                                       Image.LANCZOS)
+                    buffer = _io.BytesIO()
+                    crop.save(buffer, format="JPEG", quality=80)
+                image_tag = ("<img src='data:image/jpeg;base64,"
+                             + base64.b64encode(buffer.getvalue()).decode("ascii")
+                             + "'>")
+            except (OSError, ValueError):
+                image_tag = "(裁剪失败)"
+        cells = [_html.escape(str(row.get(key) or "")) for key in
+                 ("岛", "来源", "模型答案", "占比", "方向", "字数", "原文")]
+        cells += [image_tag, _html.escape(str(row.get("保留") or ""))]
+        parts.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
+    parts.append("</table>")
+    Path(path).with_suffix(".html").write_text("".join(parts), encoding="utf-8")
+
+
+def _typeset_page_sort_key(path) -> tuple:
+    """嵌字图的页序键：**按页号数字排**（1, 2, 10, 11…），不是字典序。
+
+    踩过的坑：`Path("10.typeset.png").stem` 得到 `"10.typeset"`（只剥最后一个
+    后缀），永远不是纯数字 → 排序键落进"按字符串"分支 → PDF 页序变成
+    1, 10, 100, 101…（实测 160 页只有第 1 页对）。所以这里显式剥掉
+    `.typeset.png` 再判数字。
+    """
+    name = str(getattr(path, "name", path)).replace(".typeset.png", "")
+    if name.isdigit():
+        return (0, int(name), "")
+    return (1, 0, name.lower())
+
+
+def _typeset_fingerprint(page: str, translations_page, directions, dropped,
+                         config_slice) -> str:
+    """这一页"要不要重嵌"的输入指纹（任一输入变 → 指纹变）。"""
+    import hashlib
+
+    payload = json.dumps({
+        "page": page,
+        "texts": {k: str(v) for k, v in sorted((translations_page or {}).items())},
+        "directions": {k: str(v) for k, v in sorted((directions or {}).items())},
+        "dropped": sorted(str(v) for v in (dropped or set())),
+        "config": {k: str(v) for k, v in sorted(config_slice.items())},
+    }, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def build_page_texts(units, readings, dropped_boxes,
-                     flat_gate: float | None = None, vision_judge=None):
+                     flat_gate: float | None = None, vision_judge=None,
+                     keep: set[str] | None = None, dump_path: Path | None = None,
+                     force_drop: set[str] | None = None):
     """Join blue-box manga readings into per-island sentence texts.
 
     Dropped boxes (false selections) never join a sentence and never set a
@@ -1800,6 +2272,11 @@ def build_page_texts(units, readings, dropped_boxes,
     page_texts: dict[str, dict[str, str]] = {}
     page_directions: dict[str, dict[str, str]] = {}
     art_text_islands: set[str] = set()
+    keep = keep or set()
+    force_drop = force_drop or set()
+    review_rows: list[dict] = []
+    drops: list[dict] = []
+    dropped_by_keep = 0
     commentary_boxes = 0
     for page, unit in units.items():
         by_island = unit["islands"]
@@ -1842,43 +2319,226 @@ def build_page_texts(units, readings, dropped_boxes,
     # 手绘字（画在画面上的效果字/拟声词）：**整岛判**——同一句对白的几个框各读
     # 一截，逐框判会把印在气泡里的对白判成手绘字。判空岛文本 = 该岛保留原图
     # （不擦、不译、不嵌），与"读不出字的假选框"同一出口。
-    # 闸门**按书自标定**：先用整本书的长文本岛（几乎必然是对白）自证"气泡基准"，
-    # 自证不住就整本禁用（见 art_text_gate / thresholds 里的实测数据）。
+    # 路由**按书自证 + 逐页改判**：书级结论当先验，页级只做"反向证据"的改判
+    # （见 art_text_page_gates / thresholds）——混合的书不再被整本二选一。
     if flat_gate is not None:
         gate, basis = float(flat_gate), "调用方指定（跳过按书自标定）"
+        page_gates = {page: gate for page in units}
     else:
-        gate, basis = art_text_gate(units, page_texts)
+        baseline = art_text_book_baseline(units, page_texts)
+        gate, basis = baseline["gate"], baseline["basis"]
+        page_gates = art_text_page_gates(units, page_texts, baseline)
     measured = any(
         island.get("bg_flat_ratio") is not None
         for unit in units.values() for island in unit["islands"].values()
     )
+    geometry_pages = {page: value for page, value in page_gates.items()
+                      if value is not None}
+    vision_pages = [page for page, value in page_gates.items() if value is None]
+
     if gate is None:
-        # 没有平坦度数据 = 这个功能根本没开（dataset 阶段没算）→ 绝不调接口
-        vision_drop = (vision_judge(units, page_texts)
+        detail = (f"；其中 {len(geometry_pages)} 页本地自证得住 → 该页仍用几何"
+                  if geometry_pages else "")
+        print(f"手绘字判据：本书自证不住几何基准（{basis}）{detail}")
+    else:
+        detail = (f"；{len(vision_pages)} 页本地自证不住 → 该页转视觉判据"
+                  if vision_pages else "")
+        print(f"手绘字判据：本书闸门 {gate:.2f}（{basis}）{detail}")
+
+    # 保台词档位（ART_TEXT_DIALOGUE_GUARD）：几何候选先交模型表态，只丢"两路都同意"的。
+    # 没配视觉接口时自动退回 off（现状），并在日志里说明——绝不因为配不上接口就改变行为。
+    guard_mode = str(ART_TEXT_DIALOGUE_GUARD)
+    guard_drops: set[str] = set()
+    guard_active = guard_mode in ("agree", "strict") and vision_judge and measured
+    if guard_mode in ("agree", "strict") and not guard_active:
+        print(f"手绘字判据：保台词档位 {guard_mode} 需要视觉判据（没配接口）→ 退回现状")
+    if guard_active:
+        guard_drops = set(vision_judge(units, page_texts) or set())
+        print(f"手绘字判据：保台词档位 {guard_mode}——几何候选只丢"
+              f"「模型也判拟声/无字」的 {len(guard_drops)} 个"
+              f"（模型判台词的一律照常翻译）")
+
+    def _guard_allows(page: str, iid: str) -> bool:
+        """这个候选是否允许丢（True = 丢）。off 档恒 True；其余要求模型同意。"""
+        if not guard_active:
+            return True
+        if f"{page}:{iid}" not in guard_drops:
+            return False
+        if guard_mode == "strict":
+            ratio = units[page]["islands"][iid].get("bg_flat_ratio")
+            return ratio is not None and float(ratio) < ART_TEXT_GUARD_RATIO
+        return True
+
+    # 决策侧：默认用**小分类器**（用我们自己的真值训的，阈值即"保台词↔少混入"旋钮，
+    # 见 thresholds.ART_TEXT_DECISION）；权重缺失/维度不符时自动退回几何规则。
+    classifier = None
+    # 调用方**显式给了 flat_gate** = "按我指定的几何闸门走"（单元测试与特殊调用都这样用），
+    # 只有自标定那条路才交给分类器。
+    if str(ART_TEXT_DECISION) == "classifier" and flat_gate is None:
+        from manga_localizer.sfx_classifier import (
+            extract_features, load_weights, probability,
+        )
+
+        classifier = load_weights()
+        if classifier is None:
+            print("手绘字判据：分类器权重缺失 → 退回几何规则")
+    if classifier is not None:
+        page_sizes = {}
+        for page, unit in units.items():
+            islands = unit["islands"]
+            first = next(iter(islands.values()), None)
+            if first and "_page_size" not in first:
+                pass
+            page_sizes[page] = None
+        dropped_by_classifier = 0
+        dropped_by_flag = 0
+        dropped_total = 0
+        # **分类器是书无关的**（它量的是岛自身的特征，不依赖"这本书自证得住"），
+        # 所以对所有页生效——这正是它相对几何路的价值：自证不住的书不必再逐岛调接口。
+        # 视觉路由只在分类器不可用时兜底（见下面的 vision_pages 分支）。
+        for page in units:
+            unit = units[page]
+            size = unit.get("image_size") or []
+            if len(size) == 2:
+                page_size = (float(size[0]), float(size[1]))
+            else:                      # 老数据集没有 image_size → 用岛 bbox 兜底
+                xs = [i["image_bbox"][2] for i in unit["islands"].values()] or [1]
+                ys = [i["image_bbox"][3] for i in unit["islands"].values()] or [1]
+                page_size = (max(xs) * 1.05, max(ys) * 1.05)
+            threshold = float(ART_TEXT_CLASSIFIER_THRESHOLD)
+            for iid, island in unit["islands"].items():
+                text = page_texts[page][iid].strip()
+                if not text:
+                    continue
+                island_key = f"{page}:{iid}"
+                flagged = bool(island.get("sfx_soft_flag"))
+                chars_n = len([c for c in text if not c.isspace()])
+                score = None
+                if island.get("bg_flat_ratio") is not None:
+                    bbox = list(island.get("members_bbox") or island["image_bbox"])
+                    features = extract_features(
+                        text=text, ratio=island.get("bg_flat_ratio"),
+                        direction=page_directions[page][iid], bbox=bbox,
+                        page_size=page_size)
+                    score = probability(features, classifier)
+                # 严格联合版裁决（用户 2026-09-30 定，开发记录 六之前四）：
+                #   留日文 = (P < 阈值 ∨ 框级软标记) ∧ 字数 < 护栏
+                # 两路是**同一裁决的两个来源**，不是两道独立筛——框级标记来自
+                # 数据集（几何票），分类器来自读数（文本+几何票），在成岛后
+                # 一起裁决；救回（≥护栏字数）的岛全文翻译、擦字覆盖全部成员框。
+                vote = flagged or (score is not None and score < threshold)
+                if score is not None and abs(score - threshold) \
+                        < float(ART_TEXT_REVIEW_BAND):
+                    # 判据没把握 → 照裁决处理，但列进复核清单（用户要求"可疑的交给我判"）
+                    review_rows.append({
+                        "岛": island_key, "概率": round(score, 3),
+                        "决定": "丢" if vote else "翻译",
+                        "原文": " ".join(text.split())[:60],
+                    })
+                if island_key in force_drop:
+                    pass              # 人工判定优先：护栏与投票都不拦人工裁决
+                elif not vote:
+                    continue          # 两路都没说像拟声 → 照常翻译
+                elif chars_n >= ART_TEXT_STRICT_MAX_CHARS:
+                    continue          # 字数护栏：≥护栏字数的岛结构上不因拟声留日文
+                source = ("框级标记+分类器"
+                          if flagged and score is not None and score < threshold
+                          else ("框级标记" if flagged else "分类器"))
+                if flagged and ART_TEXT_SOFT_REVIEW_MIN_CHARS <= chars_n \
+                        < ART_TEXT_STRICT_MAX_CHARS:
+                    # 复核加厚带（开发记录 六之前四 §5）：字数落在 [5, 护栏) 的被
+                    # 标记岛= k=5 若启用就会救回的那批，台词与拟声在所有本地
+                    # 信号上同形（交换率 2.6:1 即墙）→ 自动裁决按 k=7 丢，但
+                    # 全部列进复核清单交人工定夺（判错写 keep 即救回）。
+                    review_rows.append({
+                        "岛": island_key,
+                        "概率": round(score, 3) if score is not None else "",
+                        "决定": "丢",
+                        "原文": " ".join(text.split())[:60],
+                    })
+                _record_art_text_drop(
+                    drops, keep, island_key, source, "", island,
+                    page_directions[page][iid], text)
+                if island_key in keep:
+                    dropped_by_keep += 1
+                    continue
+                if not _guard_allows(page, iid):
+                    continue
+                art_text_islands.add(island_key)
+                page_texts[page][iid] = ""
+                dropped_total += 1
+                if flagged:
+                    dropped_by_flag += 1
+                if score is not None and score < threshold:
+                    dropped_by_classifier += 1
+        print(f"手绘字判据：严格联合版（P<{ART_TEXT_CLASSIFIER_THRESHOLD} ∨ "
+              f"框级软标记，护栏 <{ART_TEXT_STRICT_MAX_CHARS} 字）"
+              f"留日文 {dropped_total} 个岛（分类器票 {dropped_by_classifier} / "
+              f"框级标记票 {dropped_by_flag}，可重叠；权重训自 "
+              f"{classifier.get('trained_on', {}).get('islands', '?')} 个岛）")
+        if review_rows and dump_path is not None:
+            review_path = Path(dump_path).with_name("art_text_review.csv")
+            _write_art_text_review(review_path, review_rows)
+            print(f"判据没把握、需要人工复核的岛 {len(review_rows)} 个 → "
+                  f"{review_path.name}（照阈值先处理，判错就写进 art_text_keep.txt / "
+                  f"art_text_force_drop.txt）")
+
+    # 几何侧：逐页用自己的闸门（未改判的页用书级闸门，实测与页级只差 0.03 上下）
+    for page, page_gate in ({} if classifier is not None else geometry_pages).items():
+        for iid in _art_text_verdicts(
+                units[page]["islands"], page_texts[page], page_directions[page],
+                flat_gate=page_gate):
+            island_key = f"{page}:{iid}"
+            _record_art_text_drop(
+                drops, keep, island_key, "几何", "",
+                units[page]["islands"][iid], page_directions[page][iid],
+                page_texts[page][iid])
+            if island_key in keep:
+                dropped_by_keep += 1
+                continue
+            if not _guard_allows(page, iid):
+                continue                      # 保台词档位：模型说这是台词 → 照常翻译
+            art_text_islands.add(island_key)
+            page_texts[page][iid] = ""
+
+    # 视觉侧：只把被改判的页送过去（判据只问它拿到的那几页）；
+    # 分类器已经拍板时不再调接口。
+    if vision_pages and classifier is None:
+        vision_units = {page: units[page] for page in vision_pages}
+        vision_drop = (vision_judge(vision_units, page_texts)
                        if (vision_judge and measured) else set())
         if vision_drop:
-            print(f"手绘字判据：本书自证不住几何基准（{basis}）→ 改用视觉判据，"
+            print(f"手绘字判据：{len(vision_pages)} 页改用视觉判据，"
                   f"丢 {len(vision_drop)} 个岛（拟声/无字）")
-            for island_key in vision_drop:
-                page, _, iid = island_key.partition(":")
-                if iid and page in page_texts and iid in page_texts[page]:
-                    page_texts[page][iid] = ""
-                    art_text_islands.add(island_key)
         else:
-            print(f"手绘字判据：本书禁用（{basis}）→ 不丢任何岛，全部照常翻译")
-    else:
-        print(f"手绘字判据：本书闸门 {gate:.2f}（{basis}）")
-        for page, unit in units.items():
-            for iid in _art_text_verdicts(
-                    unit["islands"], page_texts[page], page_directions[page],
-                    flat_gate=gate):
-                art_text_islands.add(f"{page}:{iid}")
-                page_texts[page][iid] = ""
+            reason = ("没配视觉接口" if not (vision_judge and measured)
+                      else "模型都判成台词")
+            print(f"手绘字判据：{len(vision_pages)} 页需要视觉判据但没丢任何岛"
+                  f"（{reason}）→ 这些页照常翻译")
+        for island_key in vision_drop:
+            page, _, iid = island_key.partition(":")
+            if not (iid and page in page_texts and iid in page_texts[page]):
+                continue
+            _record_art_text_drop(
+                drops, keep, island_key, "视觉（S/U）", "",
+                units[page]["islands"][iid], page_directions[page][iid],
+                page_texts[page][iid])
+            if island_key in keep:
+                dropped_by_keep += 1
+                continue
+            page_texts[page][iid] = ""
+            art_text_islands.add(island_key)
     if art_text_islands:
         print(
             f"丢弃 {len(art_text_islands)} 个手绘字岛（画在画面上、原文 ≤ "
             f"{ART_TEXT_MAX_CHARS} 字）→ 保留原图，不译不嵌"
         )
+    if dropped_by_keep:
+        print(f"按 art_text_keep.txt 强制保留 {dropped_by_keep} 个岛（不丢、照常翻译）")
+    if drops and dump_path is not None:
+        _write_art_text_dropped(dump_path, drops, units)
+        print(f"被丢清单已写出：{dump_path.name}（同目录 .html 带裁剪图，可核对后加进 "
+              f"art_text_keep.txt 救回）")
     if commentary_boxes:
         print(f"按空读数处理 {commentary_boxes} 个 AI 说明性输出框（不是文字）")
     return page_texts, page_directions
@@ -1918,6 +2578,7 @@ def stage2_process(
     sfx_max_font_size: int | None = None,
     short_source_max_chars: int = SHORT_SOURCE_MAX_CHARS,
     page_font_ceiling_ratio: float = PAGE_FONT_CEILING_RATIO,
+    erase_inpainter: str = ERASE_INPAINTER,
     progress: "ProgressFile | None" = None,
     overwrite: bool = False,
 ) -> bool:
@@ -1971,6 +2632,7 @@ def stage2_process(
         short_source_max_chars=short_source_max_chars,
         sfx_min_side_ratio=sfx_min_side_ratio,
         page_font_ceiling_ratio=page_font_ceiling_ratio,
+        erase_inpainter=erase_inpainter,
         font_name=font_name,
         stroke_divisor=stroke_divisor, row_gap_divisor=row_gap_divisor,
         column_gap_divisor=column_gap_divisor,
@@ -2098,6 +2760,19 @@ def _dataset_has_bg_flatness(islands_path: Path) -> bool:
     )
 
 
+def _dataset_has_soft_flags(islands_path: Path) -> bool:
+    """数据集是否由"严格联合版"规则构建（islands.json 带 soft_flag_version）。
+
+    软标记（``sfx_soft_flag``）是按需写的——没有框触发放宽判据时全页都没有，
+    不能拿"岛里没有这个键"当旧版判据，所以用数据集级标记。
+    """
+    try:
+        payload = json.loads(islands_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return "soft_flag_version" in payload
+
+
 def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
                     progress: "ProgressFile", *,
                     overwrite: bool = False,
@@ -2145,10 +2820,12 @@ def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
             except OSError:
                 manifest_mtime = islands_mtime = 0.0
             # 规则也参与"新不新"：数据集是规则算出来的产物，规则变了（这里：
-            # 多算一个 bg_flat_ratio）旧 dataset 就得重建——否则改了规则却
-            # 静默复用旧产物，看起来"改了没用"。
+            # 多算一个 bg_flat_ratio、或缺严格联合版的框级软标记）旧 dataset 就得
+            # 重建——否则改了规则却静默复用旧产物，看起来"改了没用"。
             stale_rules = (
-                drop_art_boxes and not _dataset_has_bg_flatness(islands_path)
+                drop_art_boxes
+                and not (_dataset_has_bg_flatness(islands_path)
+                         and _dataset_has_soft_flags(islands_path))
             )
             if islands_mtime >= manifest_mtime and not stale_rules:
                 continue
@@ -2156,7 +2833,7 @@ def _stage2_dataset(images: Path, out_root: Path, pages: list[str],
 
             shutil.rmtree(page_dir, ignore_errors=True)
             print(
-                f"{page}: dataset 缺 bg_flat_ratio（手绘字判据新增字段），"
+                f"{page}: dataset 缺手绘字判据字段（bg_flat_ratio/框级软标记），"
                 "重建 islands"
                 if stale_rules else
                 f"{page}: capture re-done after dataset, rebuilding islands "
@@ -2302,7 +2979,10 @@ def _stage2_ocr(out_root: Path, pages: list[str], *,
     )
     page_texts, page_directions = build_page_texts(
         units, readings, dropped_boxes,
-        vision_judge=make_vision_judge(out_root, progress=progress))
+        vision_judge=make_vision_judge(out_root, progress=progress),
+        keep=art_text_keep_list(out_root),
+        force_drop=art_text_force_drop_list(out_root),
+        dump_path=Path(out_root) / "art_text_dropped.csv")
     return page_texts, page_directions, dropped_boxes
 
 
@@ -2338,7 +3018,8 @@ def _demote_suspicious_fallbacks(
 def _translate_one_page(page: str, texts: dict[str, str], *,
                         dataset_dir: Path, glossary, cache, batch_cache,
                         ai_url: str, ai_model: str,
-                        ai_api_key: str) -> dict[str, str]:
+                        ai_api_key: str,
+                        previous_lines: tuple[str, ...] = ()) -> dict[str, str]:
     """Whole-page translate: AI batch preferred, local Sakura fallback."""
     from manga_localizer.island_contract import load_island_dataset
     from manga_localizer.island_translate import (
@@ -2364,6 +3045,7 @@ def _translate_one_page(page: str, texts: dict[str, str], *,
                 ),
                 glossary=glossary,
                 cache=batch_cache,
+                previous_lines=previous_lines,
             )
             page_translations.update(batch.translations)
             fallback_texts = {island_id: texts[island_id] for island_id in batch.failures}
@@ -2424,12 +3106,38 @@ def _stage2_translate(out_root: Path, pages: list[str],
     translations: dict[str, dict[str, str]] = {}
     failed: list[str] = []
 
+    # 跨页上下文：上一页的**原文**（不是译文）。只给原文的好处是不依赖
+    # "上一页已经翻完"——页仍然可以并行翻译，缓存键也完全确定。
+    ordered_pages = sorted(texts, key=lambda name: int(name) if name.isdigit() else 0)
+    previous_page_of = {
+        name: (ordered_pages[index - 1] if index else None)
+        for index, name in enumerate(ordered_pages)
+    }
+    # 上限：最多 12 条、合计 400 字，避免把 token 预算花在上下文上
+    PREVIOUS_MAX_LINES = 12
+    PREVIOUS_MAX_CHARS = 400
+
+    def _previous_lines(page: str) -> tuple[str, ...]:
+        previous = previous_page_of.get(page)
+        lines: list[str] = []
+        budget = PREVIOUS_MAX_CHARS
+        for text in (texts.get(previous) or {}).values():
+            cleaned = " ".join(str(text or "").split())
+            if not cleaned:
+                continue
+            if len(lines) >= PREVIOUS_MAX_LINES or budget - len(cleaned) < 0:
+                break
+            budget -= len(cleaned)
+            lines.append(cleaned)
+        return tuple(lines)
+
     def _translate(page: str) -> tuple[str, dict[str, str] | None]:
         try:
             return page, _translate_one_page(
                 page, texts[page], dataset_dir=dataset_dir,
                 glossary=glossary, cache=cache, batch_cache=batch_cache,
                 ai_url=ai_url, ai_model=ai_model, ai_api_key=ai_api_key,
+                previous_lines=_previous_lines(page),
             )
         except Exception as error:  # noqa: BLE001 - per-page isolation
             print(f"!! translate {page} FAILED: {error}")
@@ -2515,6 +3223,7 @@ def _stage2_typeset(out_root: Path, images: Path, pages: list[str],
                     short_source_max_chars: int = SHORT_SOURCE_MAX_CHARS,
                     sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
                     page_font_ceiling_ratio: float = PAGE_FONT_CEILING_RATIO,
+                    erase_inpainter: str = ERASE_INPAINTER,
                     font_name: str = "", stroke_divisor: int | None = None,
                     row_gap_divisor: int | None = None,
                     column_gap_divisor: int | None = None,
@@ -2547,7 +3256,31 @@ def _stage2_typeset(out_root: Path, images: Path, pages: list[str],
             progress.log(f"skip {page}: no translations (run translate first)")
             return False
         out_png = typeset_dir / f"{page}.typeset.png"
-        if resume and out_png.is_file():
+        # **按输入指纹判断要不要重嵌**（用户要求"只重新嵌受影响的岛/页"）。
+        # 只看"文件在不在"是不够的：编辑 art_text_keep.txt / art_text_force_drop.txt
+        # 之后，被改的页输入变了但输出文件还在，旧逻辑会把它一起跳过（漏嵌），
+        # 而不带 --resume 又会把 160 页全重嵌。指纹 = 这一页真正参与嵌字的东西：
+        # 岛→译文、方向、被丢的框集合、以及影响排版的几个配置。任一变化 → 该页重嵌。
+        key_path = typeset_dir / f"{page}.typeset.key"
+        fingerprint = _typeset_fingerprint(
+            page, translations_page, page_directions.get(page),
+            dropped_boxes.get(page, set()),
+            {"min_font_size": min_font_size, "font_name": font_name,
+             "stroke_divisor": stroke_divisor, "row_gap_divisor": row_gap_divisor,
+             "column_gap_divisor": column_gap_divisor,
+             "tracking_divisor": tracking_divisor, "text_color": text_color,
+             "stroke_color": stroke_color,
+             "background_color": background_color},
+        )
+        if out_png.is_file() and key_path.is_file():
+            try:
+                if key_path.read_text(encoding="utf-8").strip() == fingerprint:
+                    progress.log(f"skip {page}: 输入未变（按指纹跳过重嵌）")
+                    return False
+            except (OSError, UnicodeError):
+                pass
+        elif resume and out_png.is_file():
+            # 老产物没有指纹 → 保持 --resume 的旧语义（文件在就跳过）
             progress.log(f"resume: skip {page} (typeset exists)")
             return False
         try:
@@ -2634,10 +3367,7 @@ def _stage2_typeset(out_root: Path, images: Path, pages: list[str],
             path for path in typeset_dir.glob("*.typeset.png")
             if path.is_file()
         ),
-        key=lambda path: (
-            (0, int(path.stem))
-            if path.stem.isdigit() else (1, path.stem.lower())
-        ),
+        key=_typeset_page_sort_key,
     )
     if not typeset_files:
         print("no pages to assemble into a PDF")
@@ -2687,8 +3417,6 @@ def _run_stage2_single(stage: str, images: Path, out_root: Path,
             drop_large_boxes=kwargs.get("drop_large_boxes", True),
             drop_art_boxes=kwargs.get("drop_art_boxes", False),
             sfx_min_side_ratio=kwargs.get("sfx_min_side_ratio", SFX_MIN_SIDE_RATIO),
-        page_font_ceiling_ratio=kwargs.get(
-            "page_font_ceiling_ratio", PAGE_FONT_CEILING_RATIO),
             sfx_min_side_page=kwargs.get("sfx_min_side_page", SFX_MIN_SIDE_PAGE),
         )
         if not active_pages:
@@ -2945,7 +3673,6 @@ def _parse_color(value: str) -> tuple[int, int, int] | None:
 # 擦字缓存版本号：擦字算法/配置语义变化时 +1，旧缓存自动失效
 ERASE_CACHE_VERSION = 1
 
-
 def _erase_cache_key(source_sha256: str, extra_regions: dict, min_island_area: float,
                      config) -> str:
     """擦字结果的缓存键：只包含**决定擦字输出**的全部输入。
@@ -2970,6 +3697,8 @@ def _erase_cache_key(source_sha256: str, extra_regions: dict, min_island_area: f
             "fill_ring_radius": getattr(config, "fill_ring_radius", None),
             "inpaint_padding": getattr(config, "inpaint_padding", None),
             "mask": str(getattr(config, "mask", "")),
+            # 修复后端进键：换 LaMa/FSR 会自动重擦（否则会串用另一种后端的旧结果）
+            "inpainter": str(getattr(config, "inpainter", "auto")),
         },
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
@@ -3033,6 +3762,8 @@ def erase_and_typeset_page_with(
     sfx_min_side_ratio: float = SFX_MIN_SIDE_RATIO,
     sfx_min_side_page: float = SFX_MIN_SIDE_PAGE,
     page_font_ceiling_ratio: float = PAGE_FONT_CEILING_RATIO,
+    # 擦字修复后端：auto = 有 LaMa 就用它（更准但 CPU 上慢 4~6 倍）/ fsr = 快
+    erase_inpainter: str = ERASE_INPAINTER,
 ):
     import dataclasses
 
@@ -3240,7 +3971,7 @@ def erase_and_typeset_page_with(
         )
     erased = _erased_image_for(
         dataset_dir / page, source, active_dataset, extra_regions,
-        ErasureConfig(), 800.0,
+        ErasureConfig(inpainter=erase_inpainter), 800.0,
     )
     result = typeset_island_page(
         erased, canonical_dataset, translations, blue_lines, config=config,
@@ -3458,6 +4189,9 @@ def main(argv=None) -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--process", action="store_true",
                       help="stage 2 only (background processing)")
+    parser.add_argument(
+        "--erase-inpainter", choices=["auto", "lama", "fsr"], default="",
+        help="擦字修复后端：auto=有 LaMa 就用（更准、CPU 上慢 4~6 倍），fsr=快")
     mode.add_argument("--stage", choices=["ocr", "translate", "typeset"],
                       help="run only one stage of stage 2 (--pages selects "
                            "the pages for it; prerequisite artifacts must "
@@ -3747,6 +4481,7 @@ def main(argv=None) -> int:
         sfx_max_font_size=args.sfx_max_font_size,
         short_source_max_chars=args.short_source_max_chars,
         page_font_ceiling_ratio=args.page_font_ceiling_ratio,
+        erase_inpainter=args.erase_inpainter or _config.get("erase_inpainter", ERASE_INPAINTER),
         resume=args.resume,
         no_pdf=args.no_pdf,
         min_font_size=args.min_font_size,

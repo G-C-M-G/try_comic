@@ -46,3 +46,13 @@ __pycache__/
 /config/sakura_*.json
 
 config/api_keys.json
+
+# 本地 OCR / 判据模型（体积大，不入库）
+models/glm-ocr/
+models/glm-ocr-manga-lora/
+models/sarashina-3b/
+models/koharu-layout/
+models/sfx-lora/
+models/bubble_detection/
+models/lama-manga/
+models/bubble-seg/

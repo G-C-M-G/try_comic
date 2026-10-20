@@ -8,11 +8,15 @@ from manga_localizer.errors import TypesettingError
 from manga_localizer.island_contract import dataset_from_data
 from manga_localizer.island_dry_run import OcrLine
 from manga_localizer.island_typeset import (
+    PROHIBITED_LINE_END,
+    PROHIBITED_LINE_START,
     TypesetConfig,
     _block_metrics,
     _slots_centered,
     _slots_follow_columns,
     _slots_horizontal,
+    apply_kinsoku,
+    kinsoku_violations,
     typeset_island_page,
 )
 
@@ -42,6 +46,99 @@ def _island(bbox, area=9000.0, island_id="island_001"):
         "image_center": [(bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2],
         "image_area": area,
     }
+
+
+class KinsokuTest(unittest.TestCase):
+    """禁则（避头尾）：只移动断点，不动字序、不超上限。"""
+
+    def test_violations_counted(self):
+        # 「，」落在第二行行首
+        self.assertEqual(kinsoku_violations("甲乙丙，丁戊", [3, 3]), 1)
+        # 「（」落在第一行行末
+        self.assertEqual(kinsoku_violations("甲乙（丙丁戊", [3, 3]), 1)
+        self.assertEqual(kinsoku_violations("甲乙丙丁戊己", [3, 3]), 0)
+
+    def test_first_line_may_start_with_punctuation(self):
+        """整句以「…」起是原文自己的开头，不算断行违规。"""
+        self.assertEqual(kinsoku_violations("…甲乙丙丁戊", [3, 3]), 0)
+
+    def test_line_end_opening_bracket_counted_at_text_end(self):
+        self.assertEqual(kinsoku_violations("甲乙丙丁戊（", [3, 3]), 1)
+
+    def test_shifts_break_to_avoid_line_start_punctuation(self):
+        """「，」被挤到第二列行首 → 往前挪断点，它落到上一列末尾。"""
+        text = "甲乙丙，丁戊己"
+        counts = apply_kinsoku(text, [3, 3, 1], 3)
+        self.assertEqual(kinsoku_violations(text, counts), 0)
+        self.assertEqual(sum(counts), len(text))
+        self.assertEqual(len(counts), 3)
+
+    def test_shifts_break_to_avoid_line_end_bracket(self):
+        """「（」落在第一列末尾 → 往前挪断点，它变成第二列行首（合法）。"""
+        text = "甲乙（丙丁戊己"
+        counts = apply_kinsoku(text, [3, 3, 1], 3)
+        self.assertEqual(kinsoku_violations(text, counts), 0)
+        self.assertEqual(sum(counts), len(text))
+
+    def test_invariants_hold(self):
+        """行数不变、总和不变、每行字数仍在 [1, capacity]。"""
+        text = "彼は言った、それは違う。本当にそう思う、なぜなら"
+        capacity = 4
+        base = [capacity] * (len(text) // capacity) + [len(text) % capacity]
+        base = [c for c in base if c > 0]
+        counts = apply_kinsoku(text, base, capacity)
+        self.assertEqual(len(counts), len(base))
+        self.assertEqual(sum(counts), len(text))
+        self.assertTrue(all(1 <= c <= capacity for c in counts))
+
+    def test_never_worse_than_input(self):
+        """不许把本来正确的改坏，也不许把违规数改多。"""
+        for text, counts in (
+            ("甲乙丙丁戊己", [3, 3]),
+            ("甲乙、丙丁戊", [3, 3]),
+            ("（甲乙丙丁戊", [3, 3]),
+            ("甲乙丙、丁戊己庚", [4, 4]),
+            ("，，，，，，", [3, 3]),
+        ):
+            out = apply_kinsoku(text, counts, max(counts))
+            self.assertLessEqual(kinsoku_violations(text, out),
+                                 kinsoku_violations(text, counts))
+            self.assertEqual(sum(out), len(text))
+
+    def test_full_lines_without_slack_left_alone(self):
+        """每行都顶满 = 没有空位可借 → 保持原样。
+
+        这是本实现的**有意边界**：宁可留一处违规，也不让某行超上限（那会让字
+        跑出岛外）。真实布局里末行是余数、总有余位，所以能修好的占多数。
+        """
+        text = "甲乙丙、。丁"
+        counts = apply_kinsoku(text, [3, 3], 3)
+        self.assertEqual(counts, (3, 3))
+
+    def test_single_line_untouched(self):
+        self.assertEqual(apply_kinsoku("甲乙丙，丁", [5], 5), (5,))
+
+    def test_slots_centered_respects_kinsoku(self):
+        dataset = _dataset([_island((10, 10, 200, 300))])
+        island = dataset.islands[0]
+        text = "甲乙丙，丁戊己庚辛壬癸"
+        slots = _slots_centered(text, 24, island, (105, 155), TypesetConfig())
+        counts = [slot.char_count for slot in slots]
+        self.assertEqual(sum(counts), len(text))
+        self.assertEqual(kinsoku_violations(text, counts), 0)
+
+    def test_slots_horizontal_respects_kinsoku(self):
+        dataset = _dataset([_island((10, 10, 290, 160))])
+        island = dataset.islands[0]
+        text = "甲乙丙丁戊，己庚辛壬癸子丑"
+        slots = _slots_horizontal(text, 18, island, (150, 85), TypesetConfig())
+        counts = [slot.char_count for slot in slots]
+        self.assertEqual(sum(counts), len(text))
+        self.assertEqual(kinsoku_violations(text, counts), 0)
+
+    def test_prohibited_sets_are_disjoint(self):
+        """避头集与避尾集互不相交——否则一处标点两个方向都无解。"""
+        self.assertEqual(PROHIBITED_LINE_START & PROHIBITED_LINE_END, frozenset())
 
 
 class ReadingOrderTest(unittest.TestCase):

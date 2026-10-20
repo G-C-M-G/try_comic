@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
+from pathlib import Path
 import time
 from typing import Dict, Mapping, Optional, Protocol, Tuple
 
@@ -164,6 +166,189 @@ class ErasureConfig:
     mask: ErasureMaskConfig = ErasureMaskConfig()
     fill_ring_radius: int = 6
     inpaint_padding: int = 8
+    # 修复后端：``auto`` = 有 LaMa 模型就用 LaMa、否则 FSR；也可强制 ``lama``/``fsr``。
+    # **这个值进擦字缓存键**（`_erase_cache_key`），所以换后端会自动重擦。
+    inpainter: str = "auto"
+
+
+# --- LaMa 修复（2026-09-17 接入）---------------------------------------------
+#
+# 为什么换掉 FSR：现役 `cv2.xphoto.INPAINT_FSR_FAST` 的选型**项目里从没评估过**。
+# 实测对照（同一掩膜、同一批岛，`var/probe_lama_vs_fsr.py`）：
+#   * 页2 WARNING 白底：FSR 去掉了字但**留下黑色残块**；LaMa 干净，且保住了原图案的斜杠装饰。
+#   * 页1 DOJIN/R18：FSR 把"白带+黑盒"的**盒子结构糊掉**；LaMa 结构保住。
+#   * 页16 网点上的手绘字：FSR 把网点抹成**一片模糊白灰**；LaMa **把网点纹理重建出来**。
+#   * 速度（生产口径，一页一次）：FSR 随面积暴涨（页22 **40.0s**）；LaMa 恒定 ~1.5s/岛。
+#
+# 两条**必须守住**的实现约束（我第一版都踩过，结果填出大片纯黑）：
+#   1. **上下文要给够**。裁剪紧贴掩膜 → 掩膜占满整张图 → LaMa 没有信息可依 → 瞎猜。
+#      这里按组件尺寸的 ``context_ratio`` 倍向外取框。
+#   2. **不许硬压方形**。实测 6.8:1 的裁剪压成 512×512 会崩（连 `WARNING` 都去不掉）。
+#      这里保长宽比缩放到 512，缺的边用**边框主色**补（中性，不注入结构）。
+#
+# 调用方传进来的是**整页并集掩膜**（每个后端一页只调一次），所以这里自己拆连通域、
+# 逐个给上下文跑。
+LAMA_MODEL = (
+    Path(__file__).resolve().parents[1] / "models" / "lama-manga" / "lama-manga.onnx"
+)
+LAMA_INPUT_SIZE = 512            # 这份导出是固定 512×512（无动态 shape）
+LAMA_CONTEXT_RATIO = 0.6         # 组件之外各留 0.6 倍尺寸作上下文
+LAMA_MIN_COMPONENT_PIXELS = 24    # 太小的组件不值得跑模型
+
+
+@dataclass(frozen=True)
+class LamaInpainter:
+    """Big-LaMa（漫画微调）修复：逐连通域、给足上下文、保长宽比。"""
+
+    model_path: Path = LAMA_MODEL
+    context_ratio: float = LAMA_CONTEXT_RATIO
+    size: int = LAMA_INPUT_SIZE
+    name: str = "lama-manga-big-local-v1"
+
+    def available(self) -> bool:
+        if not Path(self.model_path).is_file():
+            return False
+        try:
+            import numpy  # noqa: F401
+            import onnxruntime  # noqa: F401
+            import scipy  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    @staticmethod
+    def _expose_cuda_runtime_dlls() -> None:
+        """把 torch 自带的 CUDA 运行时目录加进 DLL 搜索路径。
+
+        **onnxruntime-gpu 不会自己找 cuDNN / cuBLAS，它靠 PATH。** 装了 CUDA 版 torch
+        的环境里这些 DLL 就在 ``<site-packages>/torch/lib``，但不在 PATH 上——实测缺
+        ``cublasLt64_12.dll`` 时 CUDA provider **静默退回 CPU**（只有一条 warning，
+        很容易被日志淹没，看起来"用了 GPU"其实没有）。所以这里显式加进去。
+
+        另外注意**版本要对**：onnxruntime-gpu 1.30 要 CUDA 13（``cublasLt64_13.dll``），
+        而 torch cu126 带的是 CUDA 12 命名 → 对不上。本机可用组合是
+        **onnxruntime-gpu 1.22.0**（CUDA 12 构建）+ torch 2.13+cu126 的 DLL。
+        """
+        if os.name != "nt":
+            return
+        try:
+            import torch
+        except ImportError:
+            return
+        library = Path(torch.__file__).resolve().parent / "lib"
+        if not library.is_dir():
+            return
+        os.environ["PATH"] = str(library) + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(str(library))
+        except (AttributeError, OSError):
+            pass
+
+    def _session(self):
+        cached = getattr(self, "_cached_session", None)
+        if cached is None:
+            import onnxruntime
+
+            available = onnxruntime.get_available_providers()
+            providers: list[str] = []
+            if "CUDAExecutionProvider" in available:
+                self._expose_cuda_runtime_dlls()
+                providers.append("CUDAExecutionProvider")
+            providers.append("CPUExecutionProvider")
+            options = onnxruntime.SessionOptions()
+            # **限制 CPU 路每路会话的线程数**：页级并行（`--max-workers` 默认 3）已经
+            # 把多个 LaMa 会话同时放进来了，而 onnxruntime 默认每路都吃满所有核 →
+            # 线程超订、互相抢。实测（16 逻辑核 / 3 路 / CPU）不限制时 32s/页，
+            # 而单页单独跑只要 38s（3 路本该 ~13s/页）——并行几乎白拿。
+            # GPU 路不吃 CPU 线程，这个设置对它无害。
+            options.intra_op_num_threads = max(1, (os.cpu_count() or 4) // 3)
+            options.inter_op_num_threads = 1
+            cached = onnxruntime.InferenceSession(
+                str(self.model_path), options, providers=providers)
+            object.__setattr__(self, "_cached_session", cached)
+        return cached
+
+    def _fill_component(self, working: Image.Image, box: BBox,
+                        component: Image.Image) -> None:
+        import numpy as np
+
+        crop = working.crop(box)
+        component_crop = component.crop(box)
+        width, height = crop.size
+        scale = self.size / max(width, height)
+        small_w = max(1, round(width * scale))
+        small_h = max(1, round(height * scale))
+        # 缺的边用**边框主色**补，保持中性（不用白/黑，免得给模型暗示）
+        edge = crop.resize((1, 1), Image.BOX).getpixel((0, 0))
+        canvas = Image.new("RGB", (self.size, self.size), edge)
+        canvas.paste(crop.resize((small_w, small_h), Image.LANCZOS), (0, 0))
+        mask_canvas = Image.new("L", (self.size, self.size), 0)
+        mask_canvas.paste(
+            component_crop.resize((small_w, small_h), Image.NEAREST), (0, 0))
+
+        image_input = np.transpose(
+            np.asarray(canvas, dtype=np.float32) / 255.0, (2, 0, 1))[None, ...]
+        mask_input = (
+            np.asarray(mask_canvas, dtype=np.float32) / 255.0)[None, None, ...]
+        output = self._session().run(
+            ["output"], {"image": image_input, "mask": mask_input})[0][0]
+        filled = Image.fromarray(
+            np.clip(np.transpose(output, (1, 2, 0)) * 255.0, 0, 255).astype(np.uint8)
+        ).crop((0, 0, small_w, small_h)).resize((width, height), Image.LANCZOS)
+        local = crop.copy()
+        local.paste(filled, (0, 0), component_crop)
+        working.paste(local, (box[0], box[1]))
+
+    def inpaint(self, image: Image.Image, mask: Image.Image, padding: int) -> Image.Image:
+        if mask.getbbox() is None:
+            return image.copy()
+        try:
+            import numpy as np
+            from scipy import ndimage
+        except ImportError as error:
+            raise ErasureError(
+                "numpy 与 scipy 是 LaMa 修复的依赖（pip install scipy）"
+            ) from error
+
+        source = image.convert("RGB")
+        binary = np.asarray(mask.convert("L")) > 0
+        labels, count = ndimage.label(binary)
+        if count == 0:
+            return source.copy()
+        working = source.copy()
+        for index in range(1, count + 1):
+            rows, columns = np.nonzero(labels == index)
+            if rows.size < LAMA_MIN_COMPONENT_PIXELS:
+                continue
+            y1, y2 = int(rows.min()), int(rows.max()) + 1
+            x1, x2 = int(columns.min()), int(columns.max()) + 1
+            margin = int(round(max(x2 - x1, y2 - y1) * self.context_ratio))
+            box = (max(0, x1 - margin), max(0, y1 - margin),
+                   min(source.width, x2 + margin), min(source.height, y2 + margin))
+            component = Image.fromarray(
+                np.where(labels == index, 255, 0).astype(np.uint8))
+            self._fill_component(working, box, component)
+        # 只保留掩膜内的改动——掩膜外的像素必须逐位不变（擦字的像素完整性契约）
+        return Image.composite(working, source, mask.convert("L"))
+
+
+def select_inpainter(config: Optional["ErasureConfig"] = None) -> "Inpainter":
+    """按配置挑修复后端；``auto`` 在 LaMa 可用时优先用它，否则退回 FSR。
+
+    可用性在**开跑前**判定（模型文件 + 依赖），不会跑到第 80 页才发现模型缺失。
+    """
+    choice = str(getattr(config, "inpainter", "auto") or "auto").lower()
+    if choice in ("fsr", "opencv"):
+        return OpenCVFSRInpainter()
+    lama = LamaInpainter()
+    if choice == "lama":
+        if not lama.available():
+            raise ErasureError(
+                f"配置要求 LaMa 修复，但模型不可用：{lama.model_path}"
+                "（见 开发记录 §13；或把 inpainter 改回 \"fsr\"）"
+            )
+        return lama
+    return lama if lama.available() else OpenCVFSRInpainter()
 
 
 @dataclass(frozen=True)
@@ -257,7 +442,7 @@ def erase_image(
         {column_id: decision.strategy for column_id, decision in decisions.items()},
         config.mask,
     )
-    active_inpainter = inpainter or OpenCVFSRInpainter()
+    active_inpainter = inpainter or select_inpainter(config)
     working = source.copy()
     execution: Dict[str, Tuple[str, Optional[RGBColor]]] = {}
     inpaint_groups: Dict[str, Tuple[Inpainter, Image.Image]] = {}

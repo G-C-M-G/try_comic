@@ -1,6 +1,6 @@
 # 漫画翻译助手（Manga Localizer）
 
-日文漫画 → 中文嵌字全流程：**Photos 蓝框采集 → 蓝框 OCR → 整页翻译（AI 优先 / 本地 Sakura 兜底）→ 擦字 → 竖排/横排嵌字 → PDF**。
+日文漫画 → 中文嵌字全流程：**采集（默认 PaddleOCR 全页检测，`--box-source photos` 可切回 Photos 蓝框）→ 岛级 OCR（manga-ocr × Paddle 交叉验证）→ 整页翻译（AI 优先 / 本地 Sakura 兜底）→ 擦字 → 竖排/横排嵌字 → PDF**。
 
 本仓库由两个项目合并而成：
 - **上游（try_comic 原仓）**：Windows Photos"扫描文本"高亮岛采集、差分岛提取、PaddleOCR 子进程、OCR 人工核对；
@@ -11,7 +11,7 @@
 
 ```powershell
 # 环境（root venv 已含 PySide6/PIL/numpy/winrt/manga_ocr/jsonschema）
-venv\Scripts\python.exe -m unittest discover -s tests        # 333 项测试
+venv\Scripts\python.exe -m unittest discover -s tests        # 496 项测试
 
 # 图形界面（推荐：采集 / 处理 / 审核 / 预览 / 术语 / 设置 一站完成）
 venv\Scripts\python.exe one_click_gui.py
@@ -47,6 +47,8 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --page
 
 ## 采集布局参数
 
+（以下参数仅 `--box-source photos` 的 Photos 窗口平铺采集生效；默认的 PaddleOCR 全页检测无窗口自动化，不涉及布局）
+
 | 参数 | 默认 | 作用 |
 |---|---|---|
 | `--parallel` | 3 | 并行 Photos 窗口数（上3下3 平铺） |
@@ -62,7 +64,7 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --page
 manga_localizer/      应用核心包（翻译/排版/擦字/进度/契约等）
 one_click_gui.py      一键 GUI（PySide6，调用 one_click_translate.py）
 one_click_translate.py 一键流水线 CLI（采集 / 处理 / 审核确认）
-photos_capture.py     Photos 蓝框采集底层（batch --fast --frames-only）
+photos_capture.py     Photos 蓝框采集底层（batch --fast --frames-only；现为备选，默认采集已换 PaddleOCR 全页检测）
 island_extract.py     差分岛提取 / 保底数据集
 paddle_ocr_worker.py  PaddleOCR 隔离子进程（--crops 四变体）
 windows_ocr.py        Windows.Media.Ocr(ja) 无窗口识别

@@ -18,9 +18,14 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .errors import TranslationError, TranslationResponseError
+from .errors import (
+    TranslationError,
+    TranslationResponseError,
+    TranslationTimeoutError,
+)
 from .island_contract import IslandDataset
 from .ocr_contract import BBox, Polygon
+from .text_rules import is_numeric_passthrough
 from .translator import (
     Glossary,
     PROMPT_VERSION,
@@ -425,9 +430,17 @@ def translate_island_page(
         if _is_short_symbol(source_text):
             # 1-2 char punctuation/symbol islands need no translation: keep
             # the source without calling the engine (avoids leakage).
+            skip_reason = "short-symbol"
+        elif is_numeric_passthrough(source_text):
+            # 纯数字/符号岛同理：送引擎既白花一次调用，又可能把 ``１２０`` 翻成
+            # "一百二十"（画面上的数字被改成汉字，比不译更糟）。见 text_rules。
+            skip_reason = "numeric-passthrough"
+        else:
+            skip_reason = None
+        if skip_reason is not None:
             translated = source_text
             kept_source = True
-            attempts.append(("skip", "short-symbol"))
+            attempts.append(("skip", skip_reason))
         engine_attempts = 0
         for precision in sequence:
             for style in ("contextual", "concise"):
@@ -454,6 +467,13 @@ def translate_island_page(
                     break
                 try:
                     response = translator.translate(request, active_glossary)
+                except TranslationTimeoutError as error:
+                    # 超时 = 本次请求预算已经花光。在**同一个引擎**上再试一次
+                    # （只是换 prompt 风格）大概率再花光一次，所以直接换下一档
+                    # 精度（本地 Sakura 仍在序列里，岛不会因此没译文）。
+                    attempts.append((precision, f"timeout: {error}"))
+                    failure = str(error)
+                    break
                 except TranslationError as error:
                     attempts.append((precision, f"failed: {error}"))
                     failure = str(error)
@@ -749,8 +769,22 @@ class PageBatchResult:
 def _batch_messages(
     numbered_lines: Sequence[Tuple[int, str]],
     glossary: Glossary,
+    previous_lines: Sequence[str] = (),
 ) -> list[dict]:
     body = "\n".join(f"{index}: {text}" for index, text in numbered_lines)
+    # 跨页上下文：**只给上一页的原文，不给译文**。这样不依赖"上一页已经翻完"——
+    # 页仍然可以并行翻译（`_stage2_translate` 用线程池按页并发），缓存键也完全
+    # 确定（上一页原文在开跑前就已知）。用途是**指代/人称/对话延续**；参考实现
+    # （overlay-translator 的 previous_frame）会连译文一起给，但那要求顺序翻译，
+    # 在大书上会显著变慢。
+    previous_block = ""
+    if previous_lines:
+        joined = "\n".join(
+            f"- {line}" for line in previous_lines if str(line).strip())
+        if joined:
+            previous_block = (
+                "\n\n上一页的原文（仅供理解指代与对话延续，"
+                "**不要翻译、不要复述、不要输出**）：\n" + joined)
     system = (
         "你是日文漫画对白翻译器。用户提供一页内多个高亮岛（台词框）的编号日文文本，"
         "编号即阅读顺序。请把每条整体意译成自然、简洁、口语化的简体中文，"
@@ -760,6 +794,7 @@ def _batch_messages(
         "长度以各自原文为准，日译中通常压到七成，宁短勿长，但不要为了压字数丢原意。"
         "必须逐条输出，格式严格为每行一个『编号: 译文』，不要输出其他任何内容。\n\n"
         f"术语表/人名表：\n{glossary.prompt_text()}"
+        f"{previous_block}"
     )
     return [
         {"role": "system", "content": system},
@@ -823,6 +858,7 @@ class PageBatchCache:
         texts: Mapping[str, str],
         config: IslandTranslateConfig,
         glossary: Optional[Glossary] = None,
+        previous_lines: Sequence[str] = (),
     ) -> str:
         ordered = sorted(
             (island for island in dataset.islands if island.id in texts),
@@ -841,6 +877,8 @@ class PageBatchCache:
             # 不进签名就会出现"改了术语表但命中旧缓存、改动毫无效果"。
             "glossary_sha256": glossary.sha256 if glossary is not None else "",
             "texts": {island.id: str(texts[island.id]) for island in ordered},
+            # 上一页原文也是提示词的一部分（跨页上下文），必须进签名
+            "previous_lines": [str(line) for line in previous_lines],
         }
         return _canonical_sha256(data)
 
@@ -871,6 +909,7 @@ def translate_page_batch(
     glossary: Optional[Glossary] = None,
     cache: Optional[PageBatchCache] = None,
     chat_fn=None,
+    previous_lines: Sequence[str] = (),
 ) -> PageBatchResult:
     """Whole-page batched translation through the online AI (precision=online).
 
@@ -890,7 +929,8 @@ def translate_page_batch(
         key=lambda island: -island.image_bbox[2],
     )
     numbered = {index: island.id for index, island in enumerate(ordered, 1)}
-    key = active_cache.signature(dataset, texts, config, active_glossary)
+    key = active_cache.signature(
+        dataset, texts, config, active_glossary, previous_lines)
     cached = active_cache.load(key)
     if cached is not None:
         return PageBatchResult(
@@ -915,6 +955,7 @@ def translate_page_batch(
     messages = _batch_messages(
         [(index, str(texts[island_id])) for index, island_id in numbered.items()],
         active_glossary,
+        previous_lines,
     )
     raw = chat_fn(messages)
     translations, failures, errors = _parse_batch_response(raw, numbered)

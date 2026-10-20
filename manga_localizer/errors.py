@@ -38,6 +38,16 @@ class TranslationResponseError(TranslationError):
     """A translator returned empty, unchanged, or structurally invalid text."""
 
 
+class TranslationTimeoutError(TranslationError):
+    """A translator request used up its whole timeout budget without answering.
+
+    单独一类是为了**可诊断**：以前所有传输层故障都塌成同一句 "request failed"，
+    于是"到底是超时、还是 DNS/连接被重置"在日志里分不出来，也没法据此决定要不要
+    重试。已完成的超时意味着本次请求预算已经花光——在同一个引擎上原样再来一次
+    大概率再花光一次（参考实现的同一条规则：``InterruptedIOException`` 不重试）。
+    """
+
+
 class TypesettingError(MangaLocalizerError):
     """Chinese text cannot be placed without violating the layout contract."""
 

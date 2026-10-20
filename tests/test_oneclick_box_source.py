@@ -958,3 +958,153 @@ class StaleDatasetRulesTest(unittest.TestCase):
         islands = self._run(drop_art_boxes=False, islands_payload=self.OLD_ISLANDS)
         self.assertNotIn("bg_flat_ratio", islands["islands"][0])
         self.assertEqual(len(islands["islands"]), 1)   # 原样复用，没重建
+
+class BoxDropListTests(unittest.TestCase):
+    """框级"被丢清单"：框级过滤此前**没有人工真值覆盖**（被丢的框在编组前就消失、
+    从不进核对表），"筛框到底杀了多少台词"无人知道。这里锁住"落盘"这件事。
+    """
+
+    def test_large_sfx_box_drop_is_recorded(self):
+        import json
+        import tempfile
+        from pathlib import Path as _Path
+
+        from one_click_translate import build_bluebox_dataset
+
+        # 一页里 6 个正常小框 + 1 个超大框（短边远超同方向基准且 > 10% 页短边）
+        blocks = [{"id": f"sel_{i:03d}",
+                   "image_bbox": [40, 60 + i * 40, 140, 90 + i * 40],
+                   "page_scale": False} for i in range(1, 7)]
+        blocks.append({"id": "sel_099", "image_bbox": [300, 300, 900, 1300],
+                       "page_scale": False})
+        manifest = {"source": {"width": 1000, "height": 1400},
+                    "capture": {"selection_blocks": blocks}}
+        with tempfile.TemporaryDirectory(prefix="boxdrop_") as tmp:
+            root = _Path(tmp)
+            (root / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+            from PIL import Image
+
+            source = root / "page.jpg"
+            Image.new("RGB", (1000, 1400), "white").save(source)
+            page_dir = root / "dataset" / "1"
+            islands = build_bluebox_dataset(root / "manifest.json", page_dir, source)
+            self.assertTrue(all(i["image_bbox"][2] <= 200 for i in islands
+                                if i["id"] == "island_001"))
+            drop_path = page_dir / "dropped_boxes.csv"
+            self.assertTrue(drop_path.is_file(), "大拟音框被丢时应当落 dropped_boxes.csv")
+            text = drop_path.read_text(encoding="utf-8-sig")
+            self.assertIn("大拟音", text)
+            self.assertIn("sel_099", text)
+
+
+class SoftFlagLargeSfxTest(unittest.TestCase):
+    """框级软标记（soft_flag_large_sfx）：硬过滤的放宽档，只标记不丢框。
+
+    严格联合版（开发记录 六之前四）的第一段。要锁住的边界：中等大的框确实被
+    标（1.2×~2.0× 之间那批是严格版的主要增量）、正常字号的框不被标、
+    框数不足时与硬过滤同样保持沉默。
+    """
+
+    PAGE = (1000, 1400)
+
+    def _v(self, x, y, w, h):
+        return [x, y, x + w, y + h]
+
+    def test_medium_box_is_flagged(self):
+        from one_click_translate import soft_flag_large_sfx
+
+        boxes = [self._v(10, 10, 40, 300), self._v(60, 10, 40, 300),
+                 self._v(110, 10, 40, 300), self._v(160, 10, 60, 300)]
+        flagged = soft_flag_large_sfx(boxes, *self.PAGE)
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0], boxes[3])   # 短边 60：> 1.2×40 且 > 5%×1000
+
+    def test_normal_boxes_are_not_flagged(self):
+        from one_click_translate import soft_flag_large_sfx
+
+        boxes = [self._v(10, 10, 40, 300), self._v(60, 10, 40, 300),
+                 self._v(110, 10, 40, 300), self._v(160, 10, 40, 300)]
+        self.assertEqual(soft_flag_large_sfx(boxes, *self.PAGE), [])
+
+    def test_too_few_boxes_flags_nothing(self):
+        from one_click_translate import soft_flag_large_sfx
+
+        boxes = [self._v(10, 10, 90, 300), self._v(120, 10, 90, 300)]
+        self.assertEqual(soft_flag_large_sfx(boxes, *self.PAGE), [])
+
+
+class SoftFlagDatasetPlumbingTest(unittest.TestCase):
+    """build_bluebox_dataset 必须把软标记写进岛（sfx_soft_flag）和数据集级
+    标记（soft_flag_version）——岛级裁决与"数据集新旧"判据都靠它们。"""
+
+    def test_flagged_island_and_marker_written(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        page = root / "1.jpg"
+        Image.new("RGB", (400, 300), "white").save(page)
+        # 三个正常竖框（短边 20）+ 一个中等框（短边 30 > 1.2×20 且 > 5%×300）
+        manifest = root / "capture.json"
+        manifest.write_text(json.dumps({
+            "source": {"path": str(page), "width": 400, "height": 300},
+            "capture": {
+                "box_source": "paddle",
+                "selection_blocks": [
+                    {"id": "sel_001", "image_bbox": [20, 20, 40, 280], "page_scale": False},
+                    {"id": "sel_002", "image_bbox": [100, 20, 120, 280], "page_scale": False},
+                    {"id": "sel_003", "image_bbox": [180, 20, 200, 280], "page_scale": False},
+                    {"id": "sel_004", "image_bbox": [260, 20, 290, 280], "page_scale": False},
+                ],
+            },
+        }, ensure_ascii=False), encoding="utf-8")
+        page_dir = root / "dataset" / "1"
+        # 软标记与 bg_flat_ratio 同一门控：只在手绘字功能开启时写
+        islands = build_bluebox_dataset(manifest, page_dir, str(page),
+                                        drop_art_boxes=True)
+        payload = json.loads(
+            (page_dir / "islands.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("soft_flag_version"), 1)
+        by_flag = {i["id"]: bool(i.get("sfx_soft_flag")) for i in islands}
+        flagged = [iid for iid, v in by_flag.items() if v]
+        self.assertEqual(len(flagged), 1, f"恰好一个中等框岛被标记：{by_flag}")
+
+    def test_flags_absent_when_feature_off(self):
+        """手绘字功能没开（drop_art_boxes=False）→ 绝不写软标记。
+
+        软标记是岛级裁决的"像拟声"一票：功能关着的书绝不能因为数据集里
+        多了这个字段就被丢岛（与 bg_flat_ratio 同一门控）。
+        """
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        page = root / "1.jpg"
+        Image.new("RGB", (400, 300), "white").save(page)
+        manifest = root / "capture.json"
+        manifest.write_text(json.dumps({
+            "source": {"path": str(page), "width": 400, "height": 300},
+            "capture": {
+                "box_source": "paddle",
+                "selection_blocks": [
+                    {"id": "sel_001", "image_bbox": [20, 20, 40, 280], "page_scale": False},
+                    {"id": "sel_002", "image_bbox": [100, 20, 120, 280], "page_scale": False},
+                    {"id": "sel_003", "image_bbox": [180, 20, 200, 280], "page_scale": False},
+                    {"id": "sel_004", "image_bbox": [260, 20, 290, 280], "page_scale": False},
+                ],
+            },
+        }, ensure_ascii=False), encoding="utf-8")
+        islands = build_bluebox_dataset(manifest, root / "dataset" / "1",
+                                        str(page))
+        self.assertTrue(all("sfx_soft_flag" not in i for i in islands))

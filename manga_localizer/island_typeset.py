@@ -39,7 +39,7 @@ from dataclasses import dataclass
 import math
 import time
 from pathlib import Path
-from typing import Collection, Mapping, Optional, Sequence, Tuple
+from typing import Collection, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
@@ -157,17 +157,142 @@ def _pitch(config: TypesetConfig, size: int, *, horizontal: bool = False) -> int
     return size + config.column_gap(size)
 
 
+# --- 禁则（避头尾）---------------------------------------------------------
+#
+# 中文/日文排版的硬规矩：某些标点**不能出现在行首**（避头），某些**不能出现在
+# 行末**（避尾）。之前这里完全没有这层——标点占一个格子和汉字一样排，于是成品
+# 里会出现"一列以「，」开头"这种肉眼可见的事故。
+#
+# 实现上有一条必须守住的约束：**只移动断点，不调换字符顺序**（禁则是"在哪里断
+# 行"的问题，不是字序问题），而且调整后每行字数仍落在 [1, capacity] 内。这样块
+# 的宽高只会变小不会变大，"字始终完整落在岛内"这个前提不会被破坏。
+
+PROHIBITED_LINE_START = frozenset(
+    "、。，．！？：；）］｝〉》」』】〕〗〙〛”’…ー,.!?:;)]}～"
+)
+PROHIBITED_LINE_END = frozenset("（［｛〈《「『【〔〖〘〚“‘([{")
+
+
+def _line_breaks(counts: Sequence[int]) -> list:
+    """每行起始位置（累计字数），最后一行之后不返回（它不是断点）。"""
+    positions, total = [], 0
+    for count in counts[:-1]:
+        total += count
+        positions.append(total)
+    return positions
+
+
+def kinsoku_violations(text: str, counts: Sequence[int]) -> int:
+    """这个折行方案有几处避头尾违规（0 = 干净）。
+
+    第一行开头**不算违规**——那是原文自己的开头（例如整句以「…」起），不是断行
+    造成的。这与参考实现（`ShapeAwareTextLayout.respectsKinsoku` 跳过 index 0）
+    一致。
+    """
+    if not text or not counts:
+        return 0
+    bad = 1 if text[-1] in PROHIBITED_LINE_END else 0
+    for position in _line_breaks(counts):
+        if not 0 < position < len(text):
+            continue
+        if text[position] in PROHIBITED_LINE_START:
+            bad += 1
+        if text[position - 1] in PROHIBITED_LINE_END:
+            bad += 1
+    return bad
+
+
+def _shift_break_earlier(counts: list, index: int, capacity: int) -> bool:
+    """断点往前挪一格（**追い出し**）：第 index 行首的字挪到第 index-1 行末。
+
+    第 index-1 行因此满出来，就把它的末字继续挤到下一行——沿后续行级联，直到
+    撞上某一行还有空位（通常是最后一行，它是余数）。级联让中间各行的字数不变，
+    所以只需改两处。
+    """
+    if counts[index - 1] <= 1:
+        return False
+    room = next((k for k in range(index, len(counts)) if counts[k] < capacity), None)
+    if room is None:
+        return False
+    counts[index - 1] -= 1
+    counts[room] += 1
+    return True
+
+
+def _shift_break_later(counts: list, index: int, capacity: int) -> bool:
+    """断点往后挪一格（**追い込み**）：第 index-1 行末的字提上来当第 index 行首。
+
+    与上一个方向相反，空位得从**前面**的行里找。
+    """
+    if counts[index] <= 1:
+        return False
+    room = next((k for k in range(index - 1, -1, -1) if counts[k] < capacity), None)
+    if room is None:
+        return False
+    counts[index] -= 1
+    counts[room] += 1
+    return True
+
+
+def apply_kinsoku(text: str, counts: Sequence[int],
+                  capacity: int, passes: int = 4) -> Tuple[int, ...]:
+    """按避头尾调整断点，返回调整后的每行字数。
+
+    不变量：**行数不变、逐行字数仍在 [1, capacity]、总和不变**。所以调用方拿到
+    的块宽高只会不变或变小，放得下这个结论不会被推翻。
+
+    两个方向都试，**只在真的减少了违规数时才采纳**（否则撤回），所以它可能修
+    不干净（例如相邻两个标点都该避开、无解），但绝不会把原来正确的改坏。这与
+    参考实现把 `respectsKinsoku` 当**硬否决**（宁可缩字号）的选择不同——这里
+    宁可留一处违规也不缩字号，因为我们的字号是"填满框"驱动的，缩字号会让整块
+    观感变化，代价比一个标点位置大。
+    """
+    counts = list(counts)
+    if len(counts) < 2 or not text:
+        return tuple(counts)
+    for _ in range(passes):
+        if kinsoku_violations(text, counts) == 0:
+            break
+        improved = False
+        for index in range(1, len(counts)):
+            trial = list(counts)
+            if (_shift_break_earlier(trial, index, capacity)
+                    or _shift_break_later(trial, index, capacity)):
+                if (kinsoku_violations(text, trial)
+                        < kinsoku_violations(text, counts)):
+                    counts = trial
+                    improved = True
+        if not improved:
+            break
+    return tuple(counts)
+
+
+class LinePlan(NamedTuple):
+    """一次折行计划：每列/每行的字数（已按禁则调过断点）+ 块宽高。
+
+    ``counts`` 取代了原来"每行字数相同（``chars_per_column``）+ 末行余数"的
+    表示——禁则调整会让各行字数不再相同，所以必须存整个序列。
+    """
+
+    counts: Tuple[int, ...]
+    block_width: int
+    block_height: int
+
+    @property
+    def line_count(self) -> int:
+        return len(self.counts)
+
+
 def _column_layout(
     text: str,
     size: int,
     island: IslandInfo,
     config: TypesetConfig,
     layout_bbox: Optional[BBox] = None,
-) -> Tuple[int, int, int, int]:
-    """(chars_per_column, column_count, block_width, block_height).
-
-    ``layout_bbox`` overrides the island bbox as the layout bounds -- used
-    by union mode so the block can never leave the blue-box union.
+) -> LinePlan:
+    """Vertical layout plan.  ``layout_bbox`` overrides the island bbox as the
+    layout bounds -- used by union mode so the block can never leave the
+    blue-box union.
     """
     x1, y1, x2, y2 = layout_bbox if layout_bbox is not None else island.image_bbox
     usable_w = max(1, (x2 - x1) - 2 * config.padding)
@@ -188,9 +313,31 @@ def _column_layout(
     if last_count <= 0:
         column_count = math.ceil(len(text) / chars_per_column)
         last_count = len(text) - (column_count - 1) * chars_per_column
-    block_height = (chars_per_column - 1) * step + size
-    block_width = column_count * pitch - config.column_gap(size)
-    return chars_per_column, column_count, block_width, block_height, last_count
+    counts = apply_kinsoku(
+        text, [chars_per_column] * (column_count - 1) + [last_count],
+        chars_per_column,
+    )
+    # 禁则只重分配断点，所以 max(counts) <= chars_per_column → 块只会变矮
+    block_height = (max(counts) - 1) * step + size
+    block_width = len(counts) * pitch - config.column_gap(size)
+    return LinePlan(counts, block_width, block_height)
+
+
+def _counts_follow_columns(text: str, original_columns: Sequence[ColumnGroup]) -> list:
+    """Spread mode 的折行：一个块列对一个原列，字数均分（禁则只调断点）。"""
+    column_count = min(len(text), len(original_columns))
+    chars_per_column = max(1, math.ceil(len(text) / column_count))
+    last_count = len(text) - (column_count - 1) * chars_per_column
+    if last_count <= 0:
+        # The columns would overflow the text (e.g. 5 chars across 4
+        # boxes): shrink the column count so the last column is never
+        # empty or negative.
+        column_count = math.ceil(len(text) / chars_per_column)
+        last_count = len(text) - (column_count - 1) * chars_per_column
+    return apply_kinsoku(
+        text, [chars_per_column] * (column_count - 1) + [last_count],
+        chars_per_column,
+    )
 
 
 def _slots_follow_columns(
@@ -209,19 +356,12 @@ def _slots_follow_columns(
         # box, so every column sits on its own box (union mode for spread
         # text; the box count drives the column count, not the union
         # height).
-        column_count = min(len(text), len(original_columns))
-        chars_per_column = max(1, math.ceil(len(text) / column_count))
-        last_count = len(text) - (column_count - 1) * chars_per_column
-        if last_count <= 0:
-            # The columns would overflow the text (e.g. 5 chars across 4
-            # boxes): shrink the column count so the last column is never
-            # empty or negative.
-            column_count = math.ceil(len(text) / chars_per_column)
-            last_count = len(text) - (column_count - 1) * chars_per_column
+        counts = _counts_follow_columns(text, original_columns)
     else:
-        chars_per_column, column_count, _bw, _bh, last_count = _column_layout(
+        counts = _column_layout(
             text, size, island, config, layout_bbox=layout_bbox
-        )
+        ).counts
+    column_count = len(counts)
     # reading order: rightmost original column first
     ordered = sorted(original_columns, key=_column_key)
     pitch = _pitch(config, size)
@@ -236,7 +376,7 @@ def _slots_follow_columns(
             base_cx = (ordered[-1].bbox[0] + ordered[-1].bbox[2]) / 2.0
             cx = base_cx - (i - len(ordered) + 1) * pitch
             cy = (bounds[1] + bounds[3]) / 2.0
-        count = chars_per_column if i < column_count - 1 else last_count
+        count = counts[i]
         if top_align is not None:
             # All columns of one sentence share the same top edge.
             cy = top_align + ((count - 1) * step + size) / 2.0
@@ -258,17 +398,14 @@ def _slots_centered(
     layout_bbox: Optional[BBox] = None,
     top_align: Optional[float] = None,
 ) -> Sequence[TypesetColumnSlot]:
-    chars_per_column, column_count, block_width, block_height, last_count = _column_layout(
-        text, size, island, config, layout_bbox=layout_bbox
-    )
+    plan = _column_layout(text, size, island, config, layout_bbox=layout_bbox)
     pitch = _pitch(config, size)
     step = _char_step(config, size)
     # reading order: column 0 sits rightmost, later columns go leftwards
-    right = centre[0] + block_width / 2.0
+    right = centre[0] + plan.block_width / 2.0
     slots = []
-    for i in range(column_count):
+    for i, count in enumerate(plan.counts):
         cx = right - size / 2.0 - i * pitch
-        count = chars_per_column if i < column_count - 1 else last_count
         if top_align is not None:
             # All columns of one sentence share the same top edge.
             cy = top_align + ((count - 1) * step + size) / 2.0
@@ -284,8 +421,8 @@ def _row_layout(
     island: IslandInfo,
     config: TypesetConfig,
     layout_bbox: Optional[BBox] = None,
-) -> Tuple[int, int, int, int]:
-    """Horizontal layout: (chars_per_row, row_count, block_width, block_height)."""
+) -> LinePlan:
+    """Horizontal layout plan (每行字数已按禁则调过断点)."""
     x1, y1, x2, y2 = layout_bbox if layout_bbox is not None else island.image_bbox
     usable_w = max(1, (x2 - x1) - 2 * config.padding)
     usable_h = max(1, (y2 - y1) - 2 * config.padding)
@@ -301,9 +438,12 @@ def _row_layout(
     # outside the island).
     chars_per_row = max(1, math.ceil(len(text) / row_count))
     last_count = len(text) - (row_count - 1) * chars_per_row
-    block_width = (chars_per_row - 1) * step + size
-    block_height = row_count * row_pitch - config.column_gap(size)
-    return chars_per_row, row_count, block_width, block_height, last_count
+    counts = apply_kinsoku(
+        text, [chars_per_row] * (row_count - 1) + [last_count], chars_per_row)
+    # 禁则只会让某行变短 → 块宽 <= 原宽，不会溢出
+    block_width = (max(counts) - 1) * step + size
+    block_height = len(counts) * row_pitch - config.column_gap(size)
+    return LinePlan(counts, block_width, block_height)
 
 
 def _slots_horizontal(
@@ -320,16 +460,13 @@ def _slots_horizontal(
     block itself stays horizontally centred on ``centre``), so a short last
     row does not shift the text.
     """
-    chars_per_row, row_count, block_width, block_height, last_count = _row_layout(
-        text, size, island, config, layout_bbox=layout_bbox
-    )
+    plan = _row_layout(text, size, island, config, layout_bbox=layout_bbox)
     row_pitch = _pitch(config, size, horizontal=True)
     step = _char_step(config, size)
-    top = centre[1] - block_height / 2.0
-    left = centre[0] - block_width / 2.0
+    top = centre[1] - plan.block_height / 2.0
+    left = centre[0] - plan.block_width / 2.0
     slots = []
-    for i in range(row_count):
-        count = chars_per_row if i < row_count - 1 else last_count
+    for i, count in enumerate(plan.counts):
         y_center = top + size / 2.0 + i * row_pitch
         x_center = left + (count - 1) * step / 2.0
         slots.append(TypesetColumnSlot(index=i, x_center=x_center, y_center=y_center, char_count=count))

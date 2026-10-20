@@ -15,7 +15,7 @@ from manga_localizer.island_translate import (
     translate_page_batch,
     _parse_batch_response,
 )
-from manga_localizer.translator import TranslationCache
+from manga_localizer.translator import TranslationCache, TranslationResponse
 
 
 def _dataset():
@@ -354,6 +354,164 @@ class BatchCacheGlossaryTests(unittest.TestCase):
             for stale in self.cache.directory.glob("*.json"):
                 stale.unlink(missing_ok=True)
             self.cache.directory.rmdir()
+
+
+class CrossPageContextTest(unittest.TestCase):
+    """跨页上下文：**只给上一页的原文**，且它必须进提示词与缓存键。
+
+    只给原文（不给译文）是为了不破坏按页并行——否则必须顺序翻译才能拿到上一页
+    译文。见 manga_localizer/island_translate.py 的 `_batch_messages`。
+    """
+
+    def setUp(self):
+        self.dataset = _dataset()
+        self.texts = {"island_001": "自分の軍だけでも", "island_002": "どの国も"}
+        self.config = IslandTranslateConfig(
+            precision="online", online_base_url="http://example/v1",
+            online_model="m")
+
+    def _batch(self, previous_lines=()):
+        from manga_localizer.island_translate import _batch_messages
+        from manga_localizer.translator import load_glossary
+
+        return _batch_messages([(1, "こんにちは")], load_glossary(None),
+                               previous_lines)
+
+    def test_previous_source_appears_in_the_prompt(self):
+        content = self._batch(("前页第一句", "前页第二句"))[0]["content"]
+        self.assertIn("上一页的原文", content)
+        self.assertIn("- 前页第一句", content)
+        self.assertIn("- 前页第二句", content)
+
+    def test_block_absent_without_previous_lines(self):
+        self.assertNotIn("上一页的原文", self._batch(())[0]["content"])
+        self.assertNotIn("上一页的原文", self._batch(("  ", ""))[0]["content"])
+
+    def test_previous_lines_change_the_cache_key(self):
+        from manga_localizer.island_translate import PageBatchCache
+        from manga_localizer.translator import load_glossary
+
+        cache = PageBatchCache(Path(__file__).resolve().parent / "tmp_prev_key")
+        glossary = load_glossary(None)
+        without = cache.signature(self.dataset, self.texts, self.config, glossary)
+        with_prev = cache.signature(self.dataset, self.texts, self.config, glossary,
+                                    ("前页第一句",))
+        self.assertNotEqual(without, with_prev)
+
+    def _fresh_cache(self):
+        """每次用**新的临时缓存目录**：走默认目录会在第二次跑时命中缓存，
+        `chat_fn` 不被调用、断言全落空（这条踩过一次）。"""
+        import tempfile
+
+        from manga_localizer.island_translate import PageBatchCache
+
+        return PageBatchCache(Path(tempfile.mkdtemp()) / "batch")
+
+    def test_previous_lines_are_sent_through_translate_page_batch(self):
+        from manga_localizer.island_translate import translate_page_batch
+
+        seen = []
+
+        def chat_fn(messages):
+            seen.append(messages)
+            return "1: 译文一\n2: 译文二"
+
+        translate_page_batch(
+            self.dataset, self.texts, self.config, chat_fn=chat_fn,
+            cache=self._fresh_cache(), previous_lines=("前页台词",))
+        self.assertIn("上一页的原文", seen[0][0]["content"])
+        self.assertIn("- 前页台词", seen[0][0]["content"])
+
+    def test_no_previous_lines_leaves_the_prompt_unchanged(self):
+        from manga_localizer.island_translate import translate_page_batch
+
+        seen = []
+
+        def chat_fn(messages):
+            seen.append(messages)
+            return "1: 译文一\n2: 译文二"
+
+        translate_page_batch(self.dataset, self.texts, self.config,
+                             chat_fn=chat_fn, cache=self._fresh_cache())
+        self.assertNotIn("上一页的原文", seen[0][0]["content"])
+
+
+class TimeoutAndPassthroughTest(unittest.TestCase):
+    """超时不重试同一引擎；纯数字岛不出网。"""
+
+    def setUp(self):
+        self.dataset = _dataset()
+        self.texts = {"island_001": "自分の軍だけでも"}
+
+    def test_timeout_skips_remaining_styles_for_same_engine(self):
+        """online 超时后不再用同引擎换 prompt 风格重试，直接换下一档精度。"""
+        from manga_localizer.errors import TranslationTimeoutError
+
+        seen: list[str] = []
+
+        def factory(config, precision, prompt_style="contextual"):
+            seen.append(precision)
+
+            class _T:
+                name = precision
+                model = "t"
+
+                def cache_identity(self):
+                    return {"backend": precision, "style": prompt_style}
+
+                def translate(self, request, glossary):
+                    if precision == "online":
+                        raise TranslationTimeoutError("online timed out after 90s")
+                    return TranslationResponse(
+                        text="模拟：只有我的军队。", backend="local", model="t",
+                        finish_reason="stop",
+                    )
+
+            return _T()
+
+        result = translate_island_page(
+            self.dataset, self.texts,
+            IslandTranslateConfig(precision="online",
+                                  online_base_url="http://example/v1",
+                                  online_model="m"),
+            translator_factory=factory,
+        )
+        # 同一引擎最多试一次（不再有 online/concise）
+        self.assertEqual(seen.count("online"), 1)
+        self.assertIn("local", seen)
+        self.assertEqual(result.translations["island_001"], "模拟：只有我的军队。")
+        self.assertEqual(result.failed_count, 0)
+
+    def test_numeric_island_never_calls_the_engine(self):
+        calls: list[str] = []
+
+        def factory(config, precision, prompt_style="contextual"):
+            calls.append(precision)
+            return MockIslandTranslator({"island_001": "不该被调用"})
+
+        result = translate_island_page(
+            self.dataset, {"island_001": "８１３"},
+            IslandTranslateConfig(precision="local"),
+            translator_factory=factory,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(result.translations["island_001"], "８１３")
+        self.assertEqual(result.units[0].attempts[0][1], "numeric-passthrough")
+
+    def test_short_symbol_still_skips_with_its_own_reason(self):
+        calls: list[str] = []
+
+        def factory(config, precision, prompt_style="contextual"):
+            calls.append(precision)
+            return MockIslandTranslator({"island_001": "不该被调用"})
+
+        result = translate_island_page(
+            self.dataset, {"island_001": "♡"},
+            IslandTranslateConfig(precision="local"),
+            translator_factory=factory,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(result.units[0].attempts[0][1], "short-symbol")
 
 
 if __name__ == "__main__":
