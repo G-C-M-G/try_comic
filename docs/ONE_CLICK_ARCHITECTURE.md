@@ -363,7 +363,7 @@ masked = 全页填充色 (BLUEBOX_FILL)
   - 缓存损坏/缺失 → 忽略并重建；重新采集（框变）→ 旧键自然失效
 - **收益**：改分组/改嵌字/重合并 PDF 等任何重跑，OCR 阶段 ≈ 0 秒
 - `--stage ocr` 独立运行时按同一缓存逻辑只补缺失框；`--overwrite` 会先剔除选中页的读数/译文键再全量重读
-  - **清空前先备份**：`translations.json` / `ocr_readings.json` 会被复制成 `*.bak`
+  - **清空前留回滚点**：`translations.json` / `ocr_readings.json` 会被复制成 `*.bak`
     （`_backup_before_purge`）。`--overwrite` 是"先删后重建"，而重建要跑完 OCR+翻译，
     中途失败（进程被杀/断网/额度不足）就成了"只丢不进"——实测踩到过一次，24 页译文
     被清成 `{}` 等于白花钱重翻。有了 `.bak`，最坏也只是回滚

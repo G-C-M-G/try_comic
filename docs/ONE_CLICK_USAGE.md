@@ -125,7 +125,7 @@ venv\Scripts\python.exe one_click_translate.py --images "C:\原图目录" --auto
   使重跑跳过已识别的框——断点续跑近乎零成本。
 - 单页失败不中断整批：失败页记录并在 PDF 中保持原图。
 - `--overwrite` 会先清掉选中页的读数/译文再重做，所以它**会先把 `translations.json` /
-  `ocr_readings.json` 备份成 `*.bak`**（打印路径）：中途失败（进程被杀/断网/额度不足）
+  `ocr_readings.json` 会复制成 `*.bak`**（打印路径）：中途失败（进程被杀/断网/额度不足）
   只会丢"没重做出来的"，不会连旧的也没了；回滚 = 把 `.bak` 改回原名。
 - **改分组/框规则后要重建 dataset**：`_stage2_dataset` 在 `islands.json` 比 `capture.json`
   新时会跳过重建，所以改完规则删 `dataset/*/islands.json` + `selection_blocks.json`

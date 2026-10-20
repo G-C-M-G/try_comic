@@ -67,7 +67,7 @@
 24. **state 重嵌防串用**：四路 SHA（original/islands/erased/translations）绑定，任一不符拒绝。
 25. **环境单化**：两仓合并后单一 venv（PySide6/PIL/numpy/jsonschema/winrt/manga_ocr/opencv-contrib）
     + paddle_venv；opencv 需 contrib 包才有 xphoto（FSR 修复依赖）。
-26. **删除式整理**：15.5GB 历史备份 zip、旧 exe、旧比较产物直接删除（git 接管版本）；
+26. **删除式整理**：旧归档、旧 exe、旧比较产物直接删除（git 接管版本）；
     旧 GUI/列版测试归档 legacy/，避免死代码干扰新流程。
 
 ## 遗留问题
