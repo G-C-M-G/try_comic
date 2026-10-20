@@ -81,32 +81,13 @@ venv/ + paddle_venv/  两套 Python 环境
 ```
 
 ## 文档
-- `docs/ONE_CLICK_ARCHITECTURE.md` 一键流水线架构（含阶段拆分与覆盖规则 4.12）
+- `docs/ONE_CLICK_ARCHITECTURE.md` 一键流水线架构（含阶段拆分与覆盖规则 4.10）
 - `docs/ONE_CLICK_USAGE.md` 使用说明与参数手册
 - `docs/GUI设计规范.md` GUI 设计规范
 - `docs/BLUEBOX_CAPTURE.md` 蓝框检测原理
 - `docs/SENTENCE_GROUPING_DESIGN.md` 分句/分组设计
 - `docs/LESSONS.md` 经验教训
-- 开发日志与交接文档：含实书书目/原文引用，不随公开仓库分发
-
-## 备份与清理
-
-```powershell
-# 备份（书级产物 + 配置；代码版本化靠 git）
-robocopy outputs\oneclick backups\<日期>\oneclick /E
-# /XF 排除明文密钥，避免 api_keys.json 随备份扩散
-robocopy config backups\<日期>\config /E /XF api_keys.json
-
-# 重新打包 exe（先关闭正在运行的 exe）
-venv\Scripts\python.exe -m PyInstaller "漫画翻译软件.spec" --noconfirm
-# 调试用快启动版（onedir：启动无需解压 136MB，窗口秒开）：
-venv\Scripts\python.exe -m PyInstaller "漫画翻译软件_onedir.spec" --noconfirm
-#   成品 dist\gui\gui.exe（GUI 会自己往上找项目根，不需要放在 dist/ 根）
-
-# 可清理冗余（勿删 dataset/typeset/ocr_readings.json/翻译缓存）
-#   - 书目录下 crops.*.json、_logs/、旧调试图（*.erased.png 等）、旧格式 *.bluebox_check.jpg
-#   - 项目根 build/（PyInstaller 中间产物）
-```
+- `docs/DEVLOG.md` 开发日志（精简公开版：演进时间线、不变量、关键结论；完整版仅本地保留）
 
 ## 环境
 - `venv/`：应用 + Windows OCR + manga-ocr（root venv，PySide6/PIL/numpy/jsonschema/winrt/manga_ocr/opencv-contrib）；

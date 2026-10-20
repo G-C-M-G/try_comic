@@ -371,21 +371,7 @@ masked = 全页填充色 (BLUEBOX_FILL)
 ### 4.9 输出
 - `typeset/{page}.typeset.png`、合并 PDF `outputs/oneclick/{书名}/{书名}.pdf`
 
-### 4.10 备份与恢复
-- **代码/规则版本**：git 提交即备份（分组规则、嵌字规则、文档都随代码版本化）
-- **书级产物**：`outputs/oneclick/{书名}/` 可整体复制/压缩即完整备份（含 capture、dataset、两套翻译缓存、OCR 读数缓存、typeset、PDF）；重新铺到同样路径即可恢复/继续
-- **整库快照**：`robocopy outputs\oneclick backups\<日期>\oneclick /E` + `robocopy config backups\<日期>\config /E`
-  （`backups/` 已被 .gitignore 忽略；`config/api_keys.json` 含密钥，勿提交 git）
-- **恢复重跑**：删除 `dataset/*/islands.json` → 用新分组规则重建；翻译/OCR 缓存命中则零重算；`--resume` 跳过已有 typeset 页
-- **单页重采**：删 `capture/<页>/`（+ `dataset/<页>/`）→ `--pages <页>` 重跑 stage1 → 核对 `check/<页>.bluebox_check.png` → `--pages <页> --process --no-pdf` 重嵌该页
-
-### 4.11 可清理的冗余（详见 ONE_CLICK_USAGE.md 五.7）
-- `crops.*.json`（每次运行生成的 OCR 临时任务文件）、`_logs/`（旧分段日志）
-- `check/` 下旧管线调试图（`*.erased.png` / `*.erasure_mask.png` / `*.ranges_overlay.png` / `*.islands_grouped.png`）、同页旧格式 `*.bluebox_check.jpg`
-- 项目根 `build/`（PyInstaller 中间产物，成品在 `dist/`）
-- 不可删：`dataset/`、`typeset/`、`ocr_readings.json`、两套翻译缓存
-
-### 4.12 阶段拆分与覆盖
+### 4.10 阶段拆分与覆盖
 - **阶段拆分（`--stage {ocr,translate,typeset}`，与 `--process` 互斥）**：只跑 stage2 的某一个阶段，
   `--pages` 选出该阶段页；各阶段有前置依赖，缺前置的页跳过并提示：
   - `--stage ocr`：需 `capture/{page}/`（已采集页），自动补建 `dataset/{page}/`，按缓存只补缺失框

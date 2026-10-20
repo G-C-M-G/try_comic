@@ -14,7 +14,7 @@ from manga_localizer.island_contract import (
     validate_dataset_images,
 )
 
-UPSTREAM = Path(r"D:\workplace\opencode\try_comic")
+UPSTREAM = Path(__file__).resolve().parents[2]
 REAL_DATASET = UPSTREAM / "outputs" / "exam" / "dataset33" / "33"
 
 

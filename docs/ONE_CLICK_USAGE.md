@@ -216,31 +216,6 @@ venv\Scripts\python.exe one_click_translate.py --images "原图目录" --pages 4
 - 重采后 `dataset/`、`ocr_readings.json` 中旧页键自动失效，重跑即重建，无需手动清；
 - 若整页确实无文字/全黑（如插图页），删除 `capture/<页>/` 后无需重采，stage2 自动按原图跳过。
 
-## 五.7 备份与清理
-
-**备份**（产物备份 = 整个 `outputs/oneclick/{书名}/` 目录，含 capture/dataset/缓存/typeset/PDF，复制即完整备份）：
-
-```powershell
-# 整库备份（含全部书 + config）到项目内 backups/（已被 .gitignore 忽略）
-robocopy outputs\oneclick backups\2026-08-09\oneclick /E /NFL /NDL /NJH /NP /R:1 /W:1
-robocopy config backups\2026-08-09\config /E /NFL /NDL /NJH /NP /R:1 /W:1
-```
-
-- 代码/规则版本走 git（`config/api_keys.json`、`outputs/` 已在 .gitignore，不提交）；
-- 恢复 = 把备份目录铺回原路径即可继续（缓存命中零重算）。
-
-**可安全清理的冗余**：
-
-| 文件 | 说明 |
-|---|---|
-| `crops.*.json`（书目录下，多个 PID 后缀） | 每次运行产生的 OCR 临时任务文件，跑完即可删 |
-| `_logs/`（书目录下） | 旧分段处理日志，可删 |
-| `check/*.erased.png`、`*.erasure_mask.png`、`*.ranges_overlay.png`、`*.islands_grouped.png` | 旧管线调试图，新管线不再生成，可删 |
-| `build/`（项目根） | PyInstaller 打包中间产物（dist/ 下的 exe 才是成品），可删 |
-| `check/` 中同页的旧格式 jpg | 新采集生成 `*.bluebox_check.png` 后，同页旧 `*.bluebox_check.jpg` 属旧管线遗留，可删 |
-
-**不可删**：`dataset/`、`typeset/`、`ocr_readings.json`、`translation_cache/`、`translation_batch_cache/`（删了就要重算）。
-
 ## 六、嵌字标准速查
 
 | 规则 | 值 |
