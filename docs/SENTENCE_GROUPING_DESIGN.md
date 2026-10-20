@@ -2,7 +2,7 @@
 
 版本：2026-08-05
 适用项目：manga_localizer（高亮岛内翻译嵌字，几何权威 = `islands.json`）
-上游数据：`D:\workplace\opencode\try_comic\outputs\exam\dataset33\` 等，只读输入。
+上游数据：`outputs\exam\dataset33\` 等，只读输入。
 
 > **状态标注（2026-08-07）**：本文档描述的是旧"高亮岛 + Paddle 行"流水线（M1-M4）。
 > 现行 one-click 流水线的分组合并/嵌字规则见

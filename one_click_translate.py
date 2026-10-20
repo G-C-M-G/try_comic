@@ -56,6 +56,12 @@ except (AttributeError, ValueError):
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+
+def _glossary_read_path() -> Path:
+    """Prefer the local glossary; fall back to the tracked empty template."""
+    local = ROOT / "config" / "glossary.json"
+    return local if local.is_file() else ROOT / "config" / "glossary.example.json"
+
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -3041,7 +3047,7 @@ def _translate_one_page(page: str, texts: dict[str, str], *,
                     online_base_url=ai_url,
                     online_model=ai_model,
                     online_api_key=ai_api_key,
-                    glossary_path=str(ROOT / "config" / "glossary.json"),
+                    glossary_path=str(_glossary_read_path()),
                 ),
                 glossary=glossary,
                 cache=batch_cache,
@@ -3064,7 +3070,7 @@ def _translate_one_page(page: str, texts: dict[str, str], *,
                 precision="local",
                 sakura_base_url="http://127.0.0.1:8080/v1",
                 sakura_model="sukinishiro",
-                glossary_path=str(ROOT / "config" / "glossary.json"),
+                glossary_path=str(_glossary_read_path()),
             ),
             glossary=glossary,
             cache=cache,
@@ -3099,7 +3105,7 @@ def _stage2_translate(out_root: Path, pages: list[str],
         # Discard the old translations of the selected pages: they must be
         # re-derived (cache hits return the same text, so this is cheap).
         _purge_page_artifacts(out_root, pages, readings=False, translations=True)
-    glossary = load_glossary(ROOT / "config" / "glossary.json")
+    glossary = load_glossary(_glossary_read_path())
     cache = IslandTranslationCache(out_root / "translation_cache")
     batch_cache = PageBatchCache(out_root / "translation_batch_cache")
     dataset_dir = out_root / "dataset"

@@ -44,6 +44,8 @@ __pycache__/
 /config/translation_memory.json
 /config/settings.json
 /config/sakura_*.json
+/config/glossary.json
+/config/sample_translations/
 
 config/api_keys.json
 
